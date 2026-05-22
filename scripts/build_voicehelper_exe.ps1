@@ -1,3 +1,7 @@
+param(
+    [switch]$SkipModels
+)
+
 $ErrorActionPreference = "Stop"
 
 Set-Location -LiteralPath (Join-Path $PSScriptRoot "..")
@@ -11,12 +15,29 @@ python -m PyInstaller --noconfirm --clean --windowed --icon "assets\app_icon.ico
 $dist = "dist\VoiceHelper"
 New-Item -ItemType Directory -Force -Path "$dist\models", "$dist\.tools\whisper.cpp-build-compat\bin", "$dist\assets", "$dist\docs", "$dist\scripts" | Out-Null
 
-Copy-Item -LiteralPath `
-    "models\ggml-tiny-q5_1.bin", `
-    "models\ggml-base-q5_1.bin", `
-    "models\ggml-small-q5_1.bin" `
-    -Destination "$dist\models" `
-    -Force
+if ($SkipModels) {
+    @"
+VoiceHelper models are not included in this package.
+
+Copy these files into this folder before using recognition:
+- ggml-tiny-q5_1.bin
+- ggml-base-q5_1.bin
+- ggml-small-q5_1.bin
+
+Local source folder:
+models\
+
+Official upstream model source:
+https://huggingface.co/ggerganov/whisper.cpp
+"@ | Set-Content -LiteralPath "$dist\models\README_MODELS.txt" -Encoding UTF8
+} else {
+    Copy-Item -LiteralPath `
+        "models\ggml-tiny-q5_1.bin", `
+        "models\ggml-base-q5_1.bin", `
+        "models\ggml-small-q5_1.bin" `
+        -Destination "$dist\models" `
+        -Force
+}
 
 Copy-Item `
     -Path ".tools\whisper.cpp-build-compat\bin\*" `
@@ -57,6 +78,10 @@ Copy-Item -LiteralPath `
     -Destination "$dist\scripts" `
     -Force
 
-& "$dist\VoiceHelper.exe" --self-test
+if ($SkipModels) {
+    & "$dist\VoiceHelper.exe" --self-test --allow-missing-models
+} else {
+    & "$dist\VoiceHelper.exe" --self-test
+}
 
 Write-Host "Build ready: $((Resolve-Path $dist).Path)"

@@ -45,7 +45,22 @@ if (-not (Test-Path -LiteralPath (Join-Path $releaseDir "whisper-cli.exe"))) {
     throw "whisper-cli.exe was not found in downloaded whisper.cpp release."
 }
 
-Copy-Item -Path (Join-Path $releaseDir "*") -Destination $whisperBinDir -Recurse -Force
+$requiredReleaseFiles = @(
+    "whisper-cli.exe",
+    "whisper.dll",
+    "ggml.dll",
+    "ggml-base.dll",
+    "ggml-cpu.dll"
+)
+
+Remove-Item -Path (Join-Path $whisperBinDir "*") -Recurse -Force -ErrorAction SilentlyContinue
+foreach ($fileName in $requiredReleaseFiles) {
+    $source = Join-Path $releaseDir $fileName
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "Required whisper.cpp release file was not found: $fileName"
+    }
+    Copy-Item -LiteralPath $source -Destination $whisperBinDir -Force
+}
 Write-Host "Prepared whisper.cpp binaries in $whisperBinDir"
 
 if (-not $SkipModels) {
@@ -60,6 +75,8 @@ if (-not $SkipModels) {
         $destination = Join-Path $modelsDir $model
         Download-File -Url $url -Destination $destination
     }
+} else {
+    Write-Host "Skipping model downloads."
 }
 
 Write-Host "VoiceHelper assets are ready."

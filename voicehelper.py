@@ -1196,12 +1196,20 @@ def main() -> None:
         raise SystemExit(0)
 
     if "--self-test" in sys.argv:
-        missing = [path for path in [WHISPER_EXE, *MODEL_OPTIONS.values()] if not path.exists()]
+        allow_missing_models = "--allow-missing-models" in sys.argv
+        required = [WHISPER_EXE] if allow_missing_models else [WHISPER_EXE, *MODEL_OPTIONS.values()]
+        missing = [path for path in required if not path.exists()]
         if missing:
             print("VoiceHelper self-test failed. Missing files:")
             for path in missing:
                 print(path)
             raise SystemExit(1)
+        if allow_missing_models:
+            missing_models = [path for path in MODEL_OPTIONS.values() if not path.exists()]
+            if missing_models:
+                print("VoiceHelper self-test warning: models are not included in this code-only package.")
+                for path in missing_models:
+                    print(path)
         print("VoiceHelper self-test passed.")
         print(f"APP_DIR={APP_DIR}")
         print(f"APP_ICON={APP_ICON}")

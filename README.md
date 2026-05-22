@@ -29,10 +29,18 @@ python voicehelper.py
 Workflow:
 
 - скачивает pinned `whisper.cpp` Windows x64 release;
-- скачивает модели `tiny/base/small q5_1`;
+- не скачивает и не упаковывает модели `tiny/base/small q5_1`;
 - собирает `VoiceHelper.exe` через PyInstaller;
 - упаковывает `dist/VoiceHelper` в ZIP;
 - публикует ZIP в GitHub Actions artifacts.
+
+GitHub artifact является code-only пакетом. Перед использованием распознавания нужно вручную скопировать модели в папку `models` рядом с `VoiceHelper.exe`:
+
+```text
+models\ggml-tiny-q5_1.bin
+models\ggml-base-q5_1.bin
+models\ggml-small-q5_1.bin
+```
 
 ## Что делает текущий MVP
 
