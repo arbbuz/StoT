@@ -18,9 +18,10 @@ Copy-Item -LiteralPath `
     -Destination "$dist\models" `
     -Force
 
-Copy-Item -LiteralPath `
-    ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe" `
+Copy-Item `
+    -Path ".tools\whisper.cpp-build-compat\bin\*" `
     -Destination "$dist\.tools\whisper.cpp-build-compat\bin" `
+    -Recurse `
     -Force
 
 Copy-Item -LiteralPath `

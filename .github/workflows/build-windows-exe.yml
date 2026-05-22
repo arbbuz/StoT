@@ -1,0 +1,48 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    name: Build VoiceHelper Windows artifact
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Prepare local Whisper assets
+        shell: pwsh
+        run: .\scripts\prepare_voicehelper_assets.ps1
+
+      - name: Build EXE
+        shell: pwsh
+        run: .\scripts\build_voicehelper_exe.ps1
+
+      - name: Create ZIP package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $zip = "artifacts\VoiceHelper-windows-${{ github.sha }}.zip"
+          if (Test-Path -LiteralPath $zip) {
+            Remove-Item -LiteralPath $zip -Force
+          }
+          Compress-Archive -Path "dist\VoiceHelper\*" -DestinationPath $zip -Force
+          Get-Item -LiteralPath $zip | Select-Object FullName,Length,LastWriteTime
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceHelper-windows-${{ github.sha }}
+          path: artifacts/VoiceHelper-windows-${{ github.sha }}.zip
+          retention-days: 30

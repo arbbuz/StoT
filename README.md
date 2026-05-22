@@ -18,8 +18,21 @@ python voicehelper.py
 Повторная сборка exe:
 
 ```powershell
+.\scripts\prepare_voicehelper_assets.ps1
 .\scripts\build_voicehelper_exe.ps1
 ```
+
+## GitHub Actions
+
+После push в ветку `main` запускается workflow `.github/workflows/build-windows-exe.yml`.
+
+Workflow:
+
+- скачивает pinned `whisper.cpp` Windows x64 release;
+- скачивает модели `tiny/base/small q5_1`;
+- собирает `VoiceHelper.exe` через PyInstaller;
+- упаковывает `dist/VoiceHelper` в ZIP;
+- публикует ZIP в GitHub Actions artifacts.
 
 ## Что делает текущий MVP
 
