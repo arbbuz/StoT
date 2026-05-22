@@ -23,6 +23,7 @@ VoiceHelper/
     ROADMAP.md
     STAGE_0_2_1_MICROPHONE.md
     STAGE_0_2_2_DIAGNOSTICS.md
+    STAGE_0_2_3_ERROR_MESSAGES.md
     USER_CHECKLIST.md
   scripts/
     diagnose_voicehelper.cmd

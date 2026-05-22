@@ -36,6 +36,7 @@ Copy-Item -LiteralPath `
     "docs\ROADMAP.md", `
     "docs\STAGE_0_2_1_MICROPHONE.md", `
     "docs\STAGE_0_2_2_DIAGNOSTICS.md", `
+    "docs\STAGE_0_2_3_ERROR_MESSAGES.md", `
     "docs\USER_CHECKLIST.md" `
     -Destination "$dist\docs" `
     -Force

@@ -157,6 +157,7 @@ Test-RequiredFile -RelativePath "docs\USER_CHECKLIST.md"
 Test-RequiredFile -RelativePath "docs\ROADMAP.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_2_1_MICROPHONE.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_2_2_DIAGNOSTICS.md"
+Test-RequiredFile -RelativePath "docs\STAGE_0_2_3_ERROR_MESSAGES.md"
 
 $program = Join-Path $root "VoiceHelper.exe"
 $powershellArgsPrefix = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File")

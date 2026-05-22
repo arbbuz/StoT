@@ -192,7 +192,16 @@ class VoiceHelperApp:
             self._set_status("Не найдены локальные файлы")
             messagebox.showerror(
                 "VoiceHelper",
-                "Не найдены обязательные локальные файлы:\n\n" + "\n".join(missing),
+                self._format_problem_message(
+                    "Не найдены обязательные локальные файлы VoiceHelper.",
+                    [
+                        "Запускайте приложение из полной папки VoiceHelper, не переносите один EXE отдельно.",
+                        "Проверьте, что рядом с VoiceHelper.exe есть папки models и .tools.",
+                        "Если это сборка из GitHub Actions, скачайте и распакуйте artifact целиком.",
+                        "Для проверки запустите scripts\\diagnose_voicehelper.cmd.",
+                    ],
+                    technical="\n".join(missing),
+                ),
             )
             self.record_button.configure(state=tk.DISABLED)
 
@@ -209,7 +218,7 @@ class VoiceHelperApp:
             self.input_device_var.set("")
             self.input_device_box.configure(values=[], state=tk.DISABLED)
             self.test_input_button.configure(state=tk.DISABLED)
-            self._set_status(f"Ошибка микрофона: {exc}")
+            self._set_status("Не удалось прочитать микрофоны")
             return
 
         default_input = None
@@ -324,7 +333,7 @@ class VoiceHelperApp:
         label = self.input_device_var.get()
         if label in self.input_devices:
             return self.input_devices[label]
-        raise RuntimeError("Не найден доступный микрофон. Проверьте подключение микрофона и нажмите \"Обновить\".")
+        raise RuntimeError("Не найден доступный микрофон в списке VoiceHelper.")
 
     def _input_device_default_sample_rate(self, device_index: int) -> int:
         try:
@@ -351,11 +360,11 @@ class VoiceHelperApp:
             self._set_status("Ошибка микрофона")
             messagebox.showerror(
                 "VoiceHelper",
-                "Не удалось проверить микрофон.\n\n"
-                f"Выбранный микрофон:\n{self.input_device_var.get() or 'не выбран'}\n\n"
-                f"Ошибка:\n{exc}\n\n"
-                "Проверьте, что микрофон подключен, выбран в списке и не занят другой программой. "
-                "После подключения нажмите \"Обновить\".",
+                self._format_microphone_error(
+                    "Не удалось проверить микрофон.",
+                    exc,
+                    include_diagnostics=True,
+                ),
             )
             return
 
@@ -396,8 +405,15 @@ class VoiceHelperApp:
             self.input_level_text_var.set("Уровень: тишина")
             messagebox.showwarning(
                 "VoiceHelper",
-                "Микрофон удалось открыть, но заметного звука за 3 секунды не обнаружено.\n\n"
-                "Проверьте выбранное устройство, уровень входа в Windows и физическую кнопку mute, если она есть.",
+                self._format_problem_message(
+                    "Микрофон удалось открыть, но заметного звука за 3 секунды не обнаружено.",
+                    [
+                        "Проверьте, что выбран именно рабочий микрофон, а не линейный вход или стерео микшер.",
+                        "Проверьте уровень входа в настройках Windows.",
+                        "Проверьте физическую кнопку mute на гарнитуре или микрофоне.",
+                        "Нажмите Обновить и повторите Проверить.",
+                    ],
+                ),
             )
 
     def start_recording(self) -> None:
@@ -416,11 +432,11 @@ class VoiceHelperApp:
             self._set_status("Ошибка микрофона")
             messagebox.showerror(
                 "VoiceHelper",
-                "Не удалось начать запись.\n\n"
-                f"Выбранный микрофон:\n{self.input_device_var.get() or 'не выбран'}\n\n"
-                f"Ошибка:\n{exc}\n\n"
-                "Проверьте, что микрофон подключен, выбран в списке и не занят другой программой. "
-                "После подключения нажмите \"Обновить\".",
+                self._format_microphone_error(
+                    "Не удалось начать запись.",
+                    exc,
+                    include_diagnostics=True,
+                ),
             )
             return
 
@@ -475,7 +491,17 @@ class VoiceHelperApp:
             self.input_device_box.configure(state="readonly")
             self.refresh_input_button.configure(state=tk.NORMAL)
             self.test_input_button.configure(state=tk.NORMAL)
-            messagebox.showwarning("VoiceHelper", "Запись пустая.")
+            messagebox.showwarning(
+                "VoiceHelper",
+                self._format_problem_message(
+                    "Запись пустая: VoiceHelper не получил аудиоданные от микрофона.",
+                    [
+                        "Нажмите Проверить и скажите несколько слов.",
+                        "Если индикатор уровня не двигается, выберите другой микрофон или нажмите Обновить.",
+                        "Если проблема повторяется, запустите scripts\\diagnose_voicehelper.cmd.",
+                    ],
+                ),
+            )
             return
 
         self.is_recognizing = True
@@ -628,7 +654,17 @@ class VoiceHelperApp:
     def enable_firewall_block(self) -> None:
         target = self._firewall_target_path()
         if not target.exists():
-            messagebox.showerror("VoiceHelper", f"Не найден файл для блокировки сети:\n\n{target}")
+            messagebox.showerror(
+                "VoiceHelper",
+                self._format_problem_message(
+                    "Не найден файл, для которого нужно включить сетевую блокировку.",
+                    [
+                        "Запускайте приложение из полной папки VoiceHelper.",
+                        "Если это исходники, сначала соберите EXE или откройте dist\\VoiceHelper\\VoiceHelper.exe.",
+                    ],
+                    technical=str(target),
+                ),
+            )
             return
 
         if not getattr(sys, "frozen", False):
@@ -645,7 +681,18 @@ class VoiceHelperApp:
         try:
             self._run_cmd_elevated(script_path)
         except Exception as exc:
-            messagebox.showerror("VoiceHelper", f"Не удалось запустить настройку firewall:\n\n{exc}")
+            messagebox.showerror(
+                "VoiceHelper",
+                self._format_problem_message(
+                    "Не удалось запустить настройку Windows Firewall.",
+                    [
+                        "Проверьте, что подтвердили UAC-запрос Windows.",
+                        "Если UAC-запрос не появился, запустите scripts\\diagnose_voicehelper.cmd.",
+                        "Посмотрите лог: %TEMP%\\voicehelper_firewall.log.",
+                    ],
+                    technical=str(exc),
+                ),
+            )
             return
 
         self.firewall_status_var.set("Сеть: ожидает подтверждения Windows")
@@ -654,7 +701,17 @@ class VoiceHelperApp:
     def disable_firewall_block(self) -> None:
         target = self._firewall_target_path()
         if not target.exists():
-            messagebox.showerror("VoiceHelper", f"Не найден файл для разблокировки сети:\n\n{target}")
+            messagebox.showerror(
+                "VoiceHelper",
+                self._format_problem_message(
+                    "Не найден файл, для которого нужно снять сетевую блокировку.",
+                    [
+                        "Проверьте, что приложение запущено из полной папки VoiceHelper.",
+                        "Если папку перенесли, старое firewall-правило можно удалить вручную в Windows Firewall.",
+                    ],
+                    technical=str(target),
+                ),
+            )
             return
 
         proceed = messagebox.askyesno(
@@ -669,7 +726,18 @@ class VoiceHelperApp:
         try:
             self._run_cmd_elevated(script_path)
         except Exception as exc:
-            messagebox.showerror("VoiceHelper", f"Не удалось запустить снятие firewall-правила:\n\n{exc}")
+            messagebox.showerror(
+                "VoiceHelper",
+                self._format_problem_message(
+                    "Не удалось запустить снятие firewall-правила.",
+                    [
+                        "Проверьте, что подтвердили UAC-запрос Windows.",
+                        "Посмотрите лог: %TEMP%\\voicehelper_firewall.log.",
+                        "Если правило не снимается из приложения, удалите его в Windows Firewall вручную.",
+                    ],
+                    technical=str(exc),
+                ),
+            )
             return
 
         self.firewall_status_var.set("Сеть: ожидает подтверждения Windows")
@@ -742,11 +810,17 @@ class VoiceHelperApp:
             with tempfile.NamedTemporaryFile(prefix="voicehelper_", suffix=".wav", delete=False) as wav_file:
                 wav_path = Path(wav_file.name)
 
+            selected_model = self._selected_model_path()
+            if not WHISPER_EXE.exists():
+                raise RuntimeError(f"missing-whisper-cli::{WHISPER_EXE}")
+            if not selected_model.exists():
+                raise RuntimeError(f"missing-model::{selected_model}")
+
             sample_rate = self.record_sample_rate or SAMPLE_RATE
             audio_bytes = self._trim_silence(b"".join(self.audio_chunks), sample_rate)
             audio_ms = len(audio_bytes) / (sample_rate * SAMPLE_WIDTH_BYTES) * 1000
             if audio_ms < MIN_AUDIO_MS:
-                raise RuntimeError("Запись слишком короткая или похожа на тишину.")
+                raise RuntimeError("silent-or-short-recording")
 
             with wave.open(str(wav_path), "wb") as wav:
                 wav.setnchannels(CHANNELS)
@@ -762,7 +836,7 @@ class VoiceHelperApp:
             command = [
                 str(WHISPER_EXE),
                 "-m",
-                str(self._selected_model_path()),
+                str(selected_model),
                 "-f",
                 str(wav_path),
                 "-l",
@@ -792,15 +866,15 @@ class VoiceHelperApp:
                 error_text = completed.stderr.decode("utf-8", errors="replace").strip()
                 if not error_text:
                     error_text = completed.stdout.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(error_text or f"whisper-cli завершился с кодом {completed.returncode}")
+                raise RuntimeError(f"whisper-failed::{completed.returncode}::{error_text}")
 
             if not txt_path.exists():
-                raise RuntimeError("whisper-cli не создал TXT-файл с результатом.")
+                raise RuntimeError("missing-recognition-output")
 
             recognized = txt_path.read_text(encoding="utf-8").strip()
             self.ui_queue.put(("recognized", (recognized, elapsed)))
         except Exception as exc:
-            self.ui_queue.put(("error", str(exc)))
+            self.ui_queue.put(("error", self._format_recognition_error(exc)))
         finally:
             self.audio_chunks = []
             for path in (wav_path, txt_path):
@@ -831,7 +905,7 @@ class VoiceHelperApp:
                 self._schedule_spellcheck(delay_ms=100)
             elif event == "error":
                 self._set_status("Ошибка распознавания")
-                messagebox.showerror("VoiceHelper", f"Не удалось распознать запись:\n\n{value}")
+                messagebox.showerror("VoiceHelper", str(value))
             elif event == "ready":
                 self.is_recognizing = False
                 self.record_button.configure(state=tk.NORMAL)
@@ -880,6 +954,122 @@ class VoiceHelperApp:
         elif not self.is_recording and not self.is_recognizing:
             self.record_started_at = None
         self.root.after(250, self._update_record_timer)
+
+    def _format_problem_message(
+        self,
+        summary: str,
+        steps: list[str],
+        details: str | None = None,
+        technical: str | None = None,
+    ) -> str:
+        parts = [summary.strip()]
+        if details:
+            parts.extend(["", details.strip()])
+        if steps:
+            parts.append("")
+            parts.append("Что сделать:")
+            parts.extend(f"{index}. {step}" for index, step in enumerate(steps, start=1))
+        if technical:
+            parts.append("")
+            parts.append("Технические детали:")
+            parts.append(str(technical).strip())
+        return "\n".join(parts)
+
+    def _format_microphone_error(self, summary: str, exc: Exception, include_diagnostics: bool = False) -> str:
+        selected = self.input_device_var.get() or "не выбран"
+        technical = str(exc).strip()
+        steps = [
+            "Проверьте, что микрофон подключен и выбран в строке Микрофон.",
+            "Нажмите Обновить, затем Проверить.",
+            "Закройте программы, которые могут занимать микрофон: браузер, Teams, Zoom, диктофон.",
+            "Проверьте доступ к микрофону в настройках конфиденциальности Windows.",
+        ]
+        if include_diagnostics:
+            steps.append("Если ошибка повторяется, запустите scripts\\diagnose_voicehelper.cmd и пришлите отчет из папки diagnostics.")
+
+        return self._format_problem_message(
+            summary,
+            steps,
+            details=f"Выбранный микрофон: {selected}",
+            technical=self._shorten_technical_text(technical),
+        )
+
+    def _format_recognition_error(self, exc: Exception) -> str:
+        raw = str(exc).strip()
+
+        if raw == "silent-or-short-recording":
+            return self._format_problem_message(
+                "Запись слишком короткая или похожа на тишину.",
+                [
+                    "Говорите не меньше 1-2 секунд после нажатия Записать.",
+                    "Перед записью нажмите Проверить и убедитесь, что индикатор уровня двигается.",
+                    "Проверьте уровень входа микрофона в Windows и физическую кнопку mute.",
+                ],
+            )
+
+        if raw.startswith("missing-whisper-cli::"):
+            path = raw.split("::", 1)[1]
+            return self._format_problem_message(
+                "Не найден локальный движок распознавания whisper-cli.exe.",
+                [
+                    "Запускайте VoiceHelper из полной распакованной папки.",
+                    "Проверьте, что рядом есть папка .tools.",
+                    "Если это GitHub artifact, распакуйте ZIP целиком.",
+                    "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
+                ],
+                technical=path,
+            )
+
+        if raw.startswith("missing-model::"):
+            path = raw.split("::", 1)[1]
+            return self._format_problem_message(
+                "Не найдена выбранная локальная модель Whisper.",
+                [
+                    "Запускайте VoiceHelper из полной распакованной папки.",
+                    "Проверьте, что рядом есть папка models.",
+                    "Выберите другую модель в списке и повторите запись.",
+                    "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
+                ],
+                technical=path,
+            )
+
+        if raw.startswith("whisper-failed::"):
+            _, code, technical = raw.split("::", 2)
+            return self._format_problem_message(
+                "Локальный движок распознавания завершился с ошибкой.",
+                [
+                    "Повторите запись короткой фразой.",
+                    "Проверьте, что модель выбрана и папка VoiceHelper распакована целиком.",
+                    "Запустите scripts\\diagnose_voicehelper.cmd и пришлите отчет, если ошибка повторяется.",
+                ],
+                details=f"Код завершения whisper-cli: {code}",
+                technical=self._shorten_technical_text(technical or "stderr/stdout пустой"),
+            )
+
+        if raw == "missing-recognition-output":
+            return self._format_problem_message(
+                "Распознавание завершилось, но файл с текстом не появился.",
+                [
+                    "Повторите запись.",
+                    "Проверьте, что антивирус или EDR не блокирует временные файлы в TEMP.",
+                    "Запустите scripts\\diagnose_voicehelper.cmd и пришлите отчет.",
+                ],
+            )
+
+        return self._format_problem_message(
+            "Не удалось распознать запись.",
+            [
+                "Повторите запись короткой фразой.",
+                "Если ошибка повторяется, запустите scripts\\diagnose_voicehelper.cmd.",
+            ],
+            technical=self._shorten_technical_text(raw),
+        )
+
+    def _shorten_technical_text(self, value: str, limit: int = 1200) -> str:
+        value = value.strip()
+        if len(value) <= limit:
+            return value
+        return value[:limit].rstrip() + "\n... обрезано, полный вывод смотрите в диагностике."
 
     def _set_status(self, value: str) -> None:
         self.status_var.set(value)
