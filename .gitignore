@@ -1,0 +1,13 @@
+.tools/
+models/
+samples/
+artifacts/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.tmp
+*.tmp.md
+*.spec
+diagnostics/

@@ -1,0 +1,84 @@
+param(
+    [string]$Root = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($Root)) {
+    $root = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
+} else {
+    $root = Resolve-Path -LiteralPath $Root
+}
+$whisper = Join-Path $root ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe"
+$models = @(
+    Join-Path $root "models\ggml-tiny-q5_1.bin"
+    Join-Path $root "models\ggml-base-q5_1.bin"
+    Join-Path $root "models\ggml-small-q5_1.bin"
+)
+$tempPatterns = @(
+    "voicehelper_*.wav",
+    "voicehelper_*_out.txt"
+)
+
+Write-Host "VoiceHelper security check"
+Write-Host "Root: $root"
+Write-Host ""
+
+$ok = $true
+
+if (Test-Path -LiteralPath $whisper) {
+    Write-Host "[OK] whisper-cli found: $whisper"
+} else {
+    Write-Host "[FAIL] whisper-cli not found: $whisper"
+    $ok = $false
+}
+
+foreach ($model in $models) {
+    if (Test-Path -LiteralPath $model) {
+        $item = Get-Item -LiteralPath $model
+        Write-Host "[OK] model found: $($item.Name) ($([math]::Round($item.Length / 1MB, 1)) MB)"
+    } else {
+        Write-Host "[FAIL] model not found: $model"
+        $ok = $false
+    }
+}
+
+Write-Host ""
+Write-Host "Firewall rules matching VoiceHelper:"
+$netshOutput = @(netsh advfirewall firewall show rule name="VoiceHelper Block Outbound" verbose 2>$null)
+$netshText = ($netshOutput -join "`n")
+$programText = $whisper -replace "\\.tools\\whisper\.cpp-build-compat\\bin\\whisper-cli\.exe$", "VoiceHelper.exe"
+
+if ($LASTEXITCODE -eq 0 -and $netshText -like "*$programText*") {
+    Write-Host "[OK] VoiceHelper Block Outbound is present for: $programText"
+} elseif ($LASTEXITCODE -eq 0) {
+    Write-Host "[WARN] VoiceHelper firewall rule exists, but not for this checked root."
+    Write-Host $netshText
+} else {
+    Write-Host "[WARN] VoiceHelper outbound firewall rule was not found."
+    Write-Host "       Create it manually when ready: .\scripts\add_voicehelper_firewall_block.ps1"
+}
+
+Write-Host ""
+Write-Host "Temporary VoiceHelper files:"
+$leftovers = @()
+foreach ($pattern in $tempPatterns) {
+    $leftovers += Get-ChildItem -Path $env:TEMP -Filter $pattern -ErrorAction SilentlyContinue
+}
+
+if ($leftovers.Count -eq 0) {
+    Write-Host "[OK] no VoiceHelper temp WAV/TXT leftovers found in $env:TEMP"
+} else {
+    Write-Host "[WARN] temp leftovers found:"
+    foreach ($item in $leftovers) {
+        Write-Host "       $($item.FullName)"
+    }
+}
+
+Write-Host ""
+if ($ok) {
+    Write-Host "Result: basic local files check passed."
+} else {
+    Write-Host "Result: security check found blocking issues."
+    exit 1
+}
