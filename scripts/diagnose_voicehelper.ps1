@@ -119,6 +119,22 @@ function Test-RequiredFile {
     }
 }
 
+function Test-OptionalFile {
+    param(
+        [string]$RelativePath
+    )
+
+    $path = Join-Path $root $RelativePath
+    if (-not (Test-Path -LiteralPath $path)) {
+        Write-Check -Level "OK" -Message "Optional file not found: $RelativePath. Compat fallback will be used."
+        return
+    }
+
+    $item = Get-Item -LiteralPath $path
+    $sizeMb = [math]::Round($item.Length / 1MB, 2)
+    Write-Check -Level "OK" -Message "$RelativePath found ($sizeMb MB)."
+}
+
 Write-ReportLine "VoiceHelper unified diagnostic report"
 Write-ReportLine "Created:  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
 Write-ReportLine "Root:     $root"
@@ -147,6 +163,7 @@ try {
 Write-Section "Required Files"
 Test-RequiredFile -RelativePath "VoiceHelper.exe" -Hash
 Test-RequiredFile -RelativePath ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe" -Hash
+Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-avx2\bin\whisper-cli.exe"
 Test-RequiredFile -RelativePath "models\ggml-tiny-q5_1.bin" -Hash
 Test-RequiredFile -RelativePath "models\ggml-base-q5_1.bin" -Hash
 Test-RequiredFile -RelativePath "models\ggml-small-q5_1.bin" -Hash
@@ -158,6 +175,9 @@ Test-RequiredFile -RelativePath "docs\ROADMAP.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_2_1_MICROPHONE.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_2_2_DIAGNOSTICS.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_2_3_ERROR_MESSAGES.md"
+Test-RequiredFile -RelativePath "docs\STAGE_0_3_SPEED.md"
+Test-RequiredFile -RelativePath "scripts\benchmark_voicehelper_models.cmd"
+Test-RequiredFile -RelativePath "scripts\benchmark_voicehelper_models.ps1"
 
 $program = Join-Path $root "VoiceHelper.exe"
 $powershellArgsPrefix = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File")

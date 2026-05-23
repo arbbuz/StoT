@@ -1,5 +1,8 @@
 import queue
 import ctypes
+import json
+import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -23,14 +26,34 @@ def app_dir() -> Path:
 
 APP_DIR = app_dir()
 APP_ICON = APP_DIR / "assets" / "app_icon.ico"
-WHISPER_EXE = APP_DIR / ".tools" / "whisper.cpp-build-compat" / "bin" / "whisper-cli.exe"
-MODELS_DIR = APP_DIR / "models"
-MODEL_OPTIONS = {
-    "tiny-q5_1: быстрее, менее точно": MODELS_DIR / "ggml-tiny-q5_1.bin",
-    "base-q5_1: рекомендовано": MODELS_DIR / "ggml-base-q5_1.bin",
-    "small-q5_1: точнее, медленно": MODELS_DIR / "ggml-small-q5_1.bin",
+WHISPER_BACKENDS = {
+    "avx2": APP_DIR / ".tools" / "whisper.cpp-build-avx2" / "bin" / "whisper-cli.exe",
+    "compat": APP_DIR / ".tools" / "whisper.cpp-build-compat" / "bin" / "whisper-cli.exe",
 }
+DISABLED_WHISPER_BACKENDS: set[str] = set()
+WHISPER_EXE = WHISPER_BACKENDS["compat"]
+MODELS_DIR = APP_DIR / "models"
+MODEL_LABELS = {
+    "tiny-q5_1": "tiny-q5_1: быстрее, менее точно",
+    "base-q5_1": "base-q5_1: рекомендовано",
+    "small-q5_1": "small-q5_1: точнее, медленно",
+}
+MODEL_FILES = {
+    "tiny-q5_1": MODELS_DIR / "ggml-tiny-q5_1.bin",
+    "base-q5_1": MODELS_DIR / "ggml-base-q5_1.bin",
+    "small-q5_1": MODELS_DIR / "ggml-small-q5_1.bin",
+}
+MODEL_OPTIONS = {MODEL_LABELS[key]: MODEL_FILES[key] for key in MODEL_LABELS}
+MODEL_KEY_BY_LABEL = {label: key for key, label in MODEL_LABELS.items()}
 DEFAULT_MODEL_LABEL = "base-q5_1: рекомендовано"
+PROFILE_MODEL_KEYS = {
+    "Авто": None,
+    "Быстро": "tiny-q5_1",
+    "Баланс": "base-q5_1",
+    "Точно": "small-q5_1",
+}
+DEFAULT_PROFILE_LABEL = "Авто"
+FALLBACK_AUTO_MODEL_KEY = "base-q5_1"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
@@ -38,7 +61,210 @@ SILENCE_WINDOW_MS = 30
 SILENCE_PADDING_MS = 250
 SILENCE_PEAK_THRESHOLD = 350
 MIN_AUDIO_MS = 600
+VAD_FRAME_MS = 20
+VAD_PADDING_MS = 180
+VAD_MAX_INTERNAL_SILENCE_MS = 450
+VAD_MIN_RMS = 80.0
+VAD_MIN_PEAK = 350
+VAD_NOISE_MULTIPLIER = 3.0
+BENCHMARK_AUDIO_SECONDS = 2.0
 FIREWALL_RULE_NAME = "VoiceHelper Block Outbound"
+
+
+def performance_profile_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "VoiceHelper" / "performance_profile.json"
+    return APP_DIR / "performance_profile.json"
+
+
+PERFORMANCE_PROFILE_PATH = performance_profile_path()
+
+
+def available_whisper_backends() -> list[tuple[str, Path]]:
+    return [(name, path) for name, path in WHISPER_BACKENDS.items() if path.exists() and name not in DISABLED_WHISPER_BACKENDS]
+
+
+def build_whisper_command(exe_path: Path, model_path: Path, wav_path: Path, out_base: Path) -> list[str]:
+    return [
+        str(exe_path),
+        "-m",
+        str(model_path),
+        "-f",
+        str(wav_path),
+        "-l",
+        "ru",
+        "-t",
+        "4",
+        "-nt",
+        "-np",
+        "-nf",
+        "-otxt",
+        "-of",
+        str(out_base),
+    ]
+
+
+def decode_process_output(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def run_whisper_with_fallback(model_path: Path, wav_path: Path, out_base: Path, timeout_seconds: int | None = None) -> tuple[str, subprocess.CompletedProcess[bytes]]:
+    backends = available_whisper_backends()
+    if not backends:
+        expected = "\n".join(str(path) for path in WHISPER_BACKENDS.values())
+        raise RuntimeError(f"missing-whisper-cli::{expected}")
+
+    txt_path = out_base.with_suffix(".txt")
+    errors: list[str] = []
+
+    for backend_name, exe_path in backends:
+        if txt_path.exists():
+            txt_path.unlink()
+
+        command = build_whisper_command(exe_path, model_path, wav_path, out_base)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(APP_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            errors.append(f"{backend_name}: timeout after {timeout_seconds} seconds")
+            continue
+        except Exception as exc:
+            errors.append(f"{backend_name}: {exc}")
+            continue
+
+        if completed.returncode == 0 and txt_path.exists():
+            return backend_name, completed
+
+        stderr_text = decode_process_output(completed.stderr)
+        stdout_text = decode_process_output(completed.stdout)
+        detail = stderr_text or stdout_text or "stderr/stdout пустой"
+        if completed.returncode == 0 and not txt_path.exists():
+            detail = "TXT output was not created"
+        if completed.returncode in (3221225501, -1073741795):
+            DISABLED_WHISPER_BACKENDS.add(backend_name)
+            detail = f"{detail}; backend disabled for this session after illegal instruction exit"
+        errors.append(f"{backend_name}: exit {completed.returncode}; {detail}")
+
+    technical = "\n".join(errors) if errors else "no backend attempts were made"
+    raise RuntimeError(f"whisper-failed::1::{technical}")
+
+
+def load_performance_profile() -> dict:
+    try:
+        if PERFORMANCE_PROFILE_PATH.exists():
+            return json.loads(PERFORMANCE_PROFILE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {}
+
+
+def save_performance_profile(data: dict) -> None:
+    PERFORMANCE_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PERFORMANCE_PROFILE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def choose_auto_model_key(results: dict | None = None) -> str:
+    if results is None:
+        results = load_performance_profile().get("results", {})
+
+    def realtime_factor(model_key: str) -> float | None:
+        item = results.get(model_key)
+        if not isinstance(item, dict) or not item.get("ok"):
+            return None
+        try:
+            return float(item["realtime_factor"])
+        except Exception:
+            return None
+
+    small_rtf = realtime_factor("small-q5_1")
+    base_rtf = realtime_factor("base-q5_1")
+    tiny_rtf = realtime_factor("tiny-q5_1")
+
+    if small_rtf is not None and small_rtf <= 1.5:
+        return "small-q5_1"
+    if base_rtf is not None and base_rtf <= 2.5:
+        return "base-q5_1"
+    if tiny_rtf is not None:
+        return "tiny-q5_1"
+    return FALLBACK_AUTO_MODEL_KEY
+
+
+def write_benchmark_wav(wav_path: Path, seconds: float = BENCHMARK_AUDIO_SECONDS) -> None:
+    total_frames = int(SAMPLE_RATE * seconds)
+    frames = bytearray()
+    for index in range(total_frames):
+        t = index / SAMPLE_RATE
+        envelope = 0.0 if t < 0.15 or t > seconds - 0.15 else 1.0
+        sample = int(envelope * (2200 * math.sin(2 * math.pi * 220 * t) + 900 * math.sin(2 * math.pi * 440 * t)))
+        frames.extend(sample.to_bytes(SAMPLE_WIDTH_BYTES, byteorder="little", signed=True))
+
+    with wave.open(str(wav_path), "wb") as wav:
+        wav.setnchannels(CHANNELS)
+        wav.setsampwidth(SAMPLE_WIDTH_BYTES)
+        wav.setframerate(SAMPLE_RATE)
+        wav.writeframes(bytes(frames))
+
+
+def run_model_benchmark(allow_missing_models: bool = False, print_fn=None) -> dict:
+    results: dict[str, dict] = {}
+
+    with tempfile.TemporaryDirectory(prefix="voicehelper_benchmark_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        wav_path = tmp_path / "benchmark.wav"
+        write_benchmark_wav(wav_path)
+
+        for model_key, model_path in MODEL_FILES.items():
+            if not model_path.exists():
+                results[model_key] = {"ok": False, "error": f"missing model: {model_path}"}
+                if print_fn:
+                    print_fn(f"{model_key}: missing model")
+                if not allow_missing_models:
+                    continue
+                continue
+
+            out_base = tmp_path / f"benchmark_{model_key}"
+            started_at = time.perf_counter()
+            try:
+                backend_name, _completed = run_whisper_with_fallback(
+                    model_path,
+                    wav_path,
+                    out_base,
+                    timeout_seconds=300,
+                )
+                elapsed = time.perf_counter() - started_at
+                rtf = elapsed / BENCHMARK_AUDIO_SECONDS
+                results[model_key] = {
+                    "ok": True,
+                    "backend": backend_name,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "realtime_factor": round(rtf, 3),
+                }
+                if print_fn:
+                    print_fn(f"{model_key}: {elapsed:.2f}s, realtime x{rtf:.2f}, backend={backend_name}")
+            except Exception as exc:
+                results[model_key] = {"ok": False, "error": str(exc)}
+                if print_fn:
+                    print_fn(f"{model_key}: failed: {exc}")
+
+    selected_model = choose_auto_model_key(results)
+    profile = {
+        "version": 1,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        "audio_seconds": BENCHMARK_AUDIO_SECONDS,
+        "selected_model": selected_model,
+        "results": results,
+    }
+    if any(item.get("ok") for item in results.values()):
+        save_performance_profile(profile)
+    return profile
 
 
 class VoiceHelperApp:
@@ -56,6 +282,7 @@ class VoiceHelperApp:
         self.is_recording = False
         self.is_recognizing = False
         self.is_testing_microphone = False
+        self.is_benchmarking = False
         self.record_started_at: float | None = None
         self.record_sample_rate = SAMPLE_RATE
         self.mic_test_stream: sd.RawInputStream | None = None
@@ -70,6 +297,8 @@ class VoiceHelperApp:
         self.record_time_var = tk.StringVar(value="Запись: 00:00")
         self.recognition_time_var = tk.StringVar(value="Распознавание: -")
         self.firewall_status_var = tk.StringVar(value="Сеть: проверка...")
+        self.speed_status_var = tk.StringVar(value="Скорость: авто")
+        self.profile_var = tk.StringVar(value=DEFAULT_PROFILE_LABEL)
         self.model_var = tk.StringVar(value=DEFAULT_MODEL_LABEL)
         self.input_device_var = tk.StringVar(value="")
         self.input_level_var = tk.DoubleVar(value=0)
@@ -77,6 +306,7 @@ class VoiceHelperApp:
         self.spellcheck_status_var = tk.StringVar(value="Орфография: авто")
 
         self._build_ui()
+        self._apply_profile_selection()
         self.refresh_input_devices()
         self._check_local_files()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -119,6 +349,21 @@ class VoiceHelperApp:
             width=28,
         )
         self.model_box.grid(row=0, column=7, sticky="e")
+        self.model_box.bind("<<ComboboxSelected>>", self._on_model_changed)
+
+        ttk.Label(toolbar, text="Профиль:").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 6))
+        self.profile_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.profile_var,
+            values=list(PROFILE_MODEL_KEYS.keys()),
+            state="readonly",
+            width=12,
+        )
+        self.profile_box.grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(0, 8))
+        self.profile_box.bind("<<ComboboxSelected>>", self._on_profile_changed)
+        self.benchmark_button = ttk.Button(toolbar, text="Бенчмарк", command=self.start_model_benchmark)
+        self.benchmark_button.grid(row=1, column=2, sticky="w", pady=(8, 0), padx=(0, 12))
+        ttk.Label(toolbar, textvariable=self.speed_status_var).grid(row=1, column=3, columnspan=5, sticky="w", pady=(8, 0))
 
         info = ttk.Frame(self.root, padding=(12, 0, 12, 6))
         info.grid(row=1, column=0, sticky="ew")
@@ -182,8 +427,8 @@ class VoiceHelperApp:
 
     def _check_local_files(self) -> None:
         missing = []
-        if not WHISPER_EXE.exists():
-            missing.append(str(WHISPER_EXE))
+        if not available_whisper_backends():
+            missing.extend(str(path) for path in WHISPER_BACKENDS.values())
         for model_path in MODEL_OPTIONS.values():
             if not model_path.exists():
                 missing.append(str(model_path))
@@ -204,6 +449,72 @@ class VoiceHelperApp:
                 ),
             )
             self.record_button.configure(state=tk.DISABLED)
+
+    def _on_profile_changed(self, event=None) -> None:
+        self._apply_profile_selection()
+
+    def _on_model_changed(self, event=None) -> None:
+        self._update_speed_status()
+
+    def _apply_profile_selection(self) -> None:
+        profile = self.profile_var.get()
+        model_key = PROFILE_MODEL_KEYS.get(profile)
+        if model_key is None:
+            model_key = choose_auto_model_key()
+        self._select_model_key(model_key)
+        self._update_speed_status()
+
+    def _select_model_key(self, model_key: str) -> None:
+        label = MODEL_LABELS.get(model_key, DEFAULT_MODEL_LABEL)
+        self.model_var.set(label)
+
+    def _selected_model_key(self) -> str:
+        return MODEL_KEY_BY_LABEL.get(self.model_var.get(), MODEL_KEY_BY_LABEL[DEFAULT_MODEL_LABEL])
+
+    def _update_speed_status(self, vad_stats: dict | None = None, backend_name: str | None = None) -> None:
+        profile = self.profile_var.get()
+        model_key = self._selected_model_key()
+        backend = backend_name or self._preferred_backend_name()
+        parts = [f"Скорость: {profile.lower()}, модель {model_key}", f"backend {backend}"]
+        if vad_stats:
+            reduction = vad_stats.get("reduction_percent", 0)
+            parts.append(f"VAD -{reduction:.0f}%")
+        self.speed_status_var.set("; ".join(parts))
+
+    def _preferred_backend_name(self) -> str:
+        backends = available_whisper_backends()
+        return backends[0][0] if backends else "нет whisper-cli"
+
+    def start_model_benchmark(self) -> None:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
+            return
+
+        self.is_benchmarking = True
+        self._set_status("Бенчмарк моделей...")
+        self.record_button.configure(state=tk.DISABLED)
+        self.stop_button.configure(state=tk.DISABLED)
+        self.model_box.configure(state=tk.DISABLED)
+        self.profile_box.configure(state=tk.DISABLED)
+        self.benchmark_button.configure(state=tk.DISABLED)
+        threading.Thread(target=self._benchmark_models_worker, daemon=True).start()
+
+    def _benchmark_models_worker(self) -> None:
+        try:
+            profile = run_model_benchmark(allow_missing_models=True)
+            if not any(item.get("ok") for item in profile.get("results", {}).values()):
+                raise RuntimeError("No local models were available for benchmark.")
+            self.ui_queue.put(("benchmark_result", profile))
+        except Exception as exc:
+            self.ui_queue.put(("benchmark_error", self._format_problem_message(
+                "Не удалось выполнить бенчмарк моделей.",
+                [
+                    "Проверьте, что рядом с VoiceHelper.exe есть папки models и .tools.",
+                    "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
+                ],
+                technical=self._shorten_technical_text(str(exc)),
+            )))
+        finally:
+            self.ui_queue.put(("benchmark_ready", None))
 
     def refresh_input_devices(self) -> None:
         previous_value = self.input_device_var.get()
@@ -343,7 +654,7 @@ class VoiceHelperApp:
             return SAMPLE_RATE
 
     def start_microphone_test(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
             return
 
         self.mic_test_peak = 0
@@ -373,6 +684,8 @@ class VoiceHelperApp:
         self.record_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
+        self.profile_box.configure(state=tk.DISABLED)
+        self.benchmark_button.configure(state=tk.DISABLED)
         self.input_device_box.configure(state=tk.DISABLED)
         self.refresh_input_button.configure(state=tk.DISABLED)
         self.test_input_button.configure(state=tk.DISABLED)
@@ -393,6 +706,8 @@ class VoiceHelperApp:
         self.record_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state="readonly")
+        self.profile_box.configure(state="readonly")
+        self.benchmark_button.configure(state=tk.NORMAL)
         self.input_device_box.configure(state="readonly")
         self.refresh_input_button.configure(state=tk.NORMAL)
         self.test_input_button.configure(state=tk.NORMAL)
@@ -417,7 +732,7 @@ class VoiceHelperApp:
             )
 
     def start_recording(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
             return
 
         self.audio_chunks = []
@@ -446,6 +761,8 @@ class VoiceHelperApp:
         self.record_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL)
         self.model_box.configure(state=tk.DISABLED)
+        self.profile_box.configure(state=tk.DISABLED)
+        self.benchmark_button.configure(state=tk.DISABLED)
         self.input_device_box.configure(state=tk.DISABLED)
         self.refresh_input_button.configure(state=tk.DISABLED)
         self.test_input_button.configure(state=tk.DISABLED)
@@ -488,6 +805,8 @@ class VoiceHelperApp:
             self._set_status("Готово")
             self.record_button.configure(state=tk.NORMAL)
             self.model_box.configure(state="readonly")
+            self.profile_box.configure(state="readonly")
+            self.benchmark_button.configure(state=tk.NORMAL)
             self.input_device_box.configure(state="readonly")
             self.refresh_input_button.configure(state=tk.NORMAL)
             self.test_input_button.configure(state=tk.NORMAL)
@@ -798,7 +1117,7 @@ class VoiceHelperApp:
         self.input_level_text_var.set(f"Уровень: {value}%")
 
     def _selected_model_path(self) -> Path:
-        return MODEL_OPTIONS.get(self.model_var.get(), MODEL_OPTIONS[DEFAULT_MODEL_LABEL])
+        return MODEL_FILES.get(self._selected_model_key(), MODEL_OPTIONS[DEFAULT_MODEL_LABEL])
 
     def _recognize_audio(self) -> None:
         wav_path: Path | None = None
@@ -811,13 +1130,14 @@ class VoiceHelperApp:
                 wav_path = Path(wav_file.name)
 
             selected_model = self._selected_model_path()
-            if not WHISPER_EXE.exists():
-                raise RuntimeError(f"missing-whisper-cli::{WHISPER_EXE}")
+            if not available_whisper_backends():
+                expected = "\n".join(str(path) for path in WHISPER_BACKENDS.values())
+                raise RuntimeError(f"missing-whisper-cli::{expected}")
             if not selected_model.exists():
                 raise RuntimeError(f"missing-model::{selected_model}")
 
             sample_rate = self.record_sample_rate or SAMPLE_RATE
-            audio_bytes = self._trim_silence(b"".join(self.audio_chunks), sample_rate)
+            audio_bytes, vad_stats = self._trim_silence(b"".join(self.audio_chunks), sample_rate)
             audio_ms = len(audio_bytes) / (sample_rate * SAMPLE_WIDTH_BYTES) * 1000
             if audio_ms < MIN_AUDIO_MS:
                 raise RuntimeError("silent-or-short-recording")
@@ -833,46 +1153,15 @@ class VoiceHelperApp:
             if txt_path.exists():
                 txt_path.unlink()
 
-            command = [
-                str(WHISPER_EXE),
-                "-m",
-                str(selected_model),
-                "-f",
-                str(wav_path),
-                "-l",
-                "ru",
-                "-t",
-                "4",
-                "-nt",
-                "-np",
-                "-nf",
-                "-otxt",
-                "-of",
-                str(out_base),
-            ]
-
-            completed = subprocess.run(
-                command,
-                cwd=str(APP_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                check=False,
-            )
+            backend_name, completed = run_whisper_with_fallback(selected_model, wav_path, out_base)
 
             elapsed = time.perf_counter() - started_at
-
-            if completed.returncode != 0:
-                error_text = completed.stderr.decode("utf-8", errors="replace").strip()
-                if not error_text:
-                    error_text = completed.stdout.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"whisper-failed::{completed.returncode}::{error_text}")
 
             if not txt_path.exists():
                 raise RuntimeError("missing-recognition-output")
 
             recognized = txt_path.read_text(encoding="utf-8").strip()
-            self.ui_queue.put(("recognized", (recognized, elapsed)))
+            self.ui_queue.put(("recognized", (recognized, elapsed, backend_name, vad_stats)))
         except Exception as exc:
             self.ui_queue.put(("error", self._format_recognition_error(exc)))
         finally:
@@ -897,10 +1186,11 @@ class VoiceHelperApp:
             elif event == "input_level":
                 self._set_input_level(int(value))
             elif event == "recognized":
-                recognized, elapsed = value
+                recognized, elapsed, backend_name, vad_stats = value
                 self.text.delete("1.0", tk.END)
                 self.text.insert("1.0", str(recognized))
                 self.recognition_time_var.set(f"Распознавание: {elapsed:.1f} с")
+                self._update_speed_status(vad_stats=vad_stats, backend_name=backend_name)
                 self._set_status("Готово")
                 self._schedule_spellcheck(delay_ms=100)
             elif event == "error":
@@ -911,6 +1201,28 @@ class VoiceHelperApp:
                 self.record_button.configure(state=tk.NORMAL)
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
+                self.profile_box.configure(state="readonly")
+                self.benchmark_button.configure(state=tk.NORMAL)
+                self.input_device_box.configure(state="readonly")
+                self.refresh_input_button.configure(state=tk.NORMAL)
+                self.test_input_button.configure(state=tk.NORMAL)
+            elif event == "benchmark_result":
+                profile = value
+                selected_model = profile.get("selected_model", FALLBACK_AUTO_MODEL_KEY)
+                self.profile_var.set(DEFAULT_PROFILE_LABEL)
+                self._select_model_key(selected_model)
+                self._update_speed_status()
+                self._set_status(f"Бенчмарк готов: выбрана модель {selected_model}")
+            elif event == "benchmark_error":
+                self._set_status("Ошибка бенчмарка")
+                messagebox.showerror("VoiceHelper", str(value))
+            elif event == "benchmark_ready":
+                self.is_benchmarking = False
+                self.record_button.configure(state=tk.NORMAL)
+                self.stop_button.configure(state=tk.DISABLED)
+                self.model_box.configure(state="readonly")
+                self.profile_box.configure(state="readonly")
+                self.benchmark_button.configure(state=tk.NORMAL)
                 self.input_device_box.configure(state="readonly")
                 self.refresh_input_button.configure(state=tk.NORMAL)
                 self.test_input_button.configure(state=tk.NORMAL)
@@ -1145,10 +1457,109 @@ del "%~f0" >nul 2>nul
         if result <= 32:
             raise RuntimeError(f"Windows отказала в запуске с повышенными правами. Код ShellExecute: {result}")
 
-    def _trim_silence(self, audio: bytes, sample_rate: int) -> bytes:
+    def _trim_silence(self, audio: bytes, sample_rate: int) -> tuple[bytes, dict]:
+        stats = {
+            "mode": "simple-vad",
+            "original_ms": 0.0,
+            "trimmed_ms": 0.0,
+            "reduction_percent": 0.0,
+            "segments": 0,
+        }
         if not audio:
-            return audio
+            return audio, stats
 
+        original_ms = len(audio) / (sample_rate * SAMPLE_WIDTH_BYTES) * 1000
+        stats["original_ms"] = original_ms
+
+        frame_bytes = max(SAMPLE_WIDTH_BYTES, sample_rate * SAMPLE_WIDTH_BYTES * VAD_FRAME_MS // 1000)
+        frame_bytes -= frame_bytes % SAMPLE_WIDTH_BYTES
+        if frame_bytes <= 0:
+            return audio, stats
+
+        frames: list[tuple[int, int, float, int]] = []
+        for start in range(0, len(audio), frame_bytes):
+            end = min(start + frame_bytes, len(audio))
+            window = audio[start:end]
+            if len(window) < SAMPLE_WIDTH_BYTES:
+                continue
+            samples = memoryview(window).cast("h")
+            if not samples:
+                continue
+            peak = max(abs(sample) for sample in samples)
+            rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+            frames.append((start, end, rms, peak))
+
+        if not frames:
+            return b"", stats
+
+        sorted_rms = sorted(frame[2] for frame in frames)
+        quiet_count = max(1, len(sorted_rms) // 5)
+        noise_floor = sum(sorted_rms[:quiet_count]) / quiet_count
+        threshold = max(VAD_MIN_RMS, noise_floor * VAD_NOISE_MULTIPLIER)
+        raw_speech = [(rms >= threshold or peak >= VAD_MIN_PEAK) for _start, _end, rms, peak in frames]
+
+        hangover_frames = max(1, VAD_PADDING_MS // VAD_FRAME_MS)
+        speech = raw_speech[:]
+        for index, is_speech in enumerate(raw_speech):
+            if not is_speech:
+                continue
+            left = max(0, index - hangover_frames)
+            right = min(len(speech), index + hangover_frames + 1)
+            for padded_index in range(left, right):
+                speech[padded_index] = True
+
+        segments: list[tuple[int, int]] = []
+        start_index: int | None = None
+        for index, is_speech in enumerate(speech):
+            if is_speech and start_index is None:
+                start_index = index
+            elif not is_speech and start_index is not None:
+                segments.append((start_index, index - 1))
+                start_index = None
+        if start_index is not None:
+            segments.append((start_index, len(speech) - 1))
+
+        if not segments:
+            legacy = self._trim_silence_by_peak(audio, sample_rate)
+            stats["mode"] = "peak-fallback"
+            stats["trimmed_ms"] = len(legacy) / (sample_rate * SAMPLE_WIDTH_BYTES) * 1000
+            if original_ms > 0:
+                stats["reduction_percent"] = max(0.0, (1 - stats["trimmed_ms"] / original_ms) * 100)
+            stats["segments"] = 1 if legacy else 0
+            return legacy, stats
+
+        max_gap_frames = max(1, VAD_MAX_INTERNAL_SILENCE_MS // VAD_FRAME_MS)
+        merged: list[tuple[int, int]] = []
+        for segment_start, segment_end in segments:
+            if not merged:
+                merged.append((segment_start, segment_end))
+                continue
+            prev_start, prev_end = merged[-1]
+            if segment_start - prev_end - 1 <= max_gap_frames:
+                merged[-1] = (prev_start, segment_end)
+            else:
+                merged.append((segment_start, segment_end))
+
+        parts: list[bytes] = []
+        padding_frames = max(1, VAD_PADDING_MS // VAD_FRAME_MS)
+        for segment_start, segment_end in merged:
+            padded_start = max(0, segment_start - padding_frames)
+            padded_end = min(len(frames) - 1, segment_end + padding_frames)
+            byte_start = frames[padded_start][0]
+            byte_end = frames[padded_end][1]
+            byte_start -= byte_start % SAMPLE_WIDTH_BYTES
+            byte_end -= byte_end % SAMPLE_WIDTH_BYTES
+            parts.append(audio[byte_start:byte_end])
+
+        trimmed = b"".join(parts)
+        trimmed_ms = len(trimmed) / (sample_rate * SAMPLE_WIDTH_BYTES) * 1000
+        stats["trimmed_ms"] = trimmed_ms
+        stats["reduction_percent"] = max(0.0, (1 - trimmed_ms / original_ms) * 100) if original_ms > 0 else 0.0
+        stats["segments"] = len(merged)
+        stats["threshold"] = round(threshold, 1)
+        return trimmed, stats
+
+    def _trim_silence_by_peak(self, audio: bytes, sample_rate: int) -> bytes:
         bytes_per_ms = sample_rate * SAMPLE_WIDTH_BYTES // 1000
         window_size = max(SAMPLE_WIDTH_BYTES, bytes_per_ms * SILENCE_WINDOW_MS)
         window_size -= window_size % SAMPLE_WIDTH_BYTES
@@ -1195,6 +1606,15 @@ def main() -> None:
         print("VoiceHelper spell-test passed.")
         raise SystemExit(0)
 
+    if "--benchmark-models" in sys.argv:
+        allow_missing_models = "--allow-missing-models" in sys.argv
+        profile = run_model_benchmark(allow_missing_models=allow_missing_models, print_fn=print)
+        print(f"selected_model={profile.get('selected_model', FALLBACK_AUTO_MODEL_KEY)}")
+        print(f"profile={PERFORMANCE_PROFILE_PATH}")
+        if not any(item.get("ok") for item in profile.get("results", {}).values()):
+            raise SystemExit(1)
+        raise SystemExit(0)
+
     if "--self-test" in sys.argv:
         allow_missing_models = "--allow-missing-models" in sys.argv
         required = [WHISPER_EXE] if allow_missing_models else [WHISPER_EXE, *MODEL_OPTIONS.values()]
@@ -1213,7 +1633,8 @@ def main() -> None:
         print("VoiceHelper self-test passed.")
         print(f"APP_DIR={APP_DIR}")
         print(f"APP_ICON={APP_ICON}")
-        print(f"WHISPER_EXE={WHISPER_EXE}")
+        print(f"WHISPER_BACKENDS={[(name, str(path), path.exists()) for name, path in WHISPER_BACKENDS.items()]}")
+        print(f"PERFORMANCE_PROFILE={PERFORMANCE_PROFILE_PATH}")
         raise SystemExit(0)
 
     root = tk.Tk()

@@ -45,6 +45,17 @@ Copy-Item `
     -Recurse `
     -Force
 
+$avx2Source = ".tools\whisper.cpp-build-avx2\bin"
+if (Test-Path -LiteralPath (Join-Path $avx2Source "whisper-cli.exe")) {
+    New-Item -ItemType Directory -Force -Path "$dist\.tools\whisper.cpp-build-avx2\bin" | Out-Null
+    foreach ($fileName in @("whisper-cli.exe", "whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll")) {
+        $source = Join-Path $avx2Source $fileName
+        if (Test-Path -LiteralPath $source) {
+            Copy-Item -LiteralPath $source -Destination "$dist\.tools\whisper.cpp-build-avx2\bin" -Force
+        }
+    }
+}
+
 Copy-Item -LiteralPath `
     "assets\app_icon.ico", `
     "assets\app_icon.png" `
@@ -58,6 +69,7 @@ Copy-Item -LiteralPath `
     "docs\STAGE_0_2_1_MICROPHONE.md", `
     "docs\STAGE_0_2_2_DIAGNOSTICS.md", `
     "docs\STAGE_0_2_3_ERROR_MESSAGES.md", `
+    "docs\STAGE_0_3_SPEED.md", `
     "docs\USER_CHECKLIST.md" `
     -Destination "$dist\docs" `
     -Force
@@ -71,6 +83,8 @@ Copy-Item -LiteralPath `
     "scripts\check_russian_spellcheck.cmd", `
     "scripts\diagnose_voicehelper.ps1", `
     "scripts\diagnose_voicehelper.cmd", `
+    "scripts\benchmark_voicehelper_models.ps1", `
+    "scripts\benchmark_voicehelper_models.cmd", `
     "scripts\list_audio_devices.ps1", `
     "scripts\list_audio_devices.cmd", `
     "scripts\audit_voicehelper_network.ps1", `

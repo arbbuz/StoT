@@ -28,7 +28,8 @@ python voicehelper.py
 
 Workflow:
 
-- скачивает pinned `whisper.cpp` Windows x64 release;
+- скачивает pinned `whisper.cpp` Windows x64 release для optional AVX2 backend;
+- собирает scalar compat backend `whisper.cpp` из исходников без AVX/AVX2/FMA/F16C/SSE4.2/BMI2;
 - не скачивает и не упаковывает модели `tiny/base/small q5_1`;
 - собирает `VoiceHelper.exe` через PyInstaller;
 - упаковывает `dist/VoiceHelper` в ZIP;
@@ -49,9 +50,12 @@ models\ggml-small-q5_1.bin
 - показывает результат в большом текстовом поле;
 - позволяет скопировать текст в буфер обмена;
 - позволяет выбрать модель: `tiny-q5_1`, `base-q5_1`, `small-q5_1`;
+- позволяет выбрать профиль скорости: `Авто`, `Быстро`, `Баланс`, `Точно`;
+- может запустить локальный бенчмарк моделей и автоматически выбрать модель для профиля `Авто`;
 - показывает таймер записи и время распознавания;
 - показывает статус сетевой блокировки и позволяет запустить создание firewall-правила;
 - обрезает тишину в начале и конце записи;
+- использует простой локальный VAD для удаления длинной тишины перед распознаванием;
 - удаляет временный WAV и промежуточный TXT после распознавания.
 - использует локальную иконку приложения `assets/app_icon.ico`.
 
@@ -59,7 +63,8 @@ models\ggml-small-q5_1.bin
 
 Ожидаемые файлы:
 
-- `.tools/whisper.cpp-build-compat/bin/whisper-cli.exe`
+- `.tools/whisper.cpp-build-compat/bin/whisper-cli.exe` - scalar compat fallback
+- `.tools/whisper.cpp-build-avx2/bin/whisper-cli.exe` - optional, если подготовлена AVX2-сборка
 - `models/ggml-tiny-q5_1.bin`
 - `models/ggml-base-q5_1.bin`
 - `models/ggml-small-q5_1.bin`
@@ -100,6 +105,12 @@ models\ggml-small-q5_1.bin
 
 ```powershell
 .\scripts\audit_voicehelper_network.ps1 -ProgramPath ".\dist\VoiceHelper\VoiceHelper.exe" -Seconds 30
+```
+
+Для локального бенчмарка моделей:
+
+```powershell
+.\scripts\benchmark_voicehelper_models.ps1
 ```
 
 ## Документы пилота
