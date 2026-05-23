@@ -1,8 +1,10 @@
 import queue
 import ctypes
+import ctypes.wintypes
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -27,11 +29,25 @@ def app_dir() -> Path:
 APP_DIR = app_dir()
 APP_ICON = APP_DIR / "assets" / "app_icon.ico"
 WHISPER_BACKENDS = {
+    "vulkan": APP_DIR / ".tools" / "whisper.cpp-build-vulkan" / "bin" / "whisper-cli.exe",
+    "cuda": APP_DIR / ".tools" / "whisper.cpp-build-cuda" / "bin" / "whisper-cli.exe",
+    "openvino": APP_DIR / ".tools" / "whisper.cpp-build-openvino" / "bin" / "whisper-cli.exe",
     "avx2": APP_DIR / ".tools" / "whisper.cpp-build-avx2" / "bin" / "whisper-cli.exe",
     "compat": APP_DIR / ".tools" / "whisper.cpp-build-compat" / "bin" / "whisper-cli.exe",
 }
 DISABLED_WHISPER_BACKENDS: set[str] = set()
 WHISPER_EXE = WHISPER_BACKENDS["compat"]
+BACKEND_LABELS = {
+    "auto": "Авто",
+    "vulkan": "Vulkan",
+    "cuda": "CUDA",
+    "openvino": "OpenVINO",
+    "avx2": "AVX2",
+    "compat": "Compat",
+}
+BACKEND_KEY_BY_LABEL = {label: key for key, label in BACKEND_LABELS.items()}
+DEFAULT_BACKEND_LABEL = BACKEND_LABELS["auto"]
+FALLBACK_AUTO_BACKEND_KEY = "compat"
 MODELS_DIR = APP_DIR / "models"
 MODEL_LABELS = {
     "tiny-q5_1": "tiny-q5_1: быстрее, менее точно",
@@ -69,6 +85,19 @@ VAD_MIN_PEAK = 350
 VAD_NOISE_MULTIPLIER = 3.0
 BENCHMARK_AUDIO_SECONDS = 2.0
 FIREWALL_RULE_NAME = "VoiceHelper Block Outbound"
+HOTKEY_LABEL = "Ctrl+Shift+Space"
+HOTKEY_ID = 1
+HOTKEY_MODIFIERS = 0x0002 | 0x0004
+HOTKEY_MOD_NOREPEAT = 0x4000
+HOTKEY_VK_SPACE = 0x20
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+DEFAULT_USER_SETTINGS = {
+    "auto_copy": False,
+    "format_text": True,
+    "voice_punctuation": True,
+    "backend": "auto",
+}
 
 
 def performance_profile_path() -> Path:
@@ -81,8 +110,95 @@ def performance_profile_path() -> Path:
 PERFORMANCE_PROFILE_PATH = performance_profile_path()
 
 
-def available_whisper_backends() -> list[tuple[str, Path]]:
-    return [(name, path) for name, path in WHISPER_BACKENDS.items() if path.exists() and name not in DISABLED_WHISPER_BACKENDS]
+def backend_profile_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "VoiceHelper" / "backend_profile.json"
+    return APP_DIR / "backend_profile.json"
+
+
+BACKEND_PROFILE_PATH = backend_profile_path()
+
+
+def user_settings_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "VoiceHelper" / "settings.json"
+    return APP_DIR / "settings.json"
+
+
+USER_SETTINGS_PATH = user_settings_path()
+
+
+def is_whisper_backend_available(backend_name: str) -> bool:
+    path = WHISPER_BACKENDS.get(backend_name)
+    return bool(path and path.exists() and backend_name not in DISABLED_WHISPER_BACKENDS)
+
+
+def load_backend_profile() -> dict:
+    try:
+        if BACKEND_PROFILE_PATH.exists():
+            return json.loads(BACKEND_PROFILE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {}
+
+
+def save_backend_profile(data: dict) -> None:
+    BACKEND_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BACKEND_PROFILE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def choose_auto_backend_key(results: dict | None = None) -> str:
+    if results is None:
+        selected = load_backend_profile().get("selected_backend")
+        if isinstance(selected, str) and is_whisper_backend_available(selected):
+            return selected
+        results = load_backend_profile().get("results", {})
+
+    best_backend: str | None = None
+    best_elapsed: float | None = None
+    for backend_name in WHISPER_BACKENDS:
+        item = results.get(backend_name) if isinstance(results, dict) else None
+        if not isinstance(item, dict) or not item.get("ok"):
+            continue
+        try:
+            elapsed = float(item["elapsed_seconds"])
+        except Exception:
+            continue
+        if best_elapsed is None or elapsed < best_elapsed:
+            best_backend = backend_name
+            best_elapsed = elapsed
+
+    if best_backend and is_whisper_backend_available(best_backend):
+        return best_backend
+    for backend_name in WHISPER_BACKENDS:
+        if is_whisper_backend_available(backend_name):
+            return backend_name
+    return FALLBACK_AUTO_BACKEND_KEY
+
+
+def available_whisper_backends(preferred_backend_key: str | None = None) -> list[tuple[str, Path]]:
+    available = [(name, path) for name, path in WHISPER_BACKENDS.items() if is_whisper_backend_available(name)]
+    if not available:
+        return []
+
+    priority: list[str] = []
+    if preferred_backend_key and preferred_backend_key != "auto":
+        priority.append(preferred_backend_key)
+    else:
+        priority.append(choose_auto_backend_key())
+    priority.extend(WHISPER_BACKENDS.keys())
+
+    ordered: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    available_by_name = dict(available)
+    for backend_name in priority:
+        if backend_name in seen or backend_name not in available_by_name:
+            continue
+        ordered.append((backend_name, available_by_name[backend_name]))
+        seen.add(backend_name)
+    return ordered
 
 
 def build_whisper_command(exe_path: Path, model_path: Path, wav_path: Path, out_base: Path) -> list[str]:
@@ -109,49 +225,73 @@ def decode_process_output(data: bytes) -> str:
     return data.decode("utf-8", errors="replace").strip()
 
 
-def run_whisper_with_fallback(model_path: Path, wav_path: Path, out_base: Path, timeout_seconds: int | None = None) -> tuple[str, subprocess.CompletedProcess[bytes]]:
-    backends = available_whisper_backends()
+def run_whisper_backend(
+    backend_name: str,
+    exe_path: Path,
+    model_path: Path,
+    wav_path: Path,
+    out_base: Path,
+    timeout_seconds: int | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    command = build_whisper_command(exe_path, model_path, wav_path, out_base)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(APP_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{backend_name}: timeout after {timeout_seconds} seconds")
+    except Exception as exc:
+        raise RuntimeError(f"{backend_name}: {exc}")
+
+    txt_path = out_base.with_suffix(".txt")
+    if completed.returncode == 0 and txt_path.exists():
+        return completed
+
+    stderr_text = decode_process_output(completed.stderr)
+    stdout_text = decode_process_output(completed.stdout)
+    detail = stderr_text or stdout_text or "stderr/stdout пустой"
+    if completed.returncode == 0 and not txt_path.exists():
+        detail = "TXT output was not created"
+    if completed.returncode in (3221225501, -1073741795):
+        DISABLED_WHISPER_BACKENDS.add(backend_name)
+        detail = f"{detail}; backend disabled for this session after illegal instruction exit"
+    raise RuntimeError(f"{backend_name}: exit {completed.returncode}; {detail}")
+
+
+def run_whisper_with_fallback(
+    model_path: Path,
+    wav_path: Path,
+    out_base: Path,
+    timeout_seconds: int | None = None,
+    preferred_backend_key: str | None = None,
+) -> tuple[str, subprocess.CompletedProcess[bytes]]:
+    backends = available_whisper_backends(preferred_backend_key)
     if not backends:
         expected = "\n".join(str(path) for path in WHISPER_BACKENDS.values())
         raise RuntimeError(f"missing-whisper-cli::{expected}")
 
     txt_path = out_base.with_suffix(".txt")
     errors: list[str] = []
+    if preferred_backend_key and preferred_backend_key != "auto" and not is_whisper_backend_available(preferred_backend_key):
+        preferred_path = WHISPER_BACKENDS.get(preferred_backend_key)
+        errors.append(f"{preferred_backend_key}: missing backend: {preferred_path}")
 
     for backend_name, exe_path in backends:
         if txt_path.exists():
             txt_path.unlink()
 
-        command = build_whisper_command(exe_path, model_path, wav_path, out_base)
         try:
-            completed = subprocess.run(
-                command,
-                cwd=str(APP_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                timeout=timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            errors.append(f"{backend_name}: timeout after {timeout_seconds} seconds")
-            continue
-        except Exception as exc:
-            errors.append(f"{backend_name}: {exc}")
-            continue
-
-        if completed.returncode == 0 and txt_path.exists():
+            completed = run_whisper_backend(backend_name, exe_path, model_path, wav_path, out_base, timeout_seconds)
             return backend_name, completed
-
-        stderr_text = decode_process_output(completed.stderr)
-        stdout_text = decode_process_output(completed.stdout)
-        detail = stderr_text or stdout_text or "stderr/stdout пустой"
-        if completed.returncode == 0 and not txt_path.exists():
-            detail = "TXT output was not created"
-        if completed.returncode in (3221225501, -1073741795):
-            DISABLED_WHISPER_BACKENDS.add(backend_name)
-            detail = f"{detail}; backend disabled for this session after illegal instruction exit"
-        errors.append(f"{backend_name}: exit {completed.returncode}; {detail}")
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            continue
 
     technical = "\n".join(errors) if errors else "no backend attempts were made"
     raise RuntimeError(f"whisper-failed::1::{technical}")
@@ -169,6 +309,123 @@ def load_performance_profile() -> dict:
 def save_performance_profile(data: dict) -> None:
     PERFORMANCE_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     PERFORMANCE_PROFILE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_user_settings() -> dict:
+    settings = dict(DEFAULT_USER_SETTINGS)
+    try:
+        if USER_SETTINGS_PATH.exists():
+            stored = json.loads(USER_SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                for key in ("auto_copy", "format_text", "voice_punctuation"):
+                    settings[key] = bool(stored.get(key, DEFAULT_USER_SETTINGS[key]))
+                backend = stored.get("backend", DEFAULT_USER_SETTINGS["backend"])
+                if backend in BACKEND_LABELS:
+                    settings["backend"] = backend
+    except Exception:
+        return dict(DEFAULT_USER_SETTINGS)
+    return settings
+
+
+def save_user_settings(settings: dict) -> None:
+    payload = {
+        "auto_copy": bool(settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"])),
+        "format_text": bool(settings.get("format_text", DEFAULT_USER_SETTINGS["format_text"])),
+        "voice_punctuation": bool(settings.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])),
+        "backend": str(settings.get("backend", DEFAULT_USER_SETTINGS["backend"])),
+    }
+    if payload["backend"] not in BACKEND_LABELS:
+        payload["backend"] = DEFAULT_USER_SETTINGS["backend"]
+    USER_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_SETTINGS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def apply_voice_punctuation_commands(text: str) -> str:
+    replacements = [
+        (r"(?iu)(?<!\w)новый\s+абзац[.,!?;:]*(?!\w)", "\n\n"),
+        (r"(?iu)(?<!\w)(?:запятая|запитая|запетая|запятую|запитую|запятой|запитой)[.,!?;:]*(?!\w)", ","),
+        (r"(?iu)(?<!\w)(?:точка|точку)[.,!?;:]*(?!\w)", "."),
+    ]
+    result = text
+    for pattern, replacement in replacements:
+        result = re.sub(pattern, replacement, result)
+    return normalize_punctuation_spacing(result)
+
+
+def normalize_punctuation_spacing(text: str) -> str:
+    result = text.replace("\r\n", "\n").replace("\r", "\n")
+    result = re.sub(r"[ \t]+", " ", result)
+    result = re.sub(r" *\n *", "\n", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    result = re.sub(r"\s+([,.;:!?])", r"\1", result)
+    result = re.sub(r"([,.;:!?])(?:\s*\1)+", r"\1", result)
+    result = re.sub(r",\s*([.!?])", r"\1", result)
+    result = re.sub(r"([.!?])\s*,", r"\1", result)
+    result = re.sub(r"([,.;:!?])(?=[^\s\n,.;:!?])", r"\1 ", result)
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    return result.strip()
+
+
+def capitalize_text(text: str) -> str:
+    return re.sub(
+        r"(?iu)(^|[.!?]\s+|\n+)([a-zа-яё])",
+        lambda match: match.group(1) + match.group(2).upper(),
+        text,
+    )
+
+
+def ensure_final_period(text: str) -> str:
+    result = text.rstrip()
+    if not result:
+        return result
+    if result[-1] in ".!?…":
+        return result
+    if result[-1] in ",;:":
+        return result[:-1].rstrip() + "."
+    return result + "."
+
+
+def format_recognized_text(text: str) -> str:
+    result = normalize_punctuation_spacing(text)
+    if not result:
+        return result
+    result = capitalize_text(result)
+    result = ensure_final_period(result)
+    return result
+
+
+def prepare_recognized_text(text: str, use_formatting: bool = True, use_voice_punctuation: bool = True) -> str:
+    result = text.strip()
+    if use_voice_punctuation:
+        result = apply_voice_punctuation_commands(result)
+    if use_formatting:
+        result = format_recognized_text(result)
+    return result
+
+
+def run_text_cleanup_self_test() -> None:
+    cases = [
+        (
+            "привет точка новый абзац как дела запятая нормально",
+            "Привет.\n\nКак дела, нормально.",
+        ),
+        (
+            "Провегаем команды пунктуаций, запитая, 1, 2, 3, 4, 5, запитая, 6, 7, 8, 9,.",
+            "Провегаем команды пунктуаций, 1, 2, 3, 4, 5, 6, 7, 8, 9.",
+        ),
+        (
+            "  привет   мир  ",
+            "Привет мир.",
+        ),
+        (
+            "первая строка\n\n\nвторая строка",
+            "Первая строка\n\nВторая строка.",
+        ),
+    ]
+    for source, expected in cases:
+        actual = prepare_recognized_text(source)
+        if actual != expected:
+            raise AssertionError(f"text cleanup failed: {source!r} -> {actual!r}, expected {expected!r}")
 
 
 def choose_auto_model_key(results: dict | None = None) -> str:
@@ -213,7 +470,62 @@ def write_benchmark_wav(wav_path: Path, seconds: float = BENCHMARK_AUDIO_SECONDS
         wav.writeframes(bytes(frames))
 
 
-def run_model_benchmark(allow_missing_models: bool = False, print_fn=None) -> dict:
+def faster_whisper_model_path(model_key: str) -> Path:
+    configured = os.environ.get("VOICEHELPER_FASTER_WHISPER_MODEL")
+    if configured:
+        return Path(configured)
+    return APP_DIR / ".tools" / "faster-whisper-models" / model_key
+
+
+def run_faster_whisper_benchmark(wav_path: Path, model_key: str) -> dict:
+    model_path = faster_whisper_model_path(model_key)
+    if not model_path.exists():
+        return {
+            "ok": False,
+            "available": False,
+            "error": f"missing faster-whisper model directory: {model_path}",
+        }
+
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as exc:
+        return {
+            "ok": False,
+            "available": False,
+            "error": f"faster-whisper is not installed: {exc}",
+        }
+
+    device = os.environ.get("VOICEHELPER_FASTER_WHISPER_DEVICE", "cpu")
+    compute_type = os.environ.get("VOICEHELPER_FASTER_WHISPER_COMPUTE_TYPE", "int8")
+
+    try:
+        started_at = time.perf_counter()
+        model = WhisperModel(str(model_path), device=device, compute_type=compute_type)
+        segments, _info = model.transcribe(str(wav_path), language="ru", beam_size=1)
+        segment_count = len(list(segments))
+        elapsed = time.perf_counter() - started_at
+        return {
+            "ok": True,
+            "available": True,
+            "model": str(model_path),
+            "device": device,
+            "compute_type": compute_type,
+            "segments": segment_count,
+            "elapsed_seconds": round(elapsed, 3),
+            "realtime_factor": round(elapsed / BENCHMARK_AUDIO_SECONDS, 3),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "available": True,
+            "model": str(model_path),
+            "device": device,
+            "compute_type": compute_type,
+            "error": str(exc),
+        }
+
+
+def run_model_benchmark(allow_missing_models: bool = False, print_fn=None, preferred_backend_key: str | None = None) -> dict:
     results: dict[str, dict] = {}
 
     with tempfile.TemporaryDirectory(prefix="voicehelper_benchmark_") as tmp_dir:
@@ -238,6 +550,7 @@ def run_model_benchmark(allow_missing_models: bool = False, print_fn=None) -> di
                     wav_path,
                     out_base,
                     timeout_seconds=300,
+                    preferred_backend_key=preferred_backend_key,
                 )
                 elapsed = time.perf_counter() - started_at
                 rtf = elapsed / BENCHMARK_AUDIO_SECONDS
@@ -267,6 +580,104 @@ def run_model_benchmark(allow_missing_models: bool = False, print_fn=None) -> di
     return profile
 
 
+def run_backend_benchmark(
+    model_key: str | None = None,
+    allow_missing_models: bool = False,
+    include_faster_whisper: bool = False,
+    print_fn=None,
+) -> dict:
+    model_key = model_key or choose_auto_model_key()
+    model_path = MODEL_FILES.get(model_key, MODEL_FILES[FALLBACK_AUTO_MODEL_KEY])
+    results: dict[str, dict] = {}
+
+    with tempfile.TemporaryDirectory(prefix="voicehelper_backend_benchmark_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        wav_path = tmp_path / "benchmark.wav"
+        write_benchmark_wav(wav_path)
+
+        if not model_path.exists():
+            error = f"missing model: {model_path}"
+            for backend_name in WHISPER_BACKENDS:
+                results[backend_name] = {"ok": False, "available": False, "error": error}
+            if print_fn:
+                print_fn(error)
+            if not allow_missing_models:
+                selected_backend = choose_auto_backend_key(results)
+                profile = {
+                    "version": 1,
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+                    "audio_seconds": BENCHMARK_AUDIO_SECONDS,
+                    "model": model_key,
+                    "selected_backend": selected_backend,
+                    "results": results,
+                }
+                return profile
+        else:
+            for backend_name, exe_path in WHISPER_BACKENDS.items():
+                if not exe_path.exists():
+                    results[backend_name] = {
+                        "ok": False,
+                        "available": False,
+                        "error": f"missing backend: {exe_path}",
+                    }
+                    if print_fn:
+                        print_fn(f"{backend_name}: missing backend")
+                    continue
+
+                out_base = tmp_path / f"backend_{backend_name}"
+                txt_path = out_base.with_suffix(".txt")
+                if txt_path.exists():
+                    txt_path.unlink()
+
+                started_at = time.perf_counter()
+                try:
+                    run_whisper_backend(backend_name, exe_path, model_path, wav_path, out_base, timeout_seconds=300)
+                    elapsed = time.perf_counter() - started_at
+                    rtf = elapsed / BENCHMARK_AUDIO_SECONDS
+                    results[backend_name] = {
+                        "ok": True,
+                        "available": True,
+                        "elapsed_seconds": round(elapsed, 3),
+                        "realtime_factor": round(rtf, 3),
+                    }
+                    if print_fn:
+                        print_fn(f"{backend_name}: {elapsed:.2f}s, realtime x{rtf:.2f}")
+                except Exception as exc:
+                    results[backend_name] = {
+                        "ok": False,
+                        "available": True,
+                        "error": str(exc),
+                    }
+                    if print_fn:
+                        print_fn(f"{backend_name}: failed: {exc}")
+
+        if include_faster_whisper:
+            result = run_faster_whisper_benchmark(wav_path, model_key)
+            results["faster-whisper"] = result
+            if print_fn:
+                if result.get("ok"):
+                    print_fn(
+                        "faster-whisper: "
+                        f"{result['elapsed_seconds']:.2f}s, realtime x{result['realtime_factor']:.2f}, "
+                        f"device={result.get('device')}, compute={result.get('compute_type')}"
+                    )
+                else:
+                    print_fn(f"faster-whisper: skipped: {result.get('error')}")
+
+    selected_backend = choose_auto_backend_key(results)
+    profile = {
+        "version": 1,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        "audio_seconds": BENCHMARK_AUDIO_SECONDS,
+        "model": model_key,
+        "selected_backend": selected_backend,
+        "results": results,
+    }
+    if any(results.get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS):
+        save_backend_profile(profile)
+    return profile
+
+
 class VoiceHelperApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -292,6 +703,10 @@ class VoiceHelperApp:
         self.spellcheck_after_id: str | None = None
         self.spellcheck_generation = 0
         self.spelling_issues: dict[str, SpellingIssue] = {}
+        self.settings = load_user_settings()
+        self.hotkey_thread: threading.Thread | None = None
+        self.hotkey_thread_id: int | None = None
+        self.format_undo_snapshot: tuple[str, str] | None = None
 
         self.status_var = tk.StringVar(value="Готово")
         self.record_time_var = tk.StringVar(value="Запись: 00:00")
@@ -300,10 +715,19 @@ class VoiceHelperApp:
         self.speed_status_var = tk.StringVar(value="Скорость: авто")
         self.profile_var = tk.StringVar(value=DEFAULT_PROFILE_LABEL)
         self.model_var = tk.StringVar(value=DEFAULT_MODEL_LABEL)
+        self.backend_var = tk.StringVar(
+            value=BACKEND_LABELS.get(str(self.settings.get("backend", "auto")), DEFAULT_BACKEND_LABEL)
+        )
         self.input_device_var = tk.StringVar(value="")
         self.input_level_var = tk.DoubleVar(value=0)
         self.input_level_text_var = tk.StringVar(value="Уровень: -")
         self.spellcheck_status_var = tk.StringVar(value="Орфография: авто")
+        self.hotkey_status_var = tk.StringVar(value=f"Горячая клавиша: {HOTKEY_LABEL}")
+        self.auto_copy_var = tk.BooleanVar(value=self.settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"]))
+        self.format_text_var = tk.BooleanVar(value=self.settings.get("format_text", DEFAULT_USER_SETTINGS["format_text"]))
+        self.voice_punctuation_var = tk.BooleanVar(
+            value=self.settings.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])
+        )
 
         self._build_ui()
         self._apply_profile_selection()
@@ -313,6 +737,7 @@ class VoiceHelperApp:
         self.root.after(100, self._process_ui_queue)
         self.root.after(250, self._update_record_timer)
         self.root.after(500, self.refresh_firewall_status)
+        self._start_hotkey_listener()
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -322,48 +747,32 @@ class VoiceHelperApp:
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(6, weight=1)
 
-        self.record_button = ttk.Button(toolbar, text="Записать", command=self.start_recording)
+        self.record_button = ttk.Button(toolbar, text="Записать", command=self.toggle_recording)
         self.record_button.grid(row=0, column=0, padx=(0, 8))
 
         self.stop_button = ttk.Button(toolbar, text="Стоп", command=self.stop_recording, state=tk.DISABLED)
-        self.stop_button.grid(row=0, column=1, padx=(0, 8))
 
         self.copy_button = ttk.Button(toolbar, text="Скопировать", command=self.copy_text)
-        self.copy_button.grid(row=0, column=2, padx=(0, 8))
+        self.copy_button.grid(row=0, column=1, padx=(0, 8))
+
+        self.format_button = ttk.Button(toolbar, text="Автоформат", command=self.format_current_text)
+        self.format_button.grid(row=0, column=2, padx=(0, 8))
 
         self.clear_button = ttk.Button(toolbar, text="Очистить", command=self.clear_text)
         self.clear_button.grid(row=0, column=3, padx=(0, 16))
 
-        self.firewall_button = ttk.Button(toolbar, text="Блокировать сеть", command=self.enable_firewall_block)
-        self.firewall_button.grid(row=0, column=4, padx=(0, 0))
-
-        self.firewall_unblock_button = ttk.Button(toolbar, text="Разблокировать", command=self.disable_firewall_block)
-        self.firewall_unblock_button.grid(row=0, column=5, padx=(0, 16))
-
-        ttk.Label(toolbar, text="Модель:").grid(row=0, column=6, sticky="e", padx=(0, 6))
-        self.model_box = ttk.Combobox(
+        self.input_level_bar = ttk.Progressbar(
             toolbar,
-            textvariable=self.model_var,
-            values=list(MODEL_OPTIONS.keys()),
-            state="readonly",
-            width=28,
+            variable=self.input_level_var,
+            maximum=100,
+            mode="determinate",
+            length=120,
         )
-        self.model_box.grid(row=0, column=7, sticky="e")
-        self.model_box.bind("<<ComboboxSelected>>", self._on_model_changed)
+        self.input_level_bar.grid(row=0, column=4, sticky="w", padx=(0, 6))
+        ttk.Label(toolbar, textvariable=self.input_level_text_var).grid(row=0, column=5, sticky="w", padx=(0, 18))
 
-        ttk.Label(toolbar, text="Профиль:").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 6))
-        self.profile_box = ttk.Combobox(
-            toolbar,
-            textvariable=self.profile_var,
-            values=list(PROFILE_MODEL_KEYS.keys()),
-            state="readonly",
-            width=12,
-        )
-        self.profile_box.grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(0, 8))
-        self.profile_box.bind("<<ComboboxSelected>>", self._on_profile_changed)
-        self.benchmark_button = ttk.Button(toolbar, text="Бенчмарк", command=self.start_model_benchmark)
-        self.benchmark_button.grid(row=1, column=2, sticky="w", pady=(8, 0), padx=(0, 12))
-        ttk.Label(toolbar, textvariable=self.speed_status_var).grid(row=1, column=3, columnspan=5, sticky="w", pady=(8, 0))
+        self.settings_button = ttk.Button(toolbar, text="Настройки", command=self.show_settings)
+        self.settings_button.grid(row=0, column=7, sticky="e")
 
         info = ttk.Frame(self.root, padding=(12, 0, 12, 6))
         info.grid(row=1, column=0, sticky="ew")
@@ -373,30 +782,7 @@ class VoiceHelperApp:
         ttk.Label(info, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(0, 18))
         ttk.Label(info, textvariable=self.record_time_var).grid(row=0, column=2, sticky="w", padx=(0, 18))
         ttk.Label(info, textvariable=self.recognition_time_var).grid(row=0, column=3, sticky="w", padx=(0, 18))
-        ttk.Label(info, textvariable=self.firewall_status_var).grid(row=0, column=4, sticky="w")
-        ttk.Label(info, textvariable=self.spellcheck_status_var).grid(row=0, column=5, sticky="w", padx=(18, 0))
-
-        ttk.Label(info, text="Микрофон:").grid(row=1, column=0, sticky="w", pady=(6, 0), padx=(0, 4))
-        self.input_device_box = ttk.Combobox(
-            info,
-            textvariable=self.input_device_var,
-            state="readonly",
-            width=44,
-        )
-        self.input_device_box.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(6, 0), padx=(0, 8))
-        self.refresh_input_button = ttk.Button(info, text="Обновить", command=self.refresh_input_devices)
-        self.refresh_input_button.grid(row=1, column=4, sticky="w", pady=(6, 0))
-        self.test_input_button = ttk.Button(info, text="Проверить", command=self.start_microphone_test)
-        self.test_input_button.grid(row=1, column=5, sticky="w", pady=(6, 0), padx=(8, 0))
-        self.input_level_bar = ttk.Progressbar(
-            info,
-            variable=self.input_level_var,
-            maximum=100,
-            mode="determinate",
-            length=90,
-        )
-        self.input_level_bar.grid(row=1, column=6, sticky="w", pady=(6, 0), padx=(8, 4))
-        ttk.Label(info, textvariable=self.input_level_text_var).grid(row=1, column=7, sticky="w", pady=(6, 0))
+        ttk.Label(info, textvariable=self.spellcheck_status_var).grid(row=0, column=4, sticky="w", padx=(18, 0))
 
         text_frame = ttk.Frame(self.root, padding=(12, 6, 12, 12))
         text_frame.grid(row=2, column=0, sticky="nsew")
@@ -413,6 +799,122 @@ class VoiceHelperApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.text.configure(yscrollcommand=scrollbar.set)
 
+        self._build_settings_window()
+
+    def _build_settings_window(self) -> None:
+        self.settings_window = tk.Toplevel(self.root)
+        self.settings_window.title("VoiceHelper: настройки")
+        self.settings_window.geometry("720x430")
+        self.settings_window.minsize(620, 360)
+        self.settings_window.transient(self.root)
+        self.settings_window.protocol("WM_DELETE_WINDOW", self.hide_settings)
+        self.settings_window.withdraw()
+
+        notebook = ttk.Notebook(self.settings_window)
+        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+
+        recording_tab = ttk.Frame(notebook, padding=12)
+        text_tab = ttk.Frame(notebook, padding=12)
+        performance_tab = ttk.Frame(notebook, padding=12)
+        security_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(recording_tab, text="Запись")
+        notebook.add(text_tab, text="Текст")
+        notebook.add(performance_tab, text="Производительность")
+        notebook.add(security_tab, text="Безопасность")
+
+        recording_tab.columnconfigure(1, weight=1)
+        ttk.Label(recording_tab, text="Микрофон:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self.input_device_box = ttk.Combobox(
+            recording_tab,
+            textvariable=self.input_device_var,
+            state="readonly",
+            width=52,
+        )
+        self.input_device_box.grid(row=0, column=1, columnspan=3, sticky="ew", pady=(0, 8))
+        self.refresh_input_button = ttk.Button(recording_tab, text="Обновить", command=self.refresh_input_devices)
+        self.refresh_input_button.grid(row=1, column=1, sticky="w", padx=(0, 8))
+        self.test_input_button = ttk.Button(recording_tab, text="Проверить", command=self.start_microphone_test)
+        self.test_input_button.grid(row=1, column=2, sticky="w")
+        ttk.Label(recording_tab, textvariable=self.input_level_text_var).grid(row=2, column=1, sticky="w", pady=(14, 0))
+        ttk.Label(recording_tab, textvariable=self.hotkey_status_var).grid(row=3, column=1, sticky="w", pady=(8, 0))
+
+        self.auto_copy_check = ttk.Checkbutton(
+            text_tab,
+            text="Автокопия",
+            variable=self.auto_copy_var,
+            command=self._save_current_settings,
+        )
+        self.auto_copy_check.grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.format_text_check = ttk.Checkbutton(
+            text_tab,
+            text="Форматировать",
+            variable=self.format_text_var,
+            command=self._save_current_settings,
+        )
+        self.format_text_check.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        self.voice_punctuation_check = ttk.Checkbutton(
+            text_tab,
+            text="Команды пунктуации",
+            variable=self.voice_punctuation_var,
+            command=self._save_current_settings,
+        )
+        self.voice_punctuation_check.grid(row=2, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(text_tab, textvariable=self.spellcheck_status_var).grid(row=3, column=0, sticky="w")
+
+        performance_tab.columnconfigure(1, weight=1)
+        ttk.Label(performance_tab, text="Модель:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self.model_box = ttk.Combobox(
+            performance_tab,
+            textvariable=self.model_var,
+            values=list(MODEL_OPTIONS.keys()),
+            state="readonly",
+            width=30,
+        )
+        self.model_box.grid(row=0, column=1, sticky="w", pady=(0, 8))
+        self.model_box.bind("<<ComboboxSelected>>", self._on_model_changed)
+
+        ttk.Label(performance_tab, text="Профиль:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self.profile_box = ttk.Combobox(
+            performance_tab,
+            textvariable=self.profile_var,
+            values=list(PROFILE_MODEL_KEYS.keys()),
+            state="readonly",
+            width=14,
+        )
+        self.profile_box.grid(row=1, column=1, sticky="w", pady=(0, 8))
+        self.profile_box.bind("<<ComboboxSelected>>", self._on_profile_changed)
+
+        ttk.Label(performance_tab, text="Backend:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self.backend_box = ttk.Combobox(
+            performance_tab,
+            textvariable=self.backend_var,
+            values=list(BACKEND_LABELS.values()),
+            state="readonly",
+            width=14,
+        )
+        self.backend_box.grid(row=2, column=1, sticky="w", pady=(0, 8))
+        self.backend_box.bind("<<ComboboxSelected>>", self._on_backend_changed)
+
+        self.benchmark_button = ttk.Button(performance_tab, text="Бенчмарк моделей", command=self.start_model_benchmark)
+        self.benchmark_button.grid(row=3, column=1, sticky="w", pady=(6, 8), padx=(0, 8))
+        self.backend_benchmark_button = ttk.Button(performance_tab, text="Backend тест", command=self.start_backend_benchmark)
+        self.backend_benchmark_button.grid(row=3, column=2, sticky="w", pady=(6, 8))
+        ttk.Label(performance_tab, textvariable=self.speed_status_var).grid(row=4, column=1, columnspan=2, sticky="w")
+
+        self.firewall_button = ttk.Button(security_tab, text="Блокировать сеть", command=self.enable_firewall_block)
+        self.firewall_button.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
+        self.firewall_unblock_button = ttk.Button(security_tab, text="Разблокировать", command=self.disable_firewall_block)
+        self.firewall_unblock_button.grid(row=0, column=1, sticky="w", pady=(0, 10))
+        ttk.Label(security_tab, textvariable=self.firewall_status_var).grid(row=1, column=0, columnspan=2, sticky="w")
+
+    def show_settings(self) -> None:
+        self.settings_window.deiconify()
+        self.settings_window.lift()
+        self.settings_window.focus_force()
+
+    def hide_settings(self) -> None:
+        self.settings_window.withdraw()
+
     def _apply_window_icon(self) -> None:
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VoiceHelper.LocalDictation")
@@ -428,7 +930,8 @@ class VoiceHelperApp:
     def _check_local_files(self) -> None:
         missing = []
         if not available_whisper_backends():
-            missing.extend(str(path) for path in WHISPER_BACKENDS.values())
+            expected = "\n".join(f"{name}: {path}" for name, path in WHISPER_BACKENDS.items())
+            missing.append(f"Не найден ни один локальный whisper.cpp backend:\n{expected}")
         for model_path in MODEL_OPTIONS.values():
             if not model_path.exists():
                 missing.append(str(model_path))
@@ -448,12 +951,86 @@ class VoiceHelperApp:
                     technical="\n".join(missing),
                 ),
             )
-            self.record_button.configure(state=tk.DISABLED)
+            self._set_record_button_busy("Нет файлов")
+
+    def _start_hotkey_listener(self) -> None:
+        if os.name != "nt":
+            self.hotkey_status_var.set("Горячая клавиша: только Windows")
+            return
+
+        self.hotkey_thread = threading.Thread(target=self._hotkey_worker, daemon=True)
+        self.hotkey_thread.start()
+
+    def _hotkey_worker(self) -> None:
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            self.hotkey_thread_id = int(kernel32.GetCurrentThreadId())
+
+            modifiers = HOTKEY_MODIFIERS | HOTKEY_MOD_NOREPEAT
+            registered = bool(user32.RegisterHotKey(None, HOTKEY_ID, modifiers, HOTKEY_VK_SPACE))
+            if not registered:
+                registered = bool(user32.RegisterHotKey(None, HOTKEY_ID, HOTKEY_MODIFIERS, HOTKEY_VK_SPACE))
+            if not registered:
+                self.ui_queue.put(("hotkey_status", f"Горячая клавиша: недоступна ({HOTKEY_LABEL})"))
+                return
+
+            self.ui_queue.put(("hotkey_status", f"Горячая клавиша: {HOTKEY_LABEL}"))
+            msg = ctypes.wintypes.MSG()
+            while True:
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result == 0 or result == -1:
+                    break
+                if msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID:
+                    self.ui_queue.put(("hotkey", None))
+        except Exception:
+            self.ui_queue.put(("hotkey_status", f"Горячая клавиша: недоступна ({HOTKEY_LABEL})"))
+        finally:
+            try:
+                ctypes.windll.user32.UnregisterHotKey(None, HOTKEY_ID)
+            except Exception:
+                pass
+
+    def _stop_hotkey_listener(self) -> None:
+        if os.name != "nt" or self.hotkey_thread_id is None:
+            return
+        try:
+            ctypes.windll.user32.PostThreadMessageW(self.hotkey_thread_id, WM_QUIT, 0, 0)
+        except Exception:
+            pass
+
+    def _handle_record_hotkey(self) -> None:
+        if self.is_recording:
+            self.stop_recording()
+            return
+        if self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
+            return
+        if self.record_button.instate(["!disabled"]):
+            self.start_recording()
+
+    def toggle_recording(self) -> None:
+        if self.is_recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def _set_record_button_idle(self) -> None:
+        self.record_button.configure(text="Записать", command=self.toggle_recording, state=tk.NORMAL)
+
+    def _set_record_button_recording(self) -> None:
+        self.record_button.configure(text="Стоп", command=self.stop_recording, state=tk.NORMAL)
+
+    def _set_record_button_busy(self, text: str) -> None:
+        self.record_button.configure(text=text, state=tk.DISABLED)
 
     def _on_profile_changed(self, event=None) -> None:
         self._apply_profile_selection()
 
     def _on_model_changed(self, event=None) -> None:
+        self._update_speed_status()
+
+    def _on_backend_changed(self, event=None) -> None:
+        self._save_current_settings()
         self._update_speed_status()
 
     def _apply_profile_selection(self) -> None:
@@ -471,6 +1048,16 @@ class VoiceHelperApp:
     def _selected_model_key(self) -> str:
         return MODEL_KEY_BY_LABEL.get(self.model_var.get(), MODEL_KEY_BY_LABEL[DEFAULT_MODEL_LABEL])
 
+    def _selected_backend_key(self) -> str:
+        return BACKEND_KEY_BY_LABEL.get(self.backend_var.get(), "auto")
+
+    def _selected_backend_preference(self) -> str | None:
+        backend_key = self._selected_backend_key()
+        return None if backend_key == "auto" else backend_key
+
+    def _select_backend_key(self, backend_key: str) -> None:
+        self.backend_var.set(BACKEND_LABELS.get(backend_key, DEFAULT_BACKEND_LABEL))
+
     def _update_speed_status(self, vad_stats: dict | None = None, backend_name: str | None = None) -> None:
         profile = self.profile_var.get()
         model_key = self._selected_model_key()
@@ -482,7 +1069,7 @@ class VoiceHelperApp:
         self.speed_status_var.set("; ".join(parts))
 
     def _preferred_backend_name(self) -> str:
-        backends = available_whisper_backends()
+        backends = available_whisper_backends(self._selected_backend_preference())
         return backends[0][0] if backends else "нет whisper-cli"
 
     def start_model_benchmark(self) -> None:
@@ -491,16 +1078,21 @@ class VoiceHelperApp:
 
         self.is_benchmarking = True
         self._set_status("Бенчмарк моделей...")
-        self.record_button.configure(state=tk.DISABLED)
+        self._set_record_button_busy("Бенчмарк")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
         self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
+        self.backend_box.configure(state=tk.DISABLED)
+        self.backend_benchmark_button.configure(state=tk.DISABLED)
         threading.Thread(target=self._benchmark_models_worker, daemon=True).start()
 
     def _benchmark_models_worker(self) -> None:
         try:
-            profile = run_model_benchmark(allow_missing_models=True)
+            profile = run_model_benchmark(
+                allow_missing_models=True,
+                preferred_backend_key=self._selected_backend_preference(),
+            )
             if not any(item.get("ok") for item in profile.get("results", {}).values()):
                 raise RuntimeError("No local models were available for benchmark.")
             self.ui_queue.put(("benchmark_result", profile))
@@ -509,6 +1101,40 @@ class VoiceHelperApp:
                 "Не удалось выполнить бенчмарк моделей.",
                 [
                     "Проверьте, что рядом с VoiceHelper.exe есть папки models и .tools.",
+                    "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
+                ],
+                technical=self._shorten_technical_text(str(exc)),
+            )))
+        finally:
+            self.ui_queue.put(("benchmark_ready", None))
+
+    def start_backend_benchmark(self) -> None:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
+            return
+
+        self.is_benchmarking = True
+        self._set_status("Бенчмарк backend...")
+        self._set_record_button_busy("Бенчмарк")
+        self.stop_button.configure(state=tk.DISABLED)
+        self.model_box.configure(state=tk.DISABLED)
+        self.profile_box.configure(state=tk.DISABLED)
+        self.benchmark_button.configure(state=tk.DISABLED)
+        self.backend_box.configure(state=tk.DISABLED)
+        self.backend_benchmark_button.configure(state=tk.DISABLED)
+        threading.Thread(target=self._benchmark_backends_worker, daemon=True).start()
+
+    def _benchmark_backends_worker(self) -> None:
+        try:
+            profile = run_backend_benchmark(model_key=self._selected_model_key(), allow_missing_models=True)
+            if not any(profile.get("results", {}).get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS):
+                raise RuntimeError("No local whisper.cpp backends completed the benchmark.")
+            self.ui_queue.put(("backend_benchmark_result", profile))
+        except Exception as exc:
+            self.ui_queue.put(("benchmark_error", self._format_problem_message(
+                "Не удалось выполнить бенчмарк backend.",
+                [
+                    "Проверьте, что рядом с VoiceHelper.exe есть папки models и .tools.",
+                    "GPU backend считаются optional: если их нет, должен сработать AVX2 или Compat.",
                     "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
                 ],
                 technical=self._shorten_technical_text(str(exc)),
@@ -583,7 +1209,7 @@ class VoiceHelperApp:
         if not labels:
             self.input_device_var.set("")
             self.input_device_box.configure(state=tk.DISABLED)
-            self.record_button.configure(state=tk.DISABLED)
+            self._set_record_button_busy("Нет микрофона")
             self.test_input_button.configure(state=tk.DISABLED)
             self._set_status("Микрофоны не найдены")
             return
@@ -599,7 +1225,8 @@ class VoiceHelperApp:
 
         self.input_device_var.set(selected)
         self.input_device_box.configure(state="readonly")
-        self.record_button.configure(state=tk.NORMAL)
+        if not (self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking):
+            self._set_record_button_idle()
         self.test_input_button.configure(state=tk.NORMAL)
 
     def _clean_input_device_name(self, name: str) -> str:
@@ -681,11 +1308,13 @@ class VoiceHelperApp:
 
         self.is_testing_microphone = True
         self._set_status("Проверка микрофона: говорите 3 секунды")
-        self.record_button.configure(state=tk.DISABLED)
+        self._set_record_button_busy("Проверка")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
         self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
+        self.backend_box.configure(state=tk.DISABLED)
+        self.backend_benchmark_button.configure(state=tk.DISABLED)
         self.input_device_box.configure(state=tk.DISABLED)
         self.refresh_input_button.configure(state=tk.DISABLED)
         self.test_input_button.configure(state=tk.DISABLED)
@@ -703,11 +1332,13 @@ class VoiceHelperApp:
         finally:
             self.mic_test_stream = None
 
-        self.record_button.configure(state=tk.NORMAL)
+        self._set_record_button_idle()
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state="readonly")
         self.profile_box.configure(state="readonly")
         self.benchmark_button.configure(state=tk.NORMAL)
+        self.backend_box.configure(state="readonly")
+        self.backend_benchmark_button.configure(state=tk.NORMAL)
         self.input_device_box.configure(state="readonly")
         self.refresh_input_button.configure(state=tk.NORMAL)
         self.test_input_button.configure(state=tk.NORMAL)
@@ -758,11 +1389,13 @@ class VoiceHelperApp:
         self.is_recording = True
         self.record_started_at = time.perf_counter()
         self._set_status("Запись")
-        self.record_button.configure(state=tk.DISABLED)
+        self._set_record_button_recording()
         self.stop_button.configure(state=tk.NORMAL)
         self.model_box.configure(state=tk.DISABLED)
         self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
+        self.backend_box.configure(state=tk.DISABLED)
+        self.backend_benchmark_button.configure(state=tk.DISABLED)
         self.input_device_box.configure(state=tk.DISABLED)
         self.refresh_input_button.configure(state=tk.DISABLED)
         self.test_input_button.configure(state=tk.DISABLED)
@@ -790,6 +1423,7 @@ class VoiceHelperApp:
             return
 
         self.is_recording = False
+        self._set_record_button_busy("Распознавание")
         self.stop_button.configure(state=tk.DISABLED)
 
         try:
@@ -803,10 +1437,12 @@ class VoiceHelperApp:
             self.record_started_at = None
             self.record_time_var.set("Запись: 00:00")
             self._set_status("Готово")
-            self.record_button.configure(state=tk.NORMAL)
+            self._set_record_button_idle()
             self.model_box.configure(state="readonly")
             self.profile_box.configure(state="readonly")
             self.benchmark_button.configure(state=tk.NORMAL)
+            self.backend_box.configure(state="readonly")
+            self.backend_benchmark_button.configure(state=tk.NORMAL)
             self.input_device_box.configure(state="readonly")
             self.refresh_input_button.configure(state=tk.NORMAL)
             self.test_input_button.configure(state=tk.NORMAL)
@@ -828,17 +1464,69 @@ class VoiceHelperApp:
         self.worker = threading.Thread(target=self._recognize_audio, daemon=True)
         self.worker.start()
 
+    def _save_current_settings(self) -> None:
+        settings = {
+            "auto_copy": self.auto_copy_var.get(),
+            "format_text": self.format_text_var.get(),
+            "voice_punctuation": self.voice_punctuation_var.get(),
+            "backend": self._selected_backend_key(),
+        }
+        try:
+            save_user_settings(settings)
+        except Exception as exc:
+            self._set_status(f"Не удалось сохранить настройки: {exc}")
+
+    def _copy_value_to_clipboard(self, value: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(value)
+        self.root.update()
+
     def copy_text(self) -> None:
         value = self.text.get("1.0", tk.END).strip()
         if not value:
             return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(value)
-        self.root.update()
+        self._copy_value_to_clipboard(value)
         self._set_status("Скопировано")
+
+    def format_current_text(self) -> None:
+        value = self.text.get("1.0", tk.END).strip()
+        if not value:
+            self.format_undo_snapshot = None
+            self.format_button.configure(text="Автоформат")
+            self._set_status("Нет текста для форматирования")
+            return
+        if self.format_undo_snapshot is not None:
+            original, formatted_snapshot = self.format_undo_snapshot
+            if value == formatted_snapshot:
+                self.text.delete("1.0", tk.END)
+                self.text.insert("1.0", original)
+                self.format_undo_snapshot = None
+                self.format_button.configure(text="Автоформат")
+                self._set_status("Форматирование отменено")
+                self._schedule_spellcheck(delay_ms=100)
+                return
+
+        formatted = prepare_recognized_text(
+            value,
+            use_formatting=True,
+            use_voice_punctuation=self.voice_punctuation_var.get(),
+        )
+        if formatted == value:
+            self.format_undo_snapshot = None
+            self.format_button.configure(text="Автоформат")
+            self._set_status("Текст уже отформатирован")
+            return
+        self.format_undo_snapshot = (value, formatted)
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", formatted)
+        self.format_button.configure(text="Вернуть")
+        self._set_status("Текст отформатирован")
+        self._schedule_spellcheck(delay_ms=100)
 
     def clear_text(self) -> None:
         self.text.delete("1.0", tk.END)
+        self.format_undo_snapshot = None
+        self.format_button.configure(text="Автоформат")
         self._clear_spelling_marks()
         self._set_status("Готово")
 
@@ -1063,6 +1751,7 @@ class VoiceHelperApp:
         self.root.after(5000, self.refresh_firewall_status)
 
     def on_close(self) -> None:
+        self._stop_hotkey_listener()
         if self.stream is not None:
             try:
                 self.stream.stop()
@@ -1153,7 +1842,12 @@ class VoiceHelperApp:
             if txt_path.exists():
                 txt_path.unlink()
 
-            backend_name, completed = run_whisper_with_fallback(selected_model, wav_path, out_base)
+            backend_name, completed = run_whisper_with_fallback(
+                selected_model,
+                wav_path,
+                out_base,
+                preferred_backend_key=self._selected_backend_preference(),
+            )
 
             elapsed = time.perf_counter() - started_at
 
@@ -1185,24 +1879,41 @@ class VoiceHelperApp:
                 self._set_status(str(value))
             elif event == "input_level":
                 self._set_input_level(int(value))
+            elif event == "hotkey":
+                self._handle_record_hotkey()
+            elif event == "hotkey_status":
+                self.hotkey_status_var.set(str(value))
             elif event == "recognized":
                 recognized, elapsed, backend_name, vad_stats = value
+                prepared = prepare_recognized_text(
+                    str(recognized),
+                    use_formatting=self.format_text_var.get(),
+                    use_voice_punctuation=self.voice_punctuation_var.get(),
+                )
                 self.text.delete("1.0", tk.END)
-                self.text.insert("1.0", str(recognized))
+                self.text.insert("1.0", prepared)
+                self.format_undo_snapshot = None
+                self.format_button.configure(text="Автоформат")
                 self.recognition_time_var.set(f"Распознавание: {elapsed:.1f} с")
                 self._update_speed_status(vad_stats=vad_stats, backend_name=backend_name)
-                self._set_status("Готово")
+                if self.auto_copy_var.get() and prepared:
+                    self._copy_value_to_clipboard(prepared)
+                    self._set_status("Скопировано автоматически")
+                else:
+                    self._set_status("Готово")
                 self._schedule_spellcheck(delay_ms=100)
             elif event == "error":
                 self._set_status("Ошибка распознавания")
                 messagebox.showerror("VoiceHelper", str(value))
             elif event == "ready":
                 self.is_recognizing = False
-                self.record_button.configure(state=tk.NORMAL)
+                self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
                 self.profile_box.configure(state="readonly")
                 self.benchmark_button.configure(state=tk.NORMAL)
+                self.backend_box.configure(state="readonly")
+                self.backend_benchmark_button.configure(state=tk.NORMAL)
                 self.input_device_box.configure(state="readonly")
                 self.refresh_input_button.configure(state=tk.NORMAL)
                 self.test_input_button.configure(state=tk.NORMAL)
@@ -1213,16 +1924,25 @@ class VoiceHelperApp:
                 self._select_model_key(selected_model)
                 self._update_speed_status()
                 self._set_status(f"Бенчмарк готов: выбрана модель {selected_model}")
+            elif event == "backend_benchmark_result":
+                profile = value
+                selected_backend = profile.get("selected_backend", FALLBACK_AUTO_BACKEND_KEY)
+                self._select_backend_key("auto")
+                self._save_current_settings()
+                self._update_speed_status()
+                self._set_status(f"Backend бенчмарк готов: выбран {selected_backend}")
             elif event == "benchmark_error":
                 self._set_status("Ошибка бенчмарка")
                 messagebox.showerror("VoiceHelper", str(value))
             elif event == "benchmark_ready":
                 self.is_benchmarking = False
-                self.record_button.configure(state=tk.NORMAL)
+                self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
                 self.profile_box.configure(state="readonly")
                 self.benchmark_button.configure(state=tk.NORMAL)
+                self.backend_box.configure(state="readonly")
+                self.backend_benchmark_button.configure(state=tk.NORMAL)
                 self.input_device_box.configure(state="readonly")
                 self.refresh_input_button.configure(state=tk.NORMAL)
                 self.test_input_button.configure(state=tk.NORMAL)
@@ -1606,6 +2326,11 @@ def main() -> None:
         print("VoiceHelper spell-test passed.")
         raise SystemExit(0)
 
+    if "--format-test" in sys.argv:
+        run_text_cleanup_self_test()
+        print("VoiceHelper format-test passed.")
+        raise SystemExit(0)
+
     if "--benchmark-models" in sys.argv:
         allow_missing_models = "--allow-missing-models" in sys.argv
         profile = run_model_benchmark(allow_missing_models=allow_missing_models, print_fn=print)
@@ -1615,8 +2340,30 @@ def main() -> None:
             raise SystemExit(1)
         raise SystemExit(0)
 
+    if "--benchmark-backends" in sys.argv:
+        allow_missing_models = "--allow-missing-models" in sys.argv
+        include_faster_whisper = "--include-faster-whisper" in sys.argv
+        model_key = None
+        if "--model-key" in sys.argv:
+            index = sys.argv.index("--model-key")
+            if index + 1 < len(sys.argv):
+                model_key = sys.argv[index + 1]
+        profile = run_backend_benchmark(
+            model_key=model_key,
+            allow_missing_models=allow_missing_models,
+            include_faster_whisper=include_faster_whisper,
+            print_fn=print,
+        )
+        print(f"selected_backend={profile.get('selected_backend', FALLBACK_AUTO_BACKEND_KEY)}")
+        print(f"profile={BACKEND_PROFILE_PATH}")
+        results = profile.get("results", {})
+        if not any(results.get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS):
+            raise SystemExit(1)
+        raise SystemExit(0)
+
     if "--self-test" in sys.argv:
         allow_missing_models = "--allow-missing-models" in sys.argv
+        run_text_cleanup_self_test()
         required = [WHISPER_EXE] if allow_missing_models else [WHISPER_EXE, *MODEL_OPTIONS.values()]
         missing = [path for path in required if not path.exists()]
         if missing:
@@ -1635,6 +2382,8 @@ def main() -> None:
         print(f"APP_ICON={APP_ICON}")
         print(f"WHISPER_BACKENDS={[(name, str(path), path.exists()) for name, path in WHISPER_BACKENDS.items()]}")
         print(f"PERFORMANCE_PROFILE={PERFORMANCE_PROFILE_PATH}")
+        print(f"BACKEND_PROFILE={BACKEND_PROFILE_PATH}")
+        print(f"USER_SETTINGS={USER_SETTINGS_PATH}")
         raise SystemExit(0)
 
     root = tk.Tk()

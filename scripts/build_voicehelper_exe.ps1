@@ -56,6 +56,15 @@ if (Test-Path -LiteralPath (Join-Path $avx2Source "whisper-cli.exe")) {
     }
 }
 
+foreach ($backend in @("vulkan", "cuda", "openvino")) {
+    $backendSource = ".tools\whisper.cpp-build-$backend\bin"
+    if (Test-Path -LiteralPath (Join-Path $backendSource "whisper-cli.exe")) {
+        $backendDestination = "$dist\.tools\whisper.cpp-build-$backend\bin"
+        New-Item -ItemType Directory -Force -Path $backendDestination | Out-Null
+        Copy-Item -Path (Join-Path $backendSource "*") -Destination $backendDestination -Recurse -Force
+    }
+}
+
 Copy-Item -LiteralPath `
     "assets\app_icon.ico", `
     "assets\app_icon.png" `
@@ -70,6 +79,8 @@ Copy-Item -LiteralPath `
     "docs\STAGE_0_2_2_DIAGNOSTICS.md", `
     "docs\STAGE_0_2_3_ERROR_MESSAGES.md", `
     "docs\STAGE_0_3_SPEED.md", `
+    "docs\STAGE_0_4_CONVENIENCE.md", `
+    "docs\STAGE_0_5_PERFORMANCE.md", `
     "docs\USER_CHECKLIST.md" `
     -Destination "$dist\docs" `
     -Force
@@ -85,6 +96,8 @@ Copy-Item -LiteralPath `
     "scripts\diagnose_voicehelper.cmd", `
     "scripts\benchmark_voicehelper_models.ps1", `
     "scripts\benchmark_voicehelper_models.cmd", `
+    "scripts\compare_voicehelper_backends.ps1", `
+    "scripts\compare_voicehelper_backends.cmd", `
     "scripts\list_audio_devices.ps1", `
     "scripts\list_audio_devices.cmd", `
     "scripts\audit_voicehelper_network.ps1", `

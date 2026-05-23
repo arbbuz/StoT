@@ -5,7 +5,7 @@
 
 ## Назначение
 
-VoiceHelper - локальное Windows-приложение для диктовки текста голосом. Пользователь нажимает "Записать", диктует, нажимает "Стоп", получает текст в окне приложения и вручную копирует его кнопкой "Скопировать".
+VoiceHelper - локальное Windows-приложение для диктовки текста голосом. Пользователь нажимает "Записать" или `Ctrl+Shift+Space`, диктует, нажимает ту же кнопку "Стоп" или повторно `Ctrl+Shift+Space`, получает текст в окне приложения и копирует его кнопкой "Скопировать" либо опциональной галочкой "Автокопия" в окне "Настройки".
 
 Приложение не является почтовым клиентом, не отправляет письма, не создает черновики, не подключается к облачным сервисам распознавания речи и не выполняет интеграцию с Gmail, Outlook или другими почтовыми системами.
 
@@ -25,12 +25,16 @@ VoiceHelper/
     STAGE_0_2_2_DIAGNOSTICS.md
     STAGE_0_2_3_ERROR_MESSAGES.md
     STAGE_0_3_SPEED.md
+    STAGE_0_4_CONVENIENCE.md
+    STAGE_0_5_PERFORMANCE.md
     USER_CHECKLIST.md
   scripts/
     diagnose_voicehelper.cmd
     diagnose_voicehelper.ps1
     benchmark_voicehelper_models.cmd
     benchmark_voicehelper_models.ps1
+    compare_voicehelper_backends.cmd
+    compare_voicehelper_backends.ps1
     check_firewall_block.cmd
     check_firewall_block.ps1
     check_russian_spellcheck.cmd
@@ -43,14 +47,24 @@ VoiceHelper/
     audit_voicehelper_network.ps1
   _internal/
   models/
-    ggml-tiny-q5_1.bin
-    ggml-base-q5_1.bin
-    ggml-small-q5_1.bin
+    README_MODELS.txt               code-only artifact
+    ggml-tiny-q5_1.bin              copied manually before recognition
+    ggml-base-q5_1.bin              copied manually before recognition
+    ggml-small-q5_1.bin             copied manually before recognition
   .tools/
     whisper.cpp-build-compat/
       bin/
         whisper-cli.exe
     whisper.cpp-build-avx2/          optional
+      bin/
+        whisper-cli.exe
+    whisper.cpp-build-vulkan/        optional
+      bin/
+        whisper-cli.exe
+    whisper.cpp-build-cuda/          optional
+      bin/
+        whisper-cli.exe
+    whisper.cpp-build-openvino/      optional
       bin/
         whisper-cli.exe
 ```
@@ -61,15 +75,20 @@ VoiceHelper/
 |---|---|
 | `VoiceHelper.exe` | Основное GUI-приложение. Записывает звук с микрофона, запускает локальный `whisper-cli.exe`, показывает распознанный текст. |
 | `_internal/` | Runtime PyInstaller: Python, Tkinter, sounddevice, CFFI и служебные DLL. Нужен для запуска без установки Python на ПК. |
-| `models/*.bin` | Локальные модели Whisper в формате ggml. Это веса модели, не пользовательские данные и не журналы. |
+| `models/*.bin` | Локальные модели Whisper в формате ggml. Это веса модели, не пользовательские данные и не журналы. В GitHub Actions code-only artifact не входят и копируются вручную рядом с `VoiceHelper.exe`. |
 | `.tools/whisper.cpp-build-compat/bin/whisper-cli.exe` | Локальный scalar compat backend whisper.cpp без AVX/AVX2/FMA/F16C/SSE4.2/BMI2. Работает как fallback на старых CPU. |
 | `.tools/whisper.cpp-build-avx2/bin/whisper-cli.exe` | Optional optimized backend whisper.cpp для современных CPU. Если не запускается, приложение использует compat backend. |
+| `.tools/whisper.cpp-build-vulkan/bin/whisper-cli.exe` | Optional GPU backend whisper.cpp для проверки Vulkan на реальных ПК. |
+| `.tools/whisper.cpp-build-cuda/bin/whisper-cli.exe` | Optional GPU backend whisper.cpp для проверки NVIDIA CUDA на реальных ПК. |
+| `.tools/whisper.cpp-build-openvino/bin/whisper-cli.exe` | Optional backend whisper.cpp для проверки OpenVINO на реальных ПК. |
 | `assets/` | Иконка приложения. На функциональность и обработку данных не влияет. |
 | `docs/` | Документация для ИБ и пользователя. |
 | `scripts/diagnose_voicehelper.ps1` | Единая диагностика: состав поставки, хэши, self-test, аудиоустройства, орфография, firewall, временные файлы, сетевой аудит. |
 | `scripts/diagnose_voicehelper.cmd` | Запуск единой диагностики двойным кликом; окно остается открытым до нажатия клавиши. |
 | `scripts/benchmark_voicehelper_models.ps1` | Локальный бенчмарк моделей для выбора профиля скорости. |
 | `scripts/benchmark_voicehelper_models.cmd` | Запуск бенчмарка двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/compare_voicehelper_backends.ps1` | Локальное сравнение backend `whisper.cpp`; если вручную подготовлен `faster-whisper`, показывает его как experimental result. |
+| `scripts/compare_voicehelper_backends.cmd` | Запуск сравнения backend двойным кликом; окно остается открытым до нажатия клавиши. |
 | `scripts/check_firewall_block.ps1` | Проверяет наличие outbound block firewall-правила для конкретного `VoiceHelper.exe`. |
 | `scripts/check_firewall_block.cmd` | Запуск проверки firewall двойным кликом; окно остается открытым до нажатия клавиши. |
 | `scripts/check_russian_spellcheck.ps1` | Проверяет доступность русского локального Windows Spell Checking API для `VoiceHelper.exe`. |
@@ -103,8 +122,10 @@ VoiceHelper/
 - текст в окне приложения;
 - текст, переданный локальному Windows Spell Checking API для проверки орфографии;
 - слово, добавленное пользователем в локальный пользовательский словарь Windows через пункт "Добавить в словарь";
-- текст в буфере обмена после нажатия "Скопировать".
+- текст в буфере обмена после нажатия "Скопировать" или после включенной опции "Автокопия";
 - технический файл `%LOCALAPPDATA%\VoiceHelper\performance_profile.json` с результатами локального бенчмарка моделей.
+- технический файл `%LOCALAPPDATA%\VoiceHelper\backend_profile.json` с результатами локального бенчмарка backend.
+- технический файл `%LOCALAPPDATA%\VoiceHelper\settings.json` с настройками галочек интерфейса.
 
 Не обрабатываются целенаправленно:
 
@@ -114,17 +135,17 @@ VoiceHelper/
 - браузерные cookies;
 - учетные данные;
 - сетевые ресурсы;
-- документы вне ручного копирования пользователем.
+- документы вне ручного копирования пользователем или включенного пользователем автокопирования.
 
 В штатном сценарии временные WAV/TXT-файлы удаляются после распознавания. Если процесс аварийно завершен во время распознавания, в `%TEMP%` теоретически могут остаться файлы вида `voicehelper_*.wav` или `voicehelper_*_out.txt`; это проверяется скриптом `scripts/check_voicehelper_security.ps1`.
 
-Файл `performance_profile.json` не содержит аудио, текста диктовок или истории распознаваний. В нем хранятся только время локального benchmark-запуска по моделям и выбранная модель для профиля "Авто".
+Файлы `performance_profile.json`, `backend_profile.json` и `settings.json` не содержат аудио, текста диктовок или истории распознаваний. В `performance_profile.json` хранятся только время локального benchmark-запуска по моделям и выбранная модель для профиля "Авто". В `backend_profile.json` хранятся только времена локального backend-бенчмарка и выбранный backend для режима "Авто". В `settings.json` хранятся только значения галочек "Автокопия", "Форматировать", "Команды пунктуации" и выбранный backend.
 
 ## Сеть и firewall
 
 По функциональной логике приложение не использует облачные API и не делает сетевые запросы для распознавания или проверки орфографии. Распознавание выполняется локально: `VoiceHelper.exe` вызывает локальный `whisper-cli.exe`, который использует локальные модели из папки `models`. Проверка орфографии выполняется локально через Windows Spell Checking API.
 
-Для дополнительного контроля в интерфейсе есть кнопки:
+Для дополнительного контроля в интерфейсе, во вкладке "Настройки" -> "Безопасность", есть кнопки:
 
 - "Блокировать сеть" - создает Windows Firewall outbound block rule для текущего `VoiceHelper.exe`;
 - "Разблокировать" - удаляет это правило;

@@ -164,6 +164,9 @@ Write-Section "Required Files"
 Test-RequiredFile -RelativePath "VoiceHelper.exe" -Hash
 Test-RequiredFile -RelativePath ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe" -Hash
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-avx2\bin\whisper-cli.exe"
+Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-vulkan\bin\whisper-cli.exe"
+Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-cuda\bin\whisper-cli.exe"
+Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-openvino\bin\whisper-cli.exe"
 Test-RequiredFile -RelativePath "models\ggml-tiny-q5_1.bin" -Hash
 Test-RequiredFile -RelativePath "models\ggml-base-q5_1.bin" -Hash
 Test-RequiredFile -RelativePath "models\ggml-small-q5_1.bin" -Hash
@@ -176,8 +179,12 @@ Test-RequiredFile -RelativePath "docs\STAGE_0_2_1_MICROPHONE.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_2_2_DIAGNOSTICS.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_2_3_ERROR_MESSAGES.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_3_SPEED.md"
+Test-RequiredFile -RelativePath "docs\STAGE_0_4_CONVENIENCE.md"
+Test-RequiredFile -RelativePath "docs\STAGE_0_5_PERFORMANCE.md"
 Test-RequiredFile -RelativePath "scripts\benchmark_voicehelper_models.cmd"
 Test-RequiredFile -RelativePath "scripts\benchmark_voicehelper_models.ps1"
+Test-RequiredFile -RelativePath "scripts\compare_voicehelper_backends.cmd"
+Test-RequiredFile -RelativePath "scripts\compare_voicehelper_backends.ps1"
 
 $program = Join-Path $root "VoiceHelper.exe"
 $powershellArgsPrefix = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File")
