@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import shutil
+from collections import deque
 from pathlib import Path
 
 from PIL import Image
@@ -22,15 +22,63 @@ EXPECTED_PNGS = {
     256: SOURCE_PNG_PATH,
 }
 EXPECTED_ICO_SIZES = {(16, 16), (24, 24), (32, 32), (48, 48), (256, 256)}
+DARK_CORNER_THRESHOLD = 12
 
 
-def verify_png_size(path: Path, size: int) -> None:
+def is_corner_background(pixel: tuple[int, int, int, int]) -> bool:
+    red, green, blue, alpha = pixel
+    return alpha == 0 or (
+        alpha > 0
+        and red <= DARK_CORNER_THRESHOLD
+        and green <= DARK_CORNER_THRESHOLD
+        and blue <= DARK_CORNER_THRESHOLD
+    )
+
+
+def clear_connected_corner_background(image: Image.Image) -> Image.Image:
+    image = image.convert("RGBA").copy()
+    pixels = image.load()
+    width, height = image.size
+    queue: deque[tuple[int, int]] = deque()
+    seen: set[tuple[int, int]] = set()
+
+    for x in range(width):
+        queue.append((x, 0))
+        queue.append((x, height - 1))
+    for y in range(height):
+        queue.append((0, y))
+        queue.append((width - 1, y))
+
+    while queue:
+        x, y = queue.popleft()
+        if (x, y) in seen:
+            continue
+        seen.add((x, y))
+
+        if not is_corner_background(pixels[x, y]):
+            continue
+
+        pixels[x, y] = (0, 0, 0, 0)
+        if x > 0:
+            queue.append((x - 1, y))
+        if x + 1 < width:
+            queue.append((x + 1, y))
+        if y > 0:
+            queue.append((x, y - 1))
+        if y + 1 < height:
+            queue.append((x, y + 1))
+
+    return image
+
+
+def load_icon_png(path: Path, size: int) -> Image.Image:
     if not path.exists():
         raise FileNotFoundError(f"Icon PNG is missing: {path}")
 
     with Image.open(path) as image:
         if image.size != (size, size):
             raise ValueError(f"Icon PNG has size {image.size}, expected {(size, size)}: {path}")
+        return clear_connected_corner_background(image)
 
 
 def verify_source_ico() -> None:
@@ -47,12 +95,20 @@ def verify_source_ico() -> None:
 def main() -> None:
     ASSETS.mkdir(exist_ok=True)
 
-    for size, path in EXPECTED_PNGS.items():
-        verify_png_size(path, size)
+    icon_images = {size: load_icon_png(path, size) for size, path in EXPECTED_PNGS.items()}
     verify_source_ico()
 
-    shutil.copyfile(SOURCE_PNG_PATH, PNG_PATH)
-    shutil.copyfile(SOURCE_ICO_PATH, ICO_PATH)
+    icon_images[256].save(PNG_PATH)
+    icon_images[256].save(
+        SOURCE_ICO_PATH,
+        append_images=[icon_images[16], icon_images[24], icon_images[32], icon_images[48]],
+        sizes=sorted(EXPECTED_ICO_SIZES),
+    )
+    icon_images[256].save(
+        ICO_PATH,
+        append_images=[icon_images[16], icon_images[24], icon_images[32], icon_images[48]],
+        sizes=sorted(EXPECTED_ICO_SIZES),
+    )
     print(f"Wrote {PNG_PATH}")
     print(f"Wrote {ICO_PATH}")
 
