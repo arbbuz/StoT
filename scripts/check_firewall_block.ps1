@@ -1,19 +1,19 @@
 param(
     [string]$ProgramPath = "",
-    [string]$RuleName = "VoiceHelper Block Outbound"
+    [string]$RuleName = "Dicta Block Outbound"
 )
 
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($ProgramPath)) {
     $packageRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
-    $ProgramPath = Join-Path $packageRoot "VoiceHelper.exe"
+    $ProgramPath = Join-Path $packageRoot "Dicta.exe"
 }
 
 $resolved = Resolve-Path -LiteralPath $ProgramPath
 $program = $resolved.Path
 
-Write-Host "VoiceHelper firewall block check"
+Write-Host "Dicta firewall block check"
 Write-Host "Rule:    $RuleName"
 Write-Host "Program: $program"
 Write-Host ""
@@ -26,12 +26,12 @@ $normalizedProgram = $program.ToLowerInvariant()
 
 if ($netshExit -ne 0 -or [string]::IsNullOrWhiteSpace($netshText)) {
     Write-Host "[FAIL] Firewall rule was not found."
-    Write-Host "       In VoiceHelper click: Блокировать сеть"
+    Write-Host "       In Dicta click: Блокировать сеть"
     exit 1
 }
 
 if ($normalizedOutput -notlike "*$normalizedProgram*") {
-    Write-Host "[FAIL] Rule exists, but it is not bound to this exact VoiceHelper.exe."
+    Write-Host "[FAIL] Rule exists, but it is not bound to this exact Dicta.exe."
     Write-Host ""
     Write-Host "Raw netsh output:"
     Write-Host $netshText
@@ -52,5 +52,5 @@ if (-not $looksBlocked) {
     exit 3
 }
 
-Write-Host "[OK] Outbound firewall block is enabled for this exact VoiceHelper.exe."
+Write-Host "[OK] Outbound firewall block is enabled for this exact Dicta.exe."
 exit 0

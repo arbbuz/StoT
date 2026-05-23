@@ -1,4 +1,4 @@
-# VoiceHelper 0.5: производительность
+# Dicta 0.5: производительность
 
 Дата: 2026-05-23
 Статус: реализовано в пилотной сборке
@@ -13,17 +13,18 @@
   - "AVX2";
   - "Compat".
 - Автоподбор backend по локальному бенчмарку.
+- В версии 1.1 backend-бенчмарк дополнительно подбирает число потоков `-t` для каждого доступного `whisper.cpp` backend.
 - Кнопка "Backend тест" в этой же вкладке для проверки доступных `whisper.cpp` backend на текущем ПК.
 - CLI-бенчмарк backend:
 
 ```text
-VoiceHelper.exe --benchmark-backends
+Dicta.exe --benchmark-backends
 ```
 
 - Скрипт сравнения backend на реальном ПК:
 
 ```text
-scripts\compare_voicehelper_backends.cmd
+scripts\compare_dicta_backends.cmd
 ```
 
 - Optional hook для экспериментального `faster-whisper`:
@@ -34,24 +35,24 @@ scripts\compare_voicehelper_backends.cmd
 
 ## Как работает автоподбор backend
 
-1. VoiceHelper ищет локальные `whisper-cli.exe` в папках `.tools`.
-2. Если выбран backend "Авто", приложение использует лучший backend из сохраненного backend-бенчмарка.
-3. Если бенчмарк еще не выполнялся, VoiceHelper пробует доступные backend в порядке:
+1. Dicta ищет локальные `whisper-cli.exe` в папках `.tools`.
+2. Если выбран backend "Авто", приложение использует лучшую пару backend + `-t` из сохраненного backend-бенчмарка.
+3. Если бенчмарк еще не выполнялся, Dicta пробует доступные backend в порядке:
    - Vulkan;
    - CUDA;
    - OpenVINO;
    - AVX2;
    - Compat.
-4. Если выбран конкретный backend, VoiceHelper пробует его первым.
+4. Если выбран конкретный backend, Dicta пробует его первым.
 5. Если выбранный backend отсутствует или падает, приложение сохраняет fallback на следующий доступный backend.
 
 Сохраненный результат backend-бенчмарка:
 
 ```text
-%LOCALAPPDATA%\VoiceHelper\backend_profile.json
+%LOCALAPPDATA%\Dicta\backend_profile.json
 ```
 
-В этом файле нет аудио, распознанного текста или истории диктовок. Хранятся только технические времена запуска backend и выбранный backend.
+В этом файле нет аудио, распознанного текста или истории диктовок. Хранятся только технические времена запуска backend/thread-кандидатов, выбранный backend и выбранное число потоков.
 
 ## Где ожидаются GPU backend
 
@@ -79,30 +80,30 @@ OpenVINO требует установленный OpenVINO runtime/toolkit и �
 
 `faster-whisper` в 0.5 оформлен как экспериментальный optional backend для сравнения на реальных ПК.
 
-Чтобы включить его в `scripts\compare_voicehelper_backends.cmd`, нужно вручную подготовить:
+Чтобы включить его в `scripts\compare_dicta_backends.cmd`, нужно вручную подготовить:
 
 1. Python-пакет `faster-whisper` в окружении, из которого запускается исходная версия, либо упаковать его отдельно для экспериментальной сборки.
 2. Локальную CTranslate2-модель.
 3. Переменную окружения с путем к модели:
 
 ```text
-VOICEHELPER_FASTER_WHISPER_MODEL=C:\path\to\faster-whisper-model
+DICTA_FASTER_WHISPER_MODEL=C:\path\to\faster-whisper-model
 ```
 
 Опциональные переменные:
 
 ```text
-VOICEHELPER_FASTER_WHISPER_DEVICE=cpu
-VOICEHELPER_FASTER_WHISPER_COMPUTE_TYPE=int8
+DICTA_FASTER_WHISPER_DEVICE=cpu
+DICTA_FASTER_WHISPER_COMPUTE_TYPE=int8
 ```
 
-Для GPU-проверки faster-whisper можно использовать `VOICEHELPER_FASTER_WHISPER_DEVICE=cuda` и подходящий `compute_type`, если целевой ПК и локальное окружение это поддерживают.
+Для GPU-проверки faster-whisper можно использовать `DICTA_FASTER_WHISPER_DEVICE=cuda` и подходящий `compute_type`, если целевой ПК и локальное окружение это поддерживают.
 
 ## Поставка
 
 GitHub Actions artifact остается code-only и не включает модели `.bin`.
 
-Модели Whisper по-прежнему нужно вручную скопировать рядом с `VoiceHelper.exe`:
+Модели Whisper по-прежнему нужно вручную скопировать рядом с `Dicta.exe`:
 
 ```text
 models\ggml-tiny-q5_1.bin

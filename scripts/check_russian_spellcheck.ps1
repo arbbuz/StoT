@@ -6,18 +6,18 @@ $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($ProgramPath)) {
     $packageRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
-    $ProgramPath = Join-Path $packageRoot "VoiceHelper.exe"
+    $ProgramPath = Join-Path $packageRoot "Dicta.exe"
 }
 
 $resolved = Resolve-Path -LiteralPath $ProgramPath
 $program = $resolved.Path
 
-Write-Host "VoiceHelper Russian spellchecker check"
+Write-Host "Dicta Russian spellchecker check"
 Write-Host "Program: $program"
 Write-Host ""
 
-$stdoutPath = Join-Path $env:TEMP "voicehelper_spellcheck_stdout.txt"
-$stderrPath = Join-Path $env:TEMP "voicehelper_spellcheck_stderr.txt"
+$stdoutPath = Join-Path $env:TEMP "dicta_spellcheck_stdout.txt"
+$stderrPath = Join-Path $env:TEMP "dicta_spellcheck_stderr.txt"
 Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
 
 $process = Start-Process `
@@ -43,7 +43,7 @@ $exitCode = $process.ExitCode
 
 Write-Host ""
 if ($exitCode -eq 0) {
-    Write-Host "[OK] Russian Windows spellchecker is available for VoiceHelper."
+    Write-Host "[OK] Russian Windows spellchecker is available for Dicta."
     exit 0
 }
 

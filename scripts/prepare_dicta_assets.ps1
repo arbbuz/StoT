@@ -34,10 +34,10 @@ function Download-File {
 }
 
 $whisperZip = Join-Path $env:TEMP "whisper-bin-x64-$WhisperCppVersion.zip"
-$whisperExtract = Join-Path $env:TEMP "voicehelper-whisper-$WhisperCppVersion"
+$whisperExtract = Join-Path $env:TEMP "dicta-whisper-$WhisperCppVersion"
 $whisperUrl = "https://github.com/ggml-org/whisper.cpp/releases/download/$WhisperCppVersion/whisper-bin-x64.zip"
 $sourceZip = Join-Path $env:TEMP "whisper-src-$WhisperCppVersion.zip"
-$sourceExtract = Join-Path $env:TEMP "voicehelper-whisper-src-$WhisperCppVersion"
+$sourceExtract = Join-Path $env:TEMP "dicta-whisper-src-$WhisperCppVersion"
 $sourceUrl = "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/$WhisperCppVersion.zip"
 
 Download-File -Url $whisperUrl -Destination $whisperZip
@@ -159,4 +159,4 @@ if (-not $SkipModels) {
     Write-Host "Skipping model downloads."
 }
 
-Write-Host "VoiceHelper assets are ready."
+Write-Host "Dicta assets are ready."

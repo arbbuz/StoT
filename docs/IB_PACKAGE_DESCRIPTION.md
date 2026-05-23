@@ -1,19 +1,19 @@
-# VoiceHelper: описание поставки для ИБ
+# Dicta: описание поставки для ИБ
 
 Дата: 2026-05-22
 Статус: пилотная локальная версия
 
 ## Назначение
 
-VoiceHelper - локальное Windows-приложение для диктовки текста голосом. Пользователь нажимает "Записать" или `Ctrl+Shift+Space`, диктует, нажимает ту же кнопку "Стоп" или повторно `Ctrl+Shift+Space`, получает текст в окне приложения и копирует его кнопкой "Скопировать" либо опциональной галочкой "Автокопия" в окне "Настройки".
+Dicta - локальное Windows-приложение для диктовки текста голосом. Пользователь нажимает "Записать" или `Ctrl+Shift+Space`, диктует, нажимает ту же кнопку "Стоп" или повторно `Ctrl+Shift+Space`, получает текст в окне приложения и копирует его кнопкой "Скопировать" либо опциональной галочкой "Автокопия" в окне "Настройки".
 
 Приложение не является почтовым клиентом, не отправляет письма, не создает черновики, не подключается к облачным сервисам распознавания речи и не выполняет интеграцию с Gmail, Outlook или другими почтовыми системами.
 
 ## Состав папки
 
 ```text
-VoiceHelper/
-  VoiceHelper.exe
+Dicta/
+  Dicta.exe
   manifest.json
   SHA256SUMS.txt
   assets/
@@ -30,28 +30,29 @@ VoiceHelper/
     STAGE_0_4_CONVENIENCE.md
     STAGE_0_5_PERFORMANCE.md
     STAGE_1_0_CORPORATE_PILOT.md
+    STAGE_1_1_BACKEND_THREADS.md
     UPDATE_PROCEDURE.md
     USER_CHECKLIST.md
   scripts/
-    diagnose_voicehelper.cmd
-    diagnose_voicehelper.ps1
-    verify_voicehelper_package.cmd
-    verify_voicehelper_package.ps1
-    generate_voicehelper_manifest.ps1
-    benchmark_voicehelper_models.cmd
-    benchmark_voicehelper_models.ps1
-    compare_voicehelper_backends.cmd
-    compare_voicehelper_backends.ps1
+    diagnose_dicta.cmd
+    diagnose_dicta.ps1
+    verify_dicta_package.cmd
+    verify_dicta_package.ps1
+    generate_dicta_manifest.ps1
+    benchmark_dicta_models.cmd
+    benchmark_dicta_models.ps1
+    compare_dicta_backends.cmd
+    compare_dicta_backends.ps1
     check_firewall_block.cmd
     check_firewall_block.ps1
     check_russian_spellcheck.cmd
     check_russian_spellcheck.ps1
-    check_voicehelper_security.cmd
-    check_voicehelper_security.ps1
+    check_dicta_security.cmd
+    check_dicta_security.ps1
     list_audio_devices.cmd
     list_audio_devices.ps1
-    audit_voicehelper_network.cmd
-    audit_voicehelper_network.ps1
+    audit_dicta_network.cmd
+    audit_dicta_network.ps1
   _internal/
   models/
     README_MODELS.txt               code-only artifact
@@ -80,11 +81,11 @@ VoiceHelper/
 
 | Компонент | Назначение |
 |---|---|
-| `VoiceHelper.exe` | Основное GUI-приложение. Записывает звук с микрофона, запускает локальный `whisper-cli.exe`, показывает распознанный текст. |
+| `Dicta.exe` | Основное GUI-приложение. Записывает звук с микрофона, запускает локальный `whisper-cli.exe`, показывает распознанный текст. |
 | `manifest.json` | Машинно-читаемый состав поставки: версия пакета, тип пакета, дата генерации, исходный commit и список файлов с SHA256. |
-| `SHA256SUMS.txt` | Контрольные SHA256-суммы файлов code-only поставки. Используется скриптом `verify_voicehelper_package.ps1`. |
+| `SHA256SUMS.txt` | Контрольные SHA256-суммы файлов code-only поставки. Используется скриптом `verify_dicta_package.ps1`. |
 | `_internal/` | Runtime PyInstaller: Python, Tkinter, sounddevice, CFFI и служебные DLL. Нужен для запуска без установки Python на ПК. |
-| `models/*.bin` | Локальные модели Whisper в формате ggml. Это веса модели, не пользовательские данные и не журналы. В GitHub Actions code-only artifact не входят и копируются вручную рядом с `VoiceHelper.exe`. |
+| `models/*.bin` | Локальные модели Whisper в формате ggml. Это веса модели, не пользовательские данные и не журналы. В GitHub Actions code-only artifact не входят и копируются вручную рядом с `Dicta.exe`. |
 | `.tools/whisper.cpp-build-compat/bin/whisper-cli.exe` | Локальный scalar compat backend whisper.cpp без AVX/AVX2/FMA/F16C/SSE4.2/BMI2. Работает как fallback на старых CPU. |
 | `.tools/whisper.cpp-build-avx2/bin/whisper-cli.exe` | Optional optimized backend whisper.cpp для современных CPU. Если не запускается, приложение использует compat backend. |
 | `.tools/whisper.cpp-build-vulkan/bin/whisper-cli.exe` | Optional GPU backend whisper.cpp для проверки Vulkan на реальных ПК. |
@@ -92,25 +93,25 @@ VoiceHelper/
 | `.tools/whisper.cpp-build-openvino/bin/whisper-cli.exe` | Optional backend whisper.cpp для проверки OpenVINO на реальных ПК. |
 | `assets/` | Иконка приложения. На функциональность и обработку данных не влияет. |
 | `docs/` | Документация для ИБ и пользователя. |
-| `scripts/diagnose_voicehelper.ps1` | Единая диагностика: состав поставки, хэши, self-test, аудиоустройства, орфография, firewall, временные файлы, сетевой аудит. |
-| `scripts/diagnose_voicehelper.cmd` | Запуск единой диагностики двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/verify_voicehelper_package.ps1` | Проверяет `manifest.json` и SHA256-суммы файлов поставки без запуска GUI. |
-| `scripts/verify_voicehelper_package.cmd` | Запуск проверки целостности двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/generate_voicehelper_manifest.ps1` | Создает `manifest.json` и `SHA256SUMS.txt` во время сборки поставки. |
-| `scripts/benchmark_voicehelper_models.ps1` | Локальный бенчмарк моделей для выбора профиля скорости. |
-| `scripts/benchmark_voicehelper_models.cmd` | Запуск бенчмарка двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/compare_voicehelper_backends.ps1` | Локальное сравнение backend `whisper.cpp`; если вручную подготовлен `faster-whisper`, показывает его как experimental result. |
-| `scripts/compare_voicehelper_backends.cmd` | Запуск сравнения backend двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/check_firewall_block.ps1` | Проверяет наличие outbound block firewall-правила для конкретного `VoiceHelper.exe`. |
+| `scripts/diagnose_dicta.ps1` | Единая диагностика: состав поставки, хэши, self-test, аудиоустройства, орфография, firewall, временные файлы, сетевой аудит. |
+| `scripts/diagnose_dicta.cmd` | Запуск единой диагностики двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/verify_dicta_package.ps1` | Проверяет `manifest.json` и SHA256-суммы файлов поставки без запуска GUI. |
+| `scripts/verify_dicta_package.cmd` | Запуск проверки целостности двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/generate_dicta_manifest.ps1` | Создает `manifest.json` и `SHA256SUMS.txt` во время сборки поставки. |
+| `scripts/benchmark_dicta_models.ps1` | Локальный бенчмарк моделей для выбора профиля скорости. |
+| `scripts/benchmark_dicta_models.cmd` | Запуск бенчмарка двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/compare_dicta_backends.ps1` | Локальное сравнение backend/thread-кандидатов `whisper.cpp`; если вручную подготовлен `faster-whisper`, показывает его как experimental result. |
+| `scripts/compare_dicta_backends.cmd` | Запуск сравнения backend двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/check_firewall_block.ps1` | Проверяет наличие outbound block firewall-правила для конкретного `Dicta.exe`. |
 | `scripts/check_firewall_block.cmd` | Запуск проверки firewall двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/check_russian_spellcheck.ps1` | Проверяет доступность русского локального Windows Spell Checking API для `VoiceHelper.exe`. |
+| `scripts/check_russian_spellcheck.ps1` | Проверяет доступность русского локального Windows Spell Checking API для `Dicta.exe`. |
 | `scripts/check_russian_spellcheck.cmd` | Запуск проверки русского словаря двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/check_voicehelper_security.ps1` | Проверяет наличие локальных файлов, моделей, правила firewall и временных хвостов в `%TEMP%`. |
-| `scripts/check_voicehelper_security.cmd` | Запуск общей проверки двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/list_audio_devices.ps1` | Выводит список устройств записи, которые видит VoiceHelper через sounddevice/PortAudio. |
+| `scripts/check_dicta_security.ps1` | Проверяет наличие локальных файлов, моделей, правила firewall и временных хвостов в `%TEMP%`. |
+| `scripts/check_dicta_security.cmd` | Запуск общей проверки двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/list_audio_devices.ps1` | Выводит список устройств записи, которые видит Dicta через sounddevice/PortAudio. |
 | `scripts/list_audio_devices.cmd` | Запуск списка аудиоустройств двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/audit_voicehelper_network.ps1` | Наблюдает TCP-подключения процесса VoiceHelper в течение заданного времени. |
-| `scripts/audit_voicehelper_network.cmd` | Запуск сетевого аудита двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/audit_dicta_network.ps1` | Наблюдает TCP-подключения процесса Dicta в течение заданного времени. |
+| `scripts/audit_dicta_network.cmd` | Запуск сетевого аудита двойным кликом; окно остается открытым до нажатия клавиши. |
 
 ## Чем создано
 
@@ -135,9 +136,9 @@ VoiceHelper/
 - текст, переданный локальному Windows Spell Checking API для проверки орфографии;
 - слово, добавленное пользователем в локальный пользовательский словарь Windows через пункт "Добавить в словарь";
 - текст в буфере обмена после нажатия "Скопировать" или после включенной опции "Автокопия";
-- технический файл `%LOCALAPPDATA%\VoiceHelper\performance_profile.json` с результатами локального бенчмарка моделей.
-- технический файл `%LOCALAPPDATA%\VoiceHelper\backend_profile.json` с результатами локального бенчмарка backend.
-- технический файл `%LOCALAPPDATA%\VoiceHelper\settings.json` с настройками галочек интерфейса.
+- технический файл `%LOCALAPPDATA%\Dicta\performance_profile.json` с результатами локального бенчмарка моделей.
+- технический файл `%LOCALAPPDATA%\Dicta\backend_profile.json` с результатами локального бенчмарка backend и числа потоков.
+- технический файл `%LOCALAPPDATA%\Dicta\settings.json` с настройками галочек интерфейса.
 
 Не обрабатываются целенаправленно:
 
@@ -149,53 +150,53 @@ VoiceHelper/
 - сетевые ресурсы;
 - документы вне ручного копирования пользователем или включенного пользователем автокопирования.
 
-В штатном сценарии временные WAV/TXT-файлы удаляются после распознавания. Если процесс аварийно завершен во время распознавания, в `%TEMP%` теоретически могут остаться файлы вида `voicehelper_*.wav` или `voicehelper_*_out.txt`; это проверяется скриптом `scripts/check_voicehelper_security.ps1`.
+В штатном сценарии временные WAV/TXT-файлы удаляются после распознавания. Если процесс аварийно завершен во время распознавания, в `%TEMP%` теоретически могут остаться файлы вида `dicta_*.wav` или `dicta_*_out.txt`; это проверяется скриптом `scripts/check_dicta_security.ps1`.
 
-Файлы `performance_profile.json`, `backend_profile.json` и `settings.json` не содержат аудио, текста диктовок или истории распознаваний. В `performance_profile.json` хранятся только время локального benchmark-запуска по моделям и выбранная модель для профиля "Авто". В `backend_profile.json` хранятся только времена локального backend-бенчмарка и выбранный backend для режима "Авто". В `settings.json` хранятся только значения галочек "Автокопия", "Форматировать", "Команды пунктуации" и выбранный backend.
+Файлы `performance_profile.json`, `backend_profile.json` и `settings.json` не содержат аудио, текста диктовок или истории распознаваний. В `performance_profile.json` хранятся только время локального benchmark-запуска по моделям и выбранная модель для профиля "Авто". В `backend_profile.json` хранятся только времена локального backend/thread-бенчмарка, выбранный backend и выбранное число потоков для режима "Авто". В `settings.json` хранятся только значения галочек "Автокопия", "Форматировать", "Команды пунктуации" и выбранный backend.
 
 ## Сеть и firewall
 
-По функциональной логике приложение не использует облачные API и не делает сетевые запросы для распознавания или проверки орфографии. Распознавание выполняется локально: `VoiceHelper.exe` вызывает локальный `whisper-cli.exe`, который использует локальные модели из папки `models`. Проверка орфографии выполняется локально через Windows Spell Checking API.
+По функциональной логике приложение не использует облачные API и не делает сетевые запросы для распознавания или проверки орфографии. Распознавание выполняется локально: `Dicta.exe` вызывает локальный `whisper-cli.exe`, который использует локальные модели из папки `models`. Проверка орфографии выполняется локально через Windows Spell Checking API.
 
 Для дополнительного контроля в интерфейсе, во вкладке "Настройки" -> "Безопасность", есть кнопки:
 
-- "Блокировать сеть" - создает Windows Firewall outbound block rule для текущего `VoiceHelper.exe`;
+- "Блокировать сеть" - создает Windows Firewall outbound block rule для текущего `Dicta.exe`;
 - "Разблокировать" - удаляет это правило;
 - индикатор "Сеть" - показывает наличие правила для текущего пути к EXE.
 
-Firewall-правило привязано к конкретному пути `VoiceHelper.exe`. Если папку приложения перенесли или переименовали, правило нужно создать заново из нового расположения.
+Firewall-правило привязано к конкретному пути `Dicta.exe`. Если папку приложения перенесли или переименовали, правило нужно создать заново из нового расположения.
 
 ## Проверки для ИБ
 
-Из корня распакованной папки `VoiceHelper`:
+Из корня распакованной папки `Dicta`:
 
 Запуск двойным кликом из Проводника:
 
 ```text
-scripts\diagnose_voicehelper.cmd
-scripts\verify_voicehelper_package.cmd
+scripts\diagnose_dicta.cmd
+scripts\verify_dicta_package.cmd
 scripts\check_firewall_block.cmd
 scripts\check_russian_spellcheck.cmd
-scripts\check_voicehelper_security.cmd
-scripts\audit_voicehelper_network.cmd
+scripts\check_dicta_security.cmd
+scripts\audit_dicta_network.cmd
 ```
 
 Запуск из PowerShell:
 
 ```powershell
-.\scripts\diagnose_voicehelper.ps1 -Root "."
-.\scripts\verify_voicehelper_package.ps1 -Root "."
+.\scripts\diagnose_dicta.ps1 -Root "."
+.\scripts\verify_dicta_package.ps1 -Root "."
 .\scripts\check_firewall_block.ps1
 .\scripts\check_russian_spellcheck.ps1
-.\scripts\check_voicehelper_security.ps1 -Root "."
-.\scripts\audit_voicehelper_network.ps1 -ProgramPath ".\VoiceHelper.exe" -Seconds 30
+.\scripts\check_dicta_security.ps1 -Root "."
+.\scripts\audit_dicta_network.ps1 -ProgramPath ".\Dicta.exe" -Seconds 30
 ```
 
-`check_firewall_block.ps1` должен вернуть `[OK] Outbound firewall block is enabled for this exact VoiceHelper.exe.` после нажатия "Блокировать сеть" в приложении и подтверждения UAC.
+`check_firewall_block.ps1` должен вернуть `[OK] Outbound firewall block is enabled for this exact Dicta.exe.` после нажатия "Блокировать сеть" в приложении и подтверждения UAC.
 
-`diagnose_voicehelper.ps1` сохраняет полный отчет в `diagnostics\voicehelper_diagnostic_YYYYMMDD_HHMMSS.txt`. Отчет можно передать ИБ или разработчику без скриншотов окна.
+`diagnose_dicta.ps1` сохраняет полный отчет в `diagnostics\dicta_diagnostic_YYYYMMDD_HHMMSS.txt`. Отчет можно передать ИБ или разработчику без скриншотов окна.
 
-`verify_voicehelper_package.ps1` проверяет хэши code-only файлов из `SHA256SUMS.txt`. Если после проверки в `models` вручную добавлены `.bin` модели, скрипт может показать предупреждение о дополнительных файлах; это не означает изменение code-only артефакта.
+`verify_dicta_package.ps1` проверяет хэши code-only файлов из `SHA256SUMS.txt`. Если после проверки в `models` вручную добавлены `.bin` модели, скрипт может показать предупреждение о дополнительных файлах; это не означает изменение code-only артефакта.
 
 ## Важные ограничения
 

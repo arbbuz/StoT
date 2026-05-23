@@ -1,22 +1,22 @@
-# VoiceHelper 1.0: корпоративный пилот
+# Dicta 1.0: корпоративный пилот
 
 ## Цель
 
-Версия 1.0 фиксирует VoiceHelper как поставочный пакет для корпоративного пилота: состав папки должен быть понятен пользователю, администратору и ИБ, а целостность code-only артефакта должна проверяться без запуска графического интерфейса.
+Версия 1.0 фиксирует Dicta как поставочный пакет для корпоративного пилота: состав папки должен быть понятен пользователю, администратору и ИБ, а целостность code-only артефакта должна проверяться без запуска графического интерфейса.
 
 ## Что добавлено
 
 - `manifest.json` в корне поставки: машинно-читаемый состав пакета, версия, тип пакета и список файлов с SHA256.
 - `SHA256SUMS.txt` в корне поставки: проверочные суммы файлов поставки.
-- `scripts\verify_voicehelper_package.cmd` и `.ps1`: проверка, что файлы из `SHA256SUMS.txt` на месте и не изменены.
-- Диагностика `scripts\diagnose_voicehelper.cmd` теперь включает проверку manifest/SHA256.
+- `scripts\verify_dicta_package.cmd` и `.ps1`: проверка, что файлы из `SHA256SUMS.txt` на месте и не изменены.
+- Диагностика `scripts\diagnose_dicta.cmd` теперь включает проверку manifest/SHA256.
 - Процедура обновления вынесена в `docs\UPDATE_PROCEDURE.md`.
 
 ## Правило моделей
 
 GitHub Actions artifact остается code-only. Whisper модели `models\*.bin` не включаются в архив и не попадают в git.
 
-Для работы распознавания пользователь или администратор вручную копирует модели в папку `models` рядом с `VoiceHelper.exe`:
+Для работы распознавания пользователь или администратор вручную копирует модели в папку `models` рядом с `Dicta.exe`:
 
 ```text
 models\ggml-tiny-q5_1.bin
@@ -24,20 +24,20 @@ models\ggml-base-q5_1.bin
 models\ggml-small-q5_1.bin
 ```
 
-Если модели добавлены после проверки поставки, `verify_voicehelper_package.ps1` может показать предупреждение о файлах, которых нет в `SHA256SUMS.txt`. Это нормально для вручную добавленных моделей. Проверка хэшей code-only файлов при этом остается действительной.
+Если модели добавлены после проверки поставки, `verify_dicta_package.ps1` может показать предупреждение о файлах, которых нет в `SHA256SUMS.txt`. Это нормально для вручную добавленных моделей. Проверка хэшей code-only файлов при этом остается действительной.
 
 ## Проверка поставки
 
 Из корня распакованной папки:
 
 ```text
-scripts\verify_voicehelper_package.cmd
+scripts\verify_dicta_package.cmd
 ```
 
 Или из PowerShell:
 
 ```powershell
-.\scripts\verify_voicehelper_package.ps1 -Root "."
+.\scripts\verify_dicta_package.ps1 -Root "."
 ```
 
 Ожидаемый результат для неизмененного пакета:
@@ -49,10 +49,10 @@ Result: package verification passed.
 Для полной диагностики:
 
 ```text
-scripts\diagnose_voicehelper.cmd
+scripts\diagnose_dicta.cmd
 ```
 
-Диагностика сохраняет отчет в `diagnostics\voicehelper_diagnostic_YYYYMMDD_HHMMSS.txt`.
+Диагностика сохраняет отчет в `diagnostics\dicta_diagnostic_YYYYMMDD_HHMMSS.txt`.
 
 ## Ограничения 1.0
 

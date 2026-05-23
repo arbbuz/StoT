@@ -1,10 +1,10 @@
-# VoiceHelper: логика работы программы
+# Dicta: логика работы программы
 
 Документ описывает, что делает Python-код и остальные компоненты приложения.
 
 ## Общая схема
 
-1. `VoiceHelper.exe` запускает окно Tkinter.
+1. `Dicta.exe` запускает окно Tkinter.
 2. Пользователь при необходимости открывает "Настройки" и выбирает микрофон, модель, профиль скорости или backend.
 3. Во вкладке "Запись" приложение показывает сгруппированный список микрофонов, скрывая технические дубли MME/DirectSound/WASAPI/WDM-KS.
 4. Пользователь нажимает "Записать" или горячую клавишу `Ctrl+Shift+Space`.
@@ -12,10 +12,10 @@
 6. Аудио хранится в оперативной памяти приложения до нажатия "Стоп" или повторного нажатия `Ctrl+Shift+Space`.
 7. После "Стоп" код обрезает тишину в начале и конце записи.
 8. Простой локальный VAD дополнительно убирает длинную тишину перед передачей в распознавание.
-9. Запись временно сохраняется в WAV-файл `%TEMP%\voicehelper_*.wav`.
-10. Python запускает локальный `whisper-cli.exe`: в режиме "Авто" сначала лучший backend из локального backend-бенчмарка, затем fallback по доступным backend.
+9. Запись временно сохраняется в WAV-файл `%TEMP%\dicta_*.wav`.
+10. Python запускает локальный `whisper-cli.exe`: в режиме "Авто" сначала лучшую пару backend + `-t` из локального backend-бенчмарка, затем fallback по доступным backend.
 11. `whisper-cli.exe` читает WAV и выбранную локальную модель из `models`.
-12. Результат распознавания записывается во временный TXT-файл `%TEMP%\voicehelper_*_out.txt`.
+12. Результат распознавания записывается во временный TXT-файл `%TEMP%\dicta_*_out.txt`.
 13. Python читает TXT, применяет локальные голосовые команды пунктуации и базовое форматирование, показывает текст в окне приложения и удаляет временные WAV/TXT.
 14. Если включена галочка "Автокопия", Python помещает итоговый текст в буфер обмена Windows.
 15. Python автоматически передает текст в локальный Windows Spell Checking API для проверки орфографии.
@@ -26,7 +26,7 @@
 
 ## Что делает Python-код
 
-`voicehelper.py` отвечает за:
+`dicta.py` отвечает за:
 
 - создание основного окна, компактной панели действий с ручным автоформатом и окна "Настройки" с вкладками "Запись", "Текст", "Производительность", "Безопасность";
 - регистрацию горячей клавиши `Ctrl+Shift+Space` через локальный Windows API;
@@ -50,7 +50,7 @@
 - контекстное меню поля текста с вырезанием, копированием, вставкой, выделением всего текста и орфографическими действиями на подчеркнутых словах;
 - добавление слова в локальный пользовательский словарь Windows;
 - ручное или опциональное автоматическое копирование текста в буфер обмена;
-- сохранение технических настроек интерфейса в `%LOCALAPPDATA%\VoiceHelper\settings.json`;
+- сохранение технических настроек интерфейса в `%LOCALAPPDATA%\Dicta\settings.json`;
 - запуск локального бенчмарка моделей и сохранение технического performance profile;
 - запуск локального backend-бенчмарка и сохранение технического backend profile;
 - проверку наличия firewall-правила через `netsh`;
@@ -76,7 +76,7 @@
 
 ## Что делает whisper.cpp
 
-`whisper-cli.exe` - локальный исполняемый файл speech-to-text движка. VoiceHelper поддерживает optional GPU backend, optional AVX2 backend и scalar compat fallback:
+`whisper-cli.exe` - локальный исполняемый файл speech-to-text движка. Dicta поддерживает optional GPU backend, optional AVX2 backend и scalar compat fallback:
 
 ```text
 .tools\whisper.cpp-build-vulkan\bin\whisper-cli.exe
@@ -88,7 +88,7 @@
 
 Compat backend собирается без AVX/AVX2/FMA/F16C/SSE4.2/BMI2, чтобы оставался fallback для старых CPU.
 
-GPU backend являются optional и не нужны для базового запуска. Если выбран конкретный backend, он пробуется первым. Если выбран "Авто", VoiceHelper использует сохраненный результат `%LOCALAPPDATA%\VoiceHelper\backend_profile.json`; если результата еще нет, пробует доступные backend в порядке Vulkan, CUDA, OpenVINO, AVX2, Compat.
+GPU backend являются optional и не нужны для базового запуска. Если выбран конкретный backend, он пробуется первым. Если выбран "Авто", Dicta использует сохраненный backend и число потоков из `%LOCALAPPDATA%\Dicta\backend_profile.json`; если результата еще нет, пробует доступные backend в порядке Vulkan, CUDA, OpenVINO, AVX2, Compat.
 
 Исполняемый файл получает параметры:
 
@@ -96,7 +96,7 @@ GPU backend являются optional и не нужны для базового
 -m <путь к модели>
 -f <временный WAV>
 -l ru
--t 4
+-t <число потоков из backend profile, по умолчанию 4>
 -nt
 -np
 -nf
@@ -109,7 +109,7 @@ GPU backend являются optional и не нужны для базового
 - `-m` - локальная модель;
 - `-f` - локальный WAV-файл;
 - `-l ru` - русский язык;
-- `-t 4` - число потоков CPU;
+- `-t` - число CPU-потоков для `whisper.cpp`; после backend-бенчмарка берется из `backend_profile.json`, иначе используется 4;
 - `-nt`, `-np`, `-nf` - отключение лишних служебных выводов/форматов;
 - `-otxt` - сохранить результат в TXT;
 - `-of` - базовое имя выходного файла.
@@ -119,23 +119,23 @@ GPU backend являются optional и не нужны для базового
 Бенчмарк создает короткий synthetic WAV во временной папке, прогоняет локальные модели `tiny-q5_1`, `base-q5_1`, `small-q5_1` через локальный `whisper-cli.exe` и сохраняет технический результат в:
 
 ```text
-%LOCALAPPDATA%\VoiceHelper\performance_profile.json
+%LOCALAPPDATA%\Dicta\performance_profile.json
 ```
 
 В этом файле нет пользовательского аудио, распознанного текста или истории диктовок.
 
-Backend-бенчмарк создает такой же synthetic WAV, прогоняет доступные backend `whisper.cpp` и сохраняет технический результат в:
+Backend-бенчмарк создает такой же synthetic WAV, прогоняет доступные backend `whisper.cpp` с несколькими значениями `-t` и сохраняет технический результат в:
 
 ```text
-%LOCALAPPDATA%\VoiceHelper\backend_profile.json
+%LOCALAPPDATA%\Dicta\backend_profile.json
 ```
 
-В этом файле нет пользовательского аудио, распознанного текста или истории диктовок. Хранятся только времена выполнения backend и выбранный backend для режима "Авто".
+В этом файле нет пользовательского аудио, распознанного текста или истории диктовок. Хранятся только времена выполнения backend/thread-кандидатов, выбранный backend и выбранное число потоков для режима "Авто".
 
 Настройки галочек 0.4 хранятся в:
 
 ```text
-%LOCALAPPDATA%\VoiceHelper\settings.json
+%LOCALAPPDATA%\Dicta\settings.json
 ```
 
 В этом файле нет аудио, распознанного текста или истории диктовок. Хранятся только значения настроек "Автокопия", "Форматировать" и "Команды пунктуации".
@@ -145,8 +145,8 @@ Backend-бенчмарк создает такой же synthetic WAV, прог�
 Во время распознавания:
 
 ```text
-%TEMP%\voicehelper_<random>.wav
-%TEMP%\voicehelper_<random>_out.txt
+%TEMP%\dicta_<random>.wav
+%TEMP%\dicta_<random>_out.txt
 ```
 
 После успешного или ошибочного завершения распознавания Python пытается удалить оба файла в блоке `finally`.
@@ -155,27 +155,27 @@ Backend-бенчмарк создает такой же synthetic WAV, прог�
 
 Кнопка "Блокировать сеть":
 
-1. Определяет путь текущего `VoiceHelper.exe`.
+1. Определяет путь текущего `Dicta.exe`.
 2. Создает временный CMD-файл в `%TEMP%`.
 3. Запускает его через Windows ShellExecute с verb `runas`.
 4. Windows показывает стандартный UAC-запрос.
 5. CMD выполняет:
 
 ```cmd
-netsh advfirewall firewall delete rule name="VoiceHelper Block Outbound" program="<VoiceHelper.exe>" dir=out
-netsh advfirewall firewall add rule name="VoiceHelper Block Outbound" dir=out action=block program="<VoiceHelper.exe>" enable=yes profile=any
+netsh advfirewall firewall delete rule name="Dicta Block Outbound" program="<Dicta.exe>" dir=out
+netsh advfirewall firewall add rule name="Dicta Block Outbound" dir=out action=block program="<Dicta.exe>" enable=yes profile=any
 ```
 
 Кнопка "Разблокировать":
 
 ```cmd
-netsh advfirewall firewall delete rule name="VoiceHelper Block Outbound" program="<VoiceHelper.exe>" dir=out
+netsh advfirewall firewall delete rule name="Dicta Block Outbound" program="<Dicta.exe>" dir=out
 ```
 
 Лог выполнения пишется в:
 
 ```text
-%TEMP%\voicehelper_firewall.log
+%TEMP%\dicta_firewall.log
 ```
 
 ## Что приложение не делает

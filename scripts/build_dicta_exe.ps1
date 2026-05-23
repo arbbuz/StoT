@@ -1,6 +1,6 @@
 param(
     [switch]$SkipModels,
-    [string]$PackageVersion = "1.0-pilot"
+    [string]$PackageVersion = "1.1-pilot"
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,14 +11,14 @@ python -m pip install -r requirements.txt
 python -m pip install pyinstaller
 python -m pip install pillow
 python scripts\generate_app_icon.py
-python -m PyInstaller --noconfirm --clean --windowed --icon "assets\app_icon.ico" --name VoiceHelper voicehelper.py
+python -m PyInstaller --noconfirm --clean --windowed --icon "assets\app_icon.ico" --name Dicta dicta.py
 
-$dist = "dist\VoiceHelper"
+$dist = "dist\Dicta"
 New-Item -ItemType Directory -Force -Path "$dist\models", "$dist\.tools\whisper.cpp-build-compat\bin", "$dist\assets", "$dist\docs", "$dist\scripts" | Out-Null
 
 if ($SkipModels) {
     @"
-VoiceHelper models are not included in this package.
+Dicta models are not included in this package.
 
 Copy these files into this folder before using recognition:
 - ggml-tiny-q5_1.bin
@@ -83,6 +83,7 @@ Copy-Item -LiteralPath `
     "docs\STAGE_0_4_CONVENIENCE.md", `
     "docs\STAGE_0_5_PERFORMANCE.md", `
     "docs\STAGE_1_0_CORPORATE_PILOT.md", `
+    "docs\STAGE_1_1_BACKEND_THREADS.md", `
     "docs\UPDATE_PROCEDURE.md", `
     "docs\USER_CHECKLIST.md" `
     -Destination "$dist\docs" `
@@ -91,23 +92,23 @@ Copy-Item -LiteralPath `
 Copy-Item -LiteralPath `
     "scripts\check_firewall_block.ps1", `
     "scripts\check_firewall_block.cmd", `
-    "scripts\check_voicehelper_security.ps1", `
-    "scripts\check_voicehelper_security.cmd", `
+    "scripts\check_dicta_security.ps1", `
+    "scripts\check_dicta_security.cmd", `
     "scripts\check_russian_spellcheck.ps1", `
     "scripts\check_russian_spellcheck.cmd", `
-    "scripts\diagnose_voicehelper.ps1", `
-    "scripts\diagnose_voicehelper.cmd", `
-    "scripts\generate_voicehelper_manifest.ps1", `
-    "scripts\verify_voicehelper_package.ps1", `
-    "scripts\verify_voicehelper_package.cmd", `
-    "scripts\benchmark_voicehelper_models.ps1", `
-    "scripts\benchmark_voicehelper_models.cmd", `
-    "scripts\compare_voicehelper_backends.ps1", `
-    "scripts\compare_voicehelper_backends.cmd", `
+    "scripts\diagnose_dicta.ps1", `
+    "scripts\diagnose_dicta.cmd", `
+    "scripts\generate_dicta_manifest.ps1", `
+    "scripts\verify_dicta_package.ps1", `
+    "scripts\verify_dicta_package.cmd", `
+    "scripts\benchmark_dicta_models.ps1", `
+    "scripts\benchmark_dicta_models.cmd", `
+    "scripts\compare_dicta_backends.ps1", `
+    "scripts\compare_dicta_backends.cmd", `
     "scripts\list_audio_devices.ps1", `
     "scripts\list_audio_devices.cmd", `
-    "scripts\audit_voicehelper_network.ps1", `
-    "scripts\audit_voicehelper_network.cmd" `
+    "scripts\audit_dicta_network.ps1", `
+    "scripts\audit_dicta_network.cmd" `
     -Destination "$dist\scripts" `
     -Force
 
@@ -118,18 +119,18 @@ try {
     $sourceCommit = ""
 }
 
-& ".\scripts\generate_voicehelper_manifest.ps1" `
+& ".\scripts\generate_dicta_manifest.ps1" `
     -Root $dist `
     -PackageVersion $PackageVersion `
     -SourceCommit $sourceCommit `
     -CodeOnly:$SkipModels
 
-& "$dist\scripts\verify_voicehelper_package.ps1" -Root $dist
+& "$dist\scripts\verify_dicta_package.ps1" -Root $dist
 
 if ($SkipModels) {
-    & "$dist\VoiceHelper.exe" --self-test --allow-missing-models
+    & "$dist\Dicta.exe" --self-test --allow-missing-models
 } else {
-    & "$dist\VoiceHelper.exe" --self-test
+    & "$dist\Dicta.exe" --self-test
 }
 
 Write-Host "Build ready: $((Resolve-Path $dist).Path)"

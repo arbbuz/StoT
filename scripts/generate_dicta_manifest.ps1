@@ -1,6 +1,6 @@
 param(
     [string]$Root = "",
-    [string]$PackageVersion = "1.0-pilot",
+    [string]$PackageVersion = "1.1-pilot",
     [string]$SourceCommit = "",
     [switch]$CodeOnly
 )
@@ -13,7 +13,7 @@ try {
 }
 
 if ([string]::IsNullOrWhiteSpace($Root)) {
-    $rootPath = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\dist\VoiceHelper")
+    $rootPath = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\dist\Dicta")
 } else {
     $rootPath = Resolve-Path -LiteralPath $Root
 }
@@ -35,7 +35,7 @@ function Convert-ToPackagePath {
 function Get-PackageCategory {
     param([string]$RelativePath)
 
-    if ($RelativePath -eq "VoiceHelper.exe") { return "application" }
+    if ($RelativePath -eq "Dicta.exe") { return "application" }
     if ($RelativePath -like "_internal/*") { return "runtime" }
     if ($RelativePath -like ".tools/*") { return "speech-backend" }
     if ($RelativePath -like "models/*.bin") { return "model" }
@@ -69,13 +69,13 @@ foreach ($file in $payloadFiles) {
 
 $manifest = [ordered]@{
     schemaVersion = 1
-    packageName = "VoiceHelper"
+    packageName = "Dicta"
     packageVersion = $PackageVersion
     packageKind = if ($CodeOnly) { "code-only" } else { "local-with-models" }
     generatedAtUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     sourceCommit = $SourceCommit
     modelPolicy = if ($CodeOnly) {
-        "Whisper model .bin files are intentionally excluded and must be copied manually into models next to VoiceHelper.exe."
+        "Whisper model .bin files are intentionally excluded and must be copied manually into models next to Dicta.exe."
     } else {
         "Whisper model .bin files are included from the local build machine."
     }

@@ -1,4 +1,4 @@
-# VoiceHelper 0.2.3: понятные ошибки
+# Dicta 0.2.3: понятные ошибки
 
 Дата: 2026-05-23
 Статус: реализовано в пилотной сборке
@@ -24,7 +24,7 @@
 - Улучшены сообщения для firewall-кнопок:
   - не найден целевой EXE;
   - не удалось запустить UAC/elevated CMD;
-  - где искать лог `%TEMP%\voicehelper_firewall.log`.
+  - где искать лог `%TEMP%\dicta_firewall.log`.
 
 ## Что должен видеть пользователь
 
@@ -39,13 +39,13 @@
 Если ошибка повторяется, пользователь запускает:
 
 ```text
-scripts\diagnose_voicehelper.cmd
+scripts\diagnose_dicta.cmd
 ```
 
 Отчет сохраняется в:
 
 ```text
-diagnostics\voicehelper_diagnostic_YYYYMMDD_HHMMSS.txt
+diagnostics\dicta_diagnostic_YYYYMMDD_HHMMSS.txt
 ```
 
 Этот отчет прикладывается к обращению вместо скриншотов всех окон.

@@ -1,4 +1,4 @@
-# VoiceHelper
+# Dicta
 
 Локальный прототип для диктовки в текст без облачных сервисов.
 
@@ -6,20 +6,20 @@
 
 ```powershell
 python -m pip install -r requirements.txt
-python voicehelper.py
+python dicta.py
 ```
 
 После упаковки в exe:
 
 ```powershell
-.\dist\VoiceHelper\VoiceHelper.exe
+.\dist\Dicta\Dicta.exe
 ```
 
 Повторная сборка exe:
 
 ```powershell
-.\scripts\prepare_voicehelper_assets.ps1
-.\scripts\build_voicehelper_exe.ps1
+.\scripts\prepare_dicta_assets.ps1
+.\scripts\build_dicta_exe.ps1
 ```
 
 ## GitHub Actions
@@ -31,11 +31,11 @@ Workflow:
 - скачивает pinned `whisper.cpp` Windows x64 release для optional AVX2 backend;
 - собирает scalar compat backend `whisper.cpp` из исходников без AVX/AVX2/FMA/F16C/SSE4.2/BMI2;
 - не скачивает и не упаковывает модели `tiny/base/small q5_1`;
-- собирает `VoiceHelper.exe` через PyInstaller;
-- упаковывает `dist/VoiceHelper` в ZIP;
+- собирает `Dicta.exe` через PyInstaller;
+- упаковывает `dist/Dicta` в ZIP;
 - публикует ZIP в GitHub Actions artifacts.
 
-GitHub artifact является code-only пакетом. Перед использованием распознавания нужно вручную скопировать модели в папку `models` рядом с `VoiceHelper.exe`:
+GitHub artifact является code-only пакетом. Перед использованием распознавания нужно вручную скопировать модели в папку `models` рядом с `Dicta.exe`:
 
 ```text
 models\ggml-tiny-q5_1.bin
@@ -43,7 +43,7 @@ models\ggml-base-q5_1.bin
 models\ggml-small-q5_1.bin
 ```
 
-В поставке 1.0 дополнительно создаются:
+В поставке 1.1 дополнительно создаются:
 
 ```text
 manifest.json
@@ -53,7 +53,7 @@ SHA256SUMS.txt
 Проверка целостности code-only пакета:
 
 ```powershell
-.\scripts\verify_voicehelper_package.ps1 -Root ".\dist\VoiceHelper"
+.\scripts\verify_dicta_package.ps1 -Root ".\dist\Dicta"
 ```
 
 ## Что делает текущий MVP
@@ -68,7 +68,7 @@ SHA256SUMS.txt
 - позволяет выбрать модель: `tiny-q5_1`, `base-q5_1`, `small-q5_1`;
 - позволяет выбрать профиль скорости: `Авто`, `Быстро`, `Баланс`, `Точно`;
 - позволяет выбрать backend: `Авто`, `Vulkan`, `CUDA`, `OpenVINO`, `AVX2`, `Compat`;
-- может запустить локальный backend-бенчмарк и автоматически выбрать самый быстрый доступный `whisper.cpp` backend;
+- может запустить локальный backend-бенчмарк и автоматически выбрать самую быструю пару `whisper.cpp` backend + `-t`;
 - может запустить локальный бенчмарк моделей и автоматически выбрать модель для профиля `Авто`;
 - показывает таймер записи и время распознавания;
 - держит верхнюю панель компактной: запись/стоп, копирование, автоформат, очистка, уровень микрофона и кнопка "Настройки";
@@ -100,55 +100,55 @@ SHA256SUMS.txt
 
 ## Firewall
 
-В exe-версии в "Настройки" -> "Безопасность" есть кнопки "Блокировать сеть" и "Разблокировать". Они создают или удаляют правило Windows Firewall для текущего `VoiceHelper.exe` через `netsh advfirewall` и вызывают стандартный UAC-запрос Windows. Результат пишется в `%TEMP%\voicehelper_firewall.log`.
+В exe-версии в "Настройки" -> "Безопасность" есть кнопки "Блокировать сеть" и "Разблокировать". Они создают или удаляют правило Windows Firewall для текущего `Dicta.exe` через `netsh advfirewall` и вызывают стандартный UAC-запрос Windows. Результат пишется в `%TEMP%\dicta_firewall.log`.
 
 Скрипт для ручного создания firewall-правила:
 
 ```powershell
-.\scripts\add_voicehelper_firewall_block.ps1
+.\scripts\add_dicta_firewall_block.ps1
 ```
 
-На этапе Python-прототипа это правило блокирует сеть для `python.exe`. Для будущей собранной версии лучше передавать путь к `VoiceHelper.exe`.
+На этапе Python-прототипа это правило блокирует сеть для `python.exe`. Для будущей собранной версии лучше передавать путь к `Dicta.exe`.
 
 ## ИБ-проверка пилота
 
 ```powershell
-.\scripts\check_voicehelper_security.ps1
+.\scripts\check_dicta_security.ps1
 ```
 
-Скрипт проверяет наличие локального движка, моделей, firewall-правил VoiceHelper и временных WAV/TXT-файлов в `%TEMP%`.
+Скрипт проверяет наличие локального движка, моделей, firewall-правил Dicta и временных WAV/TXT-файлов в `%TEMP%`.
 
 Для проверки exe-сборки:
 
 ```powershell
-.\scripts\check_voicehelper_security.ps1 -Root ".\dist\VoiceHelper"
+.\scripts\check_dicta_security.ps1 -Root ".\dist\Dicta"
 ```
 
 Для проверки manifest и SHA256:
 
 ```powershell
-.\scripts\verify_voicehelper_package.ps1 -Root ".\dist\VoiceHelper"
+.\scripts\verify_dicta_package.ps1 -Root ".\dist\Dicta"
 ```
 
 Для наблюдения сетевой активности запущенного приложения:
 
 ```powershell
-.\scripts\audit_voicehelper_network.ps1 -ProgramPath ".\dist\VoiceHelper\VoiceHelper.exe" -Seconds 30
+.\scripts\audit_dicta_network.ps1 -ProgramPath ".\dist\Dicta\Dicta.exe" -Seconds 30
 ```
 
 Для локального бенчмарка моделей:
 
 ```powershell
-.\scripts\benchmark_voicehelper_models.ps1
+.\scripts\benchmark_dicta_models.ps1
 ```
 
 Для сравнения backend на текущем ПК:
 
 ```powershell
-.\scripts\compare_voicehelper_backends.ps1
+.\scripts\compare_dicta_backends.ps1
 ```
 
-GPU backend и `faster-whisper` являются optional. Если рядом с приложением нет Vulkan/CUDA/OpenVINO-сборок `whisper-cli.exe`, VoiceHelper продолжит работать через AVX2 или Compat. `faster-whisper` не входит в обязательные зависимости и проверяется только при ручной подготовке локальной CTranslate2-модели.
+GPU backend и `faster-whisper` являются optional. Если рядом с приложением нет Vulkan/CUDA/OpenVINO-сборок `whisper-cli.exe`, Dicta продолжит работать через AVX2 или Compat. `faster-whisper` не входит в обязательные зависимости и проверяется только при ручной подготовке локальной CTranslate2-модели.
 
 ## Удобство диктовки
 
@@ -159,7 +159,7 @@ GPU backend и `faster-whisper` являются optional. Если рядом �
 - Кнопка "Автоформат" на основной панели применяет эти правила к тексту, который уже находится в окне; повторное нажатие возвращает прежний вариант.
 - Правый клик в поле текста открывает меню вырезания, копирования, вставки и выделения всего текста; если кликнуть по подчеркнутому слову, сверху появляются варианты орфографического исправления.
 
-Состояние галочек хранится в `%LOCALAPPDATA%\VoiceHelper\settings.json`. В этом файле нет аудио, распознанного текста или истории диктовок.
+Состояние галочек хранится в `%LOCALAPPDATA%\Dicta\settings.json`. В этом файле нет аудио, распознанного текста или истории диктовок.
 
 ## Документы пилота
 
@@ -167,3 +167,4 @@ GPU backend и `faster-whisper` являются optional. Если рядом �
 - `docs\IB_PACKAGE_DESCRIPTION.md` - состав поставки и пояснения для ИБ.
 - `docs\UPDATE_PROCEDURE.md` - процедура обновления и отката.
 - `docs\STAGE_1_0_CORPORATE_PILOT.md` - изменения версии 1.0.
+- `docs\STAGE_1_1_BACKEND_THREADS.md` - изменения версии 1.1.

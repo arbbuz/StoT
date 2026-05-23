@@ -1,28 +1,28 @@
-# VoiceHelper 0.2.2: единая диагностика
+# Dicta 0.2.2: единая диагностика
 
 Дата: 2026-05-23
 Статус: реализовано в пилотной сборке
 
 ## Что добавлено
 
-- Единый запуск диагностики: `scripts\diagnose_voicehelper.cmd`.
-- PowerShell-версия для администратора/ИБ: `scripts\diagnose_voicehelper.ps1`.
+- Единый запуск диагностики: `scripts\diagnose_dicta.cmd`.
+- PowerShell-версия для администратора/ИБ: `scripts\diagnose_dicta.ps1`.
 - Автоматическое сохранение отчета в папку `diagnostics`.
-- Проверка состава поставки: `VoiceHelper.exe`, `whisper-cli.exe`, модели, документация, иконка.
+- Проверка состава поставки: `Dicta.exe`, `whisper-cli.exe`, модели, документация, иконка.
 - Расчет SHA256 для ключевых исполняемых файлов и моделей.
-- Запуск встроенного `VoiceHelper.exe --self-test`.
-- Вывод аудиоустройств, которые видит VoiceHelper.
+- Запуск встроенного `Dicta.exe --self-test`.
+- Вывод аудиоустройств, которые видит Dicta.
 - Проверка русского Windows Spell Checking API.
 - Проверка базовой ИБ-комплектации и временных WAV/TXT-хвостов.
-- Проверка firewall-правила для конкретного `VoiceHelper.exe`.
-- Короткий сетевой аудит TCP-подключений процесса VoiceHelper.
+- Проверка firewall-правила для конкретного `Dicta.exe`.
+- Короткий сетевой аудит TCP-подключений процесса Dicta.
 
 ## Как запускать
 
 Для пользователя или администратора:
 
 ```text
-scripts\diagnose_voicehelper.cmd
+scripts\diagnose_dicta.cmd
 ```
 
 Окно PowerShell не закрывается до нажатия клавиши.
@@ -30,13 +30,13 @@ scripts\diagnose_voicehelper.cmd
 Для ИБ из PowerShell:
 
 ```powershell
-.\scripts\diagnose_voicehelper.ps1 -Root "." -NetworkSeconds 10
+.\scripts\diagnose_dicta.ps1 -Root "." -NetworkSeconds 10
 ```
 
 Если сетевой аудит не нужен:
 
 ```powershell
-.\scripts\diagnose_voicehelper.ps1 -Root "." -SkipNetworkAudit
+.\scripts\diagnose_dicta.ps1 -Root "." -SkipNetworkAudit
 ```
 
 ## Где лежит результат
@@ -44,7 +44,7 @@ scripts\diagnose_voicehelper.cmd
 Отчет сохраняется в папку:
 
 ```text
-diagnostics\voicehelper_diagnostic_YYYYMMDD_HHMMSS.txt
+diagnostics\dicta_diagnostic_YYYYMMDD_HHMMSS.txt
 ```
 
 Этот файл можно передать разработчику или ИБ без скриншотов окна.
@@ -59,6 +59,6 @@ diagnostics\voicehelper_diagnostic_YYYYMMDD_HHMMSS.txt
 
 ## Важные уточнения для ИБ
 
-Диагностика не отправляет данные в интернет. Она читает локальные файлы, параметры Windows, список аудиоустройств, состояние firewall-правила и локальные TCP-подключения процесса VoiceHelper.
+Диагностика не отправляет данные в интернет. Она читает локальные файлы, параметры Windows, список аудиоустройств, состояние firewall-правила и локальные TCP-подключения процесса Dicta.
 
-Сетевой аудит не инициирует сетевые соединения VoiceHelper. Он только наблюдает через Windows `Get-NetTCPConnection`, есть ли TCP-подключения у уже запущенного процесса.
+Сетевой аудит не инициирует сетевые соединения Dicta. Он только наблюдает через Windows `Get-NetTCPConnection`, есть ли TCP-подключения у уже запущенного процесса.

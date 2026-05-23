@@ -1,11 +1,11 @@
-# VoiceHelper: чек-лист использования
+# Dicta: чек-лист использования
 
 ## Первый запуск
 
-1. Распаковать архив целиком в отдельную папку `VoiceHelper`.
-2. Запустить проверку целостности поставки: `scripts\verify_voicehelper_package.cmd`.
-3. Если это GitHub Actions code-only artifact, вручную скопировать модели в папку `models` рядом с `VoiceHelper.exe`.
-4. Запускать именно `VoiceHelper.exe` из этой папки.
+1. Распаковать архив целиком в отдельную папку `Dicta`.
+2. Запустить проверку целостности поставки: `scripts\verify_dicta_package.cmd`.
+3. Если это GitHub Actions code-only artifact, вручную скопировать модели в папку `models` рядом с `Dicta.exe`.
+4. Запускать именно `Dicta.exe` из этой папки.
 5. Не переносить один EXE отдельно от папок `_internal`, `models`, `.tools`, `assets`, `docs`, `scripts`, `manifest.json`, `SHA256SUMS.txt`.
 6. При первом запуске разрешить Windows доступ к микрофону, если появится системный запрос.
 7. При необходимости открыть "Настройки" -> "Производительность" и выбрать модель:
@@ -21,42 +21,42 @@
 
 ## Бенчмарк скорости
 
-1. Открыть `VoiceHelper.exe`.
+1. Открыть `Dicta.exe`.
 2. Открыть "Настройки" -> "Производительность".
 3. Нажать "Бенчмарк моделей".
 4. Дождаться завершения проверки моделей.
-5. Оставить профиль "Авто", если нужно, чтобы VoiceHelper сам выбрал модель.
+5. Оставить профиль "Авто", если нужно, чтобы Dicta сам выбрал модель.
 
 Бенчмарк можно запустить двойным кликом:
 
 ```text
-scripts\benchmark_voicehelper_models.cmd
+scripts\benchmark_dicta_models.cmd
 ```
 
-Результат хранится в `%LOCALAPPDATA%\VoiceHelper\performance_profile.json`. В этом файле нет аудио, текста диктовок или истории распознаваний.
+Результат хранится в `%LOCALAPPDATA%\Dicta\performance_profile.json`. В этом файле нет аудио, текста диктовок или истории распознаваний.
 
 ## Бенчмарк backend
 
-1. Открыть `VoiceHelper.exe`.
+1. Открыть `Dicta.exe`.
 2. Открыть "Настройки" -> "Производительность".
 3. Оставить backend "Авто" или выбрать конкретный backend для проверки.
 4. Нажать "Backend тест".
 5. Дождаться завершения проверки.
-6. Оставить backend "Авто", если нужно, чтобы VoiceHelper сам использовал самый быстрый доступный backend.
+6. Оставить backend "Авто", если нужно, чтобы Dicta сам использовал самую быструю пару backend + `-t`.
 
 Сравнение можно запустить двойным кликом:
 
 ```text
-scripts\compare_voicehelper_backends.cmd
+scripts\compare_dicta_backends.cmd
 ```
 
-Результат хранится в `%LOCALAPPDATA%\VoiceHelper\backend_profile.json`. В этом файле нет аудио, текста диктовок или истории распознаваний.
+Результат хранится в `%LOCALAPPDATA%\Dicta\backend_profile.json`. В этом файле нет аудио, текста диктовок или истории распознаваний; хранятся только времена backend/thread-кандидатов и выбранная пара.
 
-Vulkan, CUDA, OpenVINO и `faster-whisper` являются optional. Если они не подготовлены вручную, VoiceHelper продолжит работать через AVX2 или Compat.
+Vulkan, CUDA, OpenVINO и `faster-whisper` являются optional. Если они не подготовлены вручную, Dicta продолжит работать через AVX2 или Compat.
 
 ## Блокировка сети
 
-1. Открыть `VoiceHelper.exe`.
+1. Открыть `Dicta.exe`.
 2. Открыть "Настройки" -> "Безопасность".
 3. Нажать "Блокировать сеть".
 4. Подтвердить UAC-запрос Windows от имени администратора.
@@ -67,7 +67,7 @@ Vulkan, CUDA, OpenVINO и `faster-whisper` являются optional. Если �
 scripts\check_firewall_block.cmd
 ```
 
-Или открыть PowerShell в папке `VoiceHelper` и выполнить:
+Или открыть PowerShell в папке `Dicta` и выполнить:
 
 ```powershell
 .\scripts\check_firewall_block.ps1
@@ -76,10 +76,10 @@ scripts\check_firewall_block.cmd
 Ожидаемый результат:
 
 ```text
-[OK] Outbound firewall block is enabled for this exact VoiceHelper.exe.
+[OK] Outbound firewall block is enabled for this exact Dicta.exe.
 ```
 
-Если папку `VoiceHelper` перенесли, переименовали или скопировали в другое место, нажать "Блокировать сеть" заново уже из нового расположения.
+Если папку `Dicta` перенесли, переименовали или скопировали в другое место, нажать "Блокировать сеть" заново уже из нового расположения.
 
 ## Обычное использование
 
@@ -101,11 +101,11 @@ scripts\check_firewall_block.cmd
 
 - `Ctrl+Shift+Space` работает как "Записать/Стоп".
 - "Автокопия" находится в "Настройки" -> "Текст" и по умолчанию выключена; если включить, распознанный текст сразу попадает в буфер обмена.
-- "Форматировать" по умолчанию включено: VoiceHelper убирает двойные пробелы, нормализует переносы строк, делает первую букву заглавной и ставит точку в конце.
+- "Форматировать" по умолчанию включено: Dicta убирает двойные пробелы, нормализует переносы строк, делает первую букву заглавной и ставит точку в конце.
 - "Команды пунктуации" по умолчанию включены: слова "точка", "запятая", "новый абзац" заменяются на знаки препинания и перенос абзаца.
 - "Автоформат" на основной панели применяет эти правила к тексту, который уже находится в окне; повторное нажатие возвращает прежний вариант.
 
-Настройки этих галочек хранятся в `%LOCALAPPDATA%\VoiceHelper\settings.json`. В этом файле нет аудио, распознанного текста или истории диктовок.
+Настройки этих галочек хранятся в `%LOCALAPPDATA%\Dicta\settings.json`. В этом файле нет аудио, распознанного текста или истории диктовок.
 
 ## Проверка орфографии
 
@@ -128,15 +128,15 @@ scripts\check_russian_spellcheck.cmd
 Ожидаемый результат:
 
 ```text
-[OK] Russian Windows spellchecker is available for VoiceHelper.
+[OK] Russian Windows spellchecker is available for Dicta.
 ```
 
 ## Проверка после работы
 
-Из папки `VoiceHelper` можно выполнить:
+Из папки `Dicta` можно выполнить:
 
 ```text
-scripts\diagnose_voicehelper.cmd
+scripts\diagnose_dicta.cmd
 ```
 
 Это единая диагностика. Она проверяет состав поставки, микрофоны, орфографию, firewall, временные файлы и сохраняет отчет в папку `diagnostics`.
@@ -144,13 +144,13 @@ scripts\diagnose_voicehelper.cmd
 Отдельная базовая ИБ-проверка:
 
 ```text
-scripts\check_voicehelper_security.cmd
+scripts\check_dicta_security.cmd
 ```
 
 Или через PowerShell:
 
 ```powershell
-.\scripts\check_voicehelper_security.ps1 -Root "."
+.\scripts\check_dicta_security.ps1 -Root "."
 ```
 
 Скрипт проверит:
@@ -158,18 +158,18 @@ scripts\check_voicehelper_security.cmd
 - наличие `whisper-cli.exe`;
 - наличие локальных моделей;
 - наличие firewall-правила;
-- отсутствие временных файлов `voicehelper_*.wav` и `voicehelper_*_out.txt` в `%TEMP%`.
+- отсутствие временных файлов `dicta_*.wav` и `dicta_*_out.txt` в `%TEMP%`.
 
 Для наблюдения TCP-подключений во время запущенного приложения:
 
 ```text
-scripts\audit_voicehelper_network.cmd
+scripts\audit_dicta_network.cmd
 ```
 
 Или через PowerShell:
 
 ```powershell
-.\scripts\audit_voicehelper_network.ps1 -ProgramPath ".\VoiceHelper.exe" -Seconds 30
+.\scripts\audit_dicta_network.ps1 -ProgramPath ".\Dicta.exe" -Seconds 30
 ```
 
 ## Как понять, что все в порядке
@@ -180,9 +180,9 @@ scripts\audit_voicehelper_network.cmd
 - `Ctrl+Shift+Space` и главная кнопка `Записать`/`Стоп` запускают и останавливают запись.
 - Подчеркнутые слова исправляются через правый клик.
 - После нажатия "Скопировать" текст вставляется через `Ctrl+V`.
-- `check_voicehelper_security.ps1` не показывает временных WAV/TXT хвостов.
+- `check_dicta_security.ps1` не показывает временных WAV/TXT хвостов.
 - При профиле "Авто" после бенчмарка выбрана подходящая модель.
-- При backend "Авто" после "Backend тест" выбран подходящий backend.
+- При backend "Авто" после "Backend тест" выбрана подходящая пара backend + `-t`.
 
 ## Что делать при проблемах
 
@@ -192,7 +192,7 @@ scripts\audit_voicehelper_network.cmd
 2. Проверить лог:
 
 ```powershell
-notepad $env:TEMP\voicehelper_firewall.log
+notepad $env:TEMP\dicta_firewall.log
 ```
 
 3. Запустить проверку:
@@ -209,30 +209,30 @@ scripts\check_firewall_block.cmd
 
 Если распознавание не запускается:
 
-1. Проверить, что папки `models` и `.tools` лежат рядом с `VoiceHelper.exe`.
+1. Проверить, что папки `models` и `.tools` лежат рядом с `Dicta.exe`.
 2. Проверить, что нужный микрофон выбран в "Настройки" -> "Запись".
 3. Если микрофон подключили после запуска приложения, нажать "Обновить".
 4. Нажать "Проверить" и говорить 3 секунды.
-5. В списке "Микрофон" показываются не технические драйверы, а сгруппированные устройства записи. VoiceHelper сам пробует доступные варианты Windows audio backend для выбранного микрофона.
+5. В списке "Микрофон" показываются не технические драйверы, а сгруппированные устройства записи. Dicta сам пробует доступные варианты Windows audio backend для выбранного микрофона.
 6. Если ошибка остается, запустить:
 
 ```text
 scripts\list_audio_devices.cmd
 ```
 
-Этот скрипт показывает, какие устройства записи видит VoiceHelper на данном ПК.
+Этот скрипт показывает, какие устройства записи видит Dicta на данном ПК.
 
 7. Запустить общую проверку:
 
 ```powershell
-.\scripts\check_voicehelper_security.ps1 -Root "."
+.\scripts\check_dicta_security.ps1 -Root "."
 ```
 
-Если появилось окно ошибки VoiceHelper:
+Если появилось окно ошибки Dicta:
 
 1. Прочитать первый абзац - это короткая причина.
 2. Выполнить пункты из блока "Что сделать".
-3. Если не помогло, запустить `scripts\diagnose_voicehelper.cmd`.
+3. Если не помогло, запустить `scripts\diagnose_dicta.cmd`.
 4. Передать файл из папки `diagnostics` администратору или разработчику.
 
 Если иконка в Проводнике выглядит старой:

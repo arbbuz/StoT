@@ -84,7 +84,13 @@ VAD_MIN_RMS = 80.0
 VAD_MIN_PEAK = 350
 VAD_NOISE_MULTIPLIER = 3.0
 BENCHMARK_AUDIO_SECONDS = 2.0
-FIREWALL_RULE_NAME = "VoiceHelper Block Outbound"
+DEFAULT_WHISPER_THREADS = 4
+GPU_BACKEND_KEYS = {"vulkan", "cuda", "openvino"}
+BACKEND_BENCHMARK_THREAD_COUNTS = {
+    "gpu": (1, 2, 4, 6, 8),
+    "cpu": (2, 4, 6, 8, 12),
+}
+FIREWALL_RULE_NAME = "Dicta Block Outbound"
 HOTKEY_LABEL = "Ctrl+Shift+Space"
 HOTKEY_ID = 1
 HOTKEY_MODIFIERS = 0x0002 | 0x0004
@@ -103,7 +109,7 @@ DEFAULT_USER_SETTINGS = {
 def performance_profile_path() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        return Path(local_app_data) / "VoiceHelper" / "performance_profile.json"
+        return Path(local_app_data) / "Dicta" / "performance_profile.json"
     return APP_DIR / "performance_profile.json"
 
 
@@ -113,7 +119,7 @@ PERFORMANCE_PROFILE_PATH = performance_profile_path()
 def backend_profile_path() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        return Path(local_app_data) / "VoiceHelper" / "backend_profile.json"
+        return Path(local_app_data) / "Dicta" / "backend_profile.json"
     return APP_DIR / "backend_profile.json"
 
 
@@ -123,7 +129,7 @@ BACKEND_PROFILE_PATH = backend_profile_path()
 def user_settings_path() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        return Path(local_app_data) / "VoiceHelper" / "settings.json"
+        return Path(local_app_data) / "Dicta" / "settings.json"
     return APP_DIR / "settings.json"
 
 
@@ -147,6 +153,79 @@ def load_backend_profile() -> dict:
 def save_backend_profile(data: dict) -> None:
     BACKEND_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     BACKEND_PROFILE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def parse_positive_int(value: object) -> int | None:
+    try:
+        number = int(value)
+    except Exception:
+        return None
+    if number < 1:
+        return None
+    return min(number, 64)
+
+
+def sanitize_whisper_threads(value: object | None, default: int = DEFAULT_WHISPER_THREADS) -> int:
+    return parse_positive_int(value) or default
+
+
+def backend_thread_candidates(backend_name: str) -> list[int]:
+    cpu_count = max(1, os.cpu_count() or DEFAULT_WHISPER_THREADS)
+    profile = "gpu" if backend_name in GPU_BACKEND_KEYS else "cpu"
+    configured = BACKEND_BENCHMARK_THREAD_COUNTS[profile]
+    candidates = [threads for threads in configured if threads <= cpu_count]
+    if not candidates:
+        candidates = [1]
+    return sorted(set(candidates))
+
+
+def choose_backend_threads_from_results(backend_name: str, results: dict | None = None) -> int:
+    item = results.get(backend_name) if isinstance(results, dict) else None
+    if not isinstance(item, dict):
+        return DEFAULT_WHISPER_THREADS
+
+    selected_threads = parse_positive_int(item.get("selected_threads"))
+    if selected_threads:
+        return selected_threads
+
+    legacy_threads = parse_positive_int(item.get("threads"))
+    if legacy_threads:
+        return legacy_threads
+
+    thread_results = item.get("thread_results")
+    if not isinstance(thread_results, dict):
+        return DEFAULT_WHISPER_THREADS
+
+    best_threads: int | None = None
+    best_elapsed: float | None = None
+    for thread_key, thread_item in thread_results.items():
+        if not isinstance(thread_item, dict) or not thread_item.get("ok"):
+            continue
+        try:
+            elapsed = float(thread_item["elapsed_seconds"])
+        except Exception:
+            continue
+        threads = parse_positive_int(thread_item.get("threads")) or parse_positive_int(thread_key)
+        if threads is None:
+            continue
+        if best_elapsed is None or elapsed < best_elapsed:
+            best_threads = threads
+            best_elapsed = elapsed
+
+    return best_threads or DEFAULT_WHISPER_THREADS
+
+
+def choose_backend_threads(backend_name: str, profile: dict | None = None) -> int:
+    if profile is None:
+        profile = load_backend_profile()
+
+    if isinstance(profile, dict) and profile.get("selected_backend") == backend_name:
+        selected_threads = parse_positive_int(profile.get("selected_threads"))
+        if selected_threads:
+            return selected_threads
+
+    results = profile.get("results", {}) if isinstance(profile, dict) else {}
+    return choose_backend_threads_from_results(backend_name, results)
 
 
 def choose_auto_backend_key(results: dict | None = None) -> str:
@@ -201,7 +280,14 @@ def available_whisper_backends(preferred_backend_key: str | None = None) -> list
     return ordered
 
 
-def build_whisper_command(exe_path: Path, model_path: Path, wav_path: Path, out_base: Path) -> list[str]:
+def build_whisper_command(
+    exe_path: Path,
+    model_path: Path,
+    wav_path: Path,
+    out_base: Path,
+    threads: int = DEFAULT_WHISPER_THREADS,
+) -> list[str]:
+    threads = sanitize_whisper_threads(threads)
     return [
         str(exe_path),
         "-m",
@@ -211,7 +297,7 @@ def build_whisper_command(exe_path: Path, model_path: Path, wav_path: Path, out_
         "-l",
         "ru",
         "-t",
-        "4",
+        str(threads),
         "-nt",
         "-np",
         "-nf",
@@ -232,8 +318,10 @@ def run_whisper_backend(
     wav_path: Path,
     out_base: Path,
     timeout_seconds: int | None = None,
+    threads: int = DEFAULT_WHISPER_THREADS,
 ) -> subprocess.CompletedProcess[bytes]:
-    command = build_whisper_command(exe_path, model_path, wav_path, out_base)
+    threads = sanitize_whisper_threads(threads)
+    command = build_whisper_command(exe_path, model_path, wav_path, out_base, threads=threads)
     try:
         completed = subprocess.run(
             command,
@@ -245,9 +333,9 @@ def run_whisper_backend(
             check=False,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{backend_name}: timeout after {timeout_seconds} seconds")
+        raise RuntimeError(f"{backend_name} t={threads}: timeout after {timeout_seconds} seconds")
     except Exception as exc:
-        raise RuntimeError(f"{backend_name}: {exc}")
+        raise RuntimeError(f"{backend_name} t={threads}: {exc}")
 
     txt_path = out_base.with_suffix(".txt")
     if completed.returncode == 0 and txt_path.exists():
@@ -261,7 +349,7 @@ def run_whisper_backend(
     if completed.returncode in (3221225501, -1073741795):
         DISABLED_WHISPER_BACKENDS.add(backend_name)
         detail = f"{detail}; backend disabled for this session after illegal instruction exit"
-    raise RuntimeError(f"{backend_name}: exit {completed.returncode}; {detail}")
+    raise RuntimeError(f"{backend_name} t={threads}: exit {completed.returncode}; {detail}")
 
 
 def run_whisper_with_fallback(
@@ -270,12 +358,13 @@ def run_whisper_with_fallback(
     out_base: Path,
     timeout_seconds: int | None = None,
     preferred_backend_key: str | None = None,
-) -> tuple[str, subprocess.CompletedProcess[bytes]]:
+) -> tuple[str, int, subprocess.CompletedProcess[bytes]]:
     backends = available_whisper_backends(preferred_backend_key)
     if not backends:
         expected = "\n".join(str(path) for path in WHISPER_BACKENDS.values())
         raise RuntimeError(f"missing-whisper-cli::{expected}")
 
+    backend_profile = load_backend_profile()
     txt_path = out_base.with_suffix(".txt")
     errors: list[str] = []
     if preferred_backend_key and preferred_backend_key != "auto" and not is_whisper_backend_available(preferred_backend_key):
@@ -286,9 +375,18 @@ def run_whisper_with_fallback(
         if txt_path.exists():
             txt_path.unlink()
 
+        threads = choose_backend_threads(backend_name, backend_profile)
         try:
-            completed = run_whisper_backend(backend_name, exe_path, model_path, wav_path, out_base, timeout_seconds)
-            return backend_name, completed
+            completed = run_whisper_backend(
+                backend_name,
+                exe_path,
+                model_path,
+                wav_path,
+                out_base,
+                timeout_seconds,
+                threads=threads,
+            )
+            return backend_name, threads, completed
         except RuntimeError as exc:
             errors.append(str(exc))
             continue
@@ -471,7 +569,7 @@ def write_benchmark_wav(wav_path: Path, seconds: float = BENCHMARK_AUDIO_SECONDS
 
 
 def faster_whisper_model_path(model_key: str) -> Path:
-    configured = os.environ.get("VOICEHELPER_FASTER_WHISPER_MODEL")
+    configured = os.environ.get("DICTA_FASTER_WHISPER_MODEL")
     if configured:
         return Path(configured)
     return APP_DIR / ".tools" / "faster-whisper-models" / model_key
@@ -495,8 +593,8 @@ def run_faster_whisper_benchmark(wav_path: Path, model_key: str) -> dict:
             "error": f"faster-whisper is not installed: {exc}",
         }
 
-    device = os.environ.get("VOICEHELPER_FASTER_WHISPER_DEVICE", "cpu")
-    compute_type = os.environ.get("VOICEHELPER_FASTER_WHISPER_COMPUTE_TYPE", "int8")
+    device = os.environ.get("DICTA_FASTER_WHISPER_DEVICE", "cpu")
+    compute_type = os.environ.get("DICTA_FASTER_WHISPER_COMPUTE_TYPE", "int8")
 
     try:
         started_at = time.perf_counter()
@@ -528,7 +626,7 @@ def run_faster_whisper_benchmark(wav_path: Path, model_key: str) -> dict:
 def run_model_benchmark(allow_missing_models: bool = False, print_fn=None, preferred_backend_key: str | None = None) -> dict:
     results: dict[str, dict] = {}
 
-    with tempfile.TemporaryDirectory(prefix="voicehelper_benchmark_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="dicta_benchmark_") as tmp_dir:
         tmp_path = Path(tmp_dir)
         wav_path = tmp_path / "benchmark.wav"
         write_benchmark_wav(wav_path)
@@ -543,9 +641,11 @@ def run_model_benchmark(allow_missing_models: bool = False, print_fn=None, prefe
                 continue
 
             out_base = tmp_path / f"benchmark_{model_key}"
+            if print_fn:
+                print_fn(f"{model_key}: проверка...")
             started_at = time.perf_counter()
             try:
-                backend_name, _completed = run_whisper_with_fallback(
+                backend_name, backend_threads, _completed = run_whisper_with_fallback(
                     model_path,
                     wav_path,
                     out_base,
@@ -557,11 +657,15 @@ def run_model_benchmark(allow_missing_models: bool = False, print_fn=None, prefe
                 results[model_key] = {
                     "ok": True,
                     "backend": backend_name,
+                    "threads": backend_threads,
                     "elapsed_seconds": round(elapsed, 3),
                     "realtime_factor": round(rtf, 3),
                 }
                 if print_fn:
-                    print_fn(f"{model_key}: {elapsed:.2f}s, realtime x{rtf:.2f}, backend={backend_name}")
+                    print_fn(
+                        f"{model_key}: {elapsed:.2f}s, realtime x{rtf:.2f}, "
+                        f"backend={backend_name}, t={backend_threads}"
+                    )
             except Exception as exc:
                 results[model_key] = {"ok": False, "error": str(exc)}
                 if print_fn:
@@ -590,7 +694,7 @@ def run_backend_benchmark(
     model_path = MODEL_FILES.get(model_key, MODEL_FILES[FALLBACK_AUTO_MODEL_KEY])
     results: dict[str, dict] = {}
 
-    with tempfile.TemporaryDirectory(prefix="voicehelper_backend_benchmark_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="dicta_backend_benchmark_") as tmp_dir:
         tmp_path = Path(tmp_dir)
         wav_path = tmp_path / "benchmark.wav"
         write_benchmark_wav(wav_path)
@@ -603,12 +707,14 @@ def run_backend_benchmark(
                 print_fn(error)
             if not allow_missing_models:
                 selected_backend = choose_auto_backend_key(results)
+                selected_threads = choose_backend_threads_from_results(selected_backend, results)
                 profile = {
-                    "version": 1,
+                    "version": 2,
                     "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
                     "audio_seconds": BENCHMARK_AUDIO_SECONDS,
                     "model": model_key,
                     "selected_backend": selected_backend,
+                    "selected_threads": selected_threads,
                     "results": results,
                 }
                 return profile
@@ -624,32 +730,78 @@ def run_backend_benchmark(
                         print_fn(f"{backend_name}: missing backend")
                     continue
 
-                out_base = tmp_path / f"backend_{backend_name}"
-                txt_path = out_base.with_suffix(".txt")
-                if txt_path.exists():
-                    txt_path.unlink()
+                thread_results: dict[str, dict] = {}
+                for threads in backend_thread_candidates(backend_name):
+                    out_base = tmp_path / f"backend_{backend_name}_t{threads}"
+                    txt_path = out_base.with_suffix(".txt")
+                    if txt_path.exists():
+                        txt_path.unlink()
 
-                started_at = time.perf_counter()
-                try:
-                    run_whisper_backend(backend_name, exe_path, model_path, wav_path, out_base, timeout_seconds=300)
-                    elapsed = time.perf_counter() - started_at
-                    rtf = elapsed / BENCHMARK_AUDIO_SECONDS
+                    if print_fn:
+                        print_fn(f"{backend_name} t={threads}: проверка...")
+                    started_at = time.perf_counter()
+                    try:
+                        run_whisper_backend(
+                            backend_name,
+                            exe_path,
+                            model_path,
+                            wav_path,
+                            out_base,
+                            timeout_seconds=300,
+                            threads=threads,
+                        )
+                        elapsed = time.perf_counter() - started_at
+                        rtf = elapsed / BENCHMARK_AUDIO_SECONDS
+                        thread_results[str(threads)] = {
+                            "ok": True,
+                            "threads": threads,
+                            "elapsed_seconds": round(elapsed, 3),
+                            "realtime_factor": round(rtf, 3),
+                        }
+                        if print_fn:
+                            print_fn(f"{backend_name} t={threads}: {elapsed:.2f}s, realtime x{rtf:.2f}")
+                    except Exception as exc:
+                        thread_results[str(threads)] = {
+                            "ok": False,
+                            "threads": threads,
+                            "error": str(exc),
+                        }
+                        if print_fn:
+                            print_fn(f"{backend_name} t={threads}: failed: {exc}")
+                        if backend_name in DISABLED_WHISPER_BACKENDS:
+                            break
+
+                best_threads = choose_backend_threads_from_results(
+                    backend_name,
+                    {backend_name: {"thread_results": thread_results}},
+                )
+                best_result = thread_results.get(str(best_threads), {})
+                if best_result.get("ok"):
                     results[backend_name] = {
                         "ok": True,
                         "available": True,
-                        "elapsed_seconds": round(elapsed, 3),
-                        "realtime_factor": round(rtf, 3),
+                        "selected_threads": best_threads,
+                        "elapsed_seconds": best_result.get("elapsed_seconds"),
+                        "realtime_factor": best_result.get("realtime_factor"),
+                        "thread_results": thread_results,
                     }
                     if print_fn:
-                        print_fn(f"{backend_name}: {elapsed:.2f}s, realtime x{rtf:.2f}")
-                except Exception as exc:
+                        print_fn(
+                            f"{backend_name}: selected t={best_threads}, "
+                            f"{best_result.get('elapsed_seconds'):.2f}s"
+                        )
+                else:
+                    errors = [
+                        str(item.get("error"))
+                        for item in thread_results.values()
+                        if isinstance(item, dict) and item.get("error")
+                    ]
                     results[backend_name] = {
                         "ok": False,
                         "available": True,
-                        "error": str(exc),
+                        "error": "; ".join(errors) if errors else "no thread candidates completed",
+                        "thread_results": thread_results,
                     }
-                    if print_fn:
-                        print_fn(f"{backend_name}: failed: {exc}")
 
         if include_faster_whisper:
             result = run_faster_whisper_benchmark(wav_path, model_key)
@@ -665,12 +817,14 @@ def run_backend_benchmark(
                     print_fn(f"faster-whisper: skipped: {result.get('error')}")
 
     selected_backend = choose_auto_backend_key(results)
+    selected_threads = choose_backend_threads_from_results(selected_backend, results)
     profile = {
-        "version": 1,
+        "version": 2,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
         "audio_seconds": BENCHMARK_AUDIO_SECONDS,
         "model": model_key,
         "selected_backend": selected_backend,
+        "selected_threads": selected_threads,
         "results": results,
     }
     if any(results.get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS):
@@ -678,10 +832,10 @@ def run_backend_benchmark(
     return profile
 
 
-class VoiceHelperApp:
+class DictaApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("VoiceHelper")
+        self.root.title("Dicta")
         self._apply_window_icon()
         self.root.geometry("900x560")
         self.root.minsize(720, 460)
@@ -805,7 +959,7 @@ class VoiceHelperApp:
 
     def _build_settings_window(self) -> None:
         self.settings_window = tk.Toplevel(self.root)
-        self.settings_window.title("VoiceHelper: настройки")
+        self.settings_window.title("Dicta: настройки")
         self.settings_window.geometry("720x430")
         self.settings_window.minsize(620, 360)
         self.settings_window.transient(self.root)
@@ -897,11 +1051,13 @@ class VoiceHelperApp:
         self.backend_box.grid(row=2, column=1, sticky="w", pady=(0, 8))
         self.backend_box.bind("<<ComboboxSelected>>", self._on_backend_changed)
 
-        self.benchmark_button = ttk.Button(performance_tab, text="Бенчмарк моделей", command=self.start_model_benchmark)
-        self.benchmark_button.grid(row=3, column=1, sticky="w", pady=(6, 8), padx=(0, 8))
-        self.backend_benchmark_button = ttk.Button(performance_tab, text="Backend тест", command=self.start_backend_benchmark)
-        self.backend_benchmark_button.grid(row=3, column=2, sticky="w", pady=(6, 8))
-        ttk.Label(performance_tab, textvariable=self.speed_status_var).grid(row=4, column=1, columnspan=2, sticky="w")
+        benchmark_buttons = ttk.Frame(performance_tab)
+        benchmark_buttons.grid(row=3, column=1, sticky="w", pady=(6, 8))
+        self.benchmark_button = ttk.Button(benchmark_buttons, text="Бенчмарк моделей", command=self.start_model_benchmark)
+        self.benchmark_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.backend_benchmark_button = ttk.Button(benchmark_buttons, text="Backend тест", command=self.start_backend_benchmark)
+        self.backend_benchmark_button.grid(row=0, column=1, sticky="w")
+        ttk.Label(performance_tab, textvariable=self.speed_status_var).grid(row=4, column=1, sticky="w")
 
         self.firewall_button = ttk.Button(security_tab, text="Блокировать сеть", command=self.enable_firewall_block)
         self.firewall_button.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
@@ -919,7 +1075,7 @@ class VoiceHelperApp:
 
     def _apply_window_icon(self) -> None:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VoiceHelper.LocalDictation")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Dicta.LocalDictation")
         except Exception:
             pass
 
@@ -941,14 +1097,14 @@ class VoiceHelperApp:
         if missing:
             self._set_status("Не найдены локальные файлы")
             messagebox.showerror(
-                "VoiceHelper",
+                "Dicta",
                 self._format_problem_message(
-                    "Не найдены обязательные локальные файлы VoiceHelper.",
+                    "Не найдены обязательные локальные файлы Dicta.",
                     [
-                        "Запускайте приложение из полной папки VoiceHelper, не переносите один EXE отдельно.",
-                        "Проверьте, что рядом с VoiceHelper.exe есть папки models и .tools.",
+                        "Запускайте приложение из полной папки Dicta, не переносите один EXE отдельно.",
+                        "Проверьте, что рядом с Dicta.exe есть папки models и .tools.",
                         "Если это сборка из GitHub Actions, скачайте и распакуйте artifact целиком.",
-                        "Для проверки запустите scripts\\diagnose_voicehelper.cmd.",
+                        "Для проверки запустите scripts\\diagnose_dicta.cmd.",
                     ],
                     technical="\n".join(missing),
                 ),
@@ -1060,11 +1216,19 @@ class VoiceHelperApp:
     def _select_backend_key(self, backend_key: str) -> None:
         self.backend_var.set(BACKEND_LABELS.get(backend_key, DEFAULT_BACKEND_LABEL))
 
-    def _update_speed_status(self, vad_stats: dict | None = None, backend_name: str | None = None) -> None:
+    def _update_speed_status(
+        self,
+        vad_stats: dict | None = None,
+        backend_name: str | None = None,
+        backend_threads: int | None = None,
+    ) -> None:
         profile = self.profile_var.get()
         model_key = self._selected_model_key()
         backend = backend_name or self._preferred_backend_name()
         parts = [f"Скорость: {profile.lower()}, модель {model_key}", f"backend {backend}"]
+        if backend in WHISPER_BACKENDS:
+            threads = backend_threads or choose_backend_threads(backend)
+            parts.append(f"t={threads}")
         if vad_stats:
             reduction = vad_stats.get("reduction_percent", 0)
             parts.append(f"VAD -{reduction:.0f}%")
@@ -1079,21 +1243,26 @@ class VoiceHelperApp:
             return
 
         self.is_benchmarking = True
-        self._set_status("Бенчмарк моделей...")
+        self._set_status("Бенчмарк моделей: подготовка...")
+        self.speed_status_var.set("Бенчмарк моделей: идет проверка моделей")
         self._set_record_button_busy("Бенчмарк")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
         self.profile_box.configure(state=tk.DISABLED)
-        self.benchmark_button.configure(state=tk.DISABLED)
+        self.benchmark_button.configure(text="Идет тест...", state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
         threading.Thread(target=self._benchmark_models_worker, daemon=True).start()
 
     def _benchmark_models_worker(self) -> None:
         try:
+            def report_progress(message: str) -> None:
+                self.ui_queue.put(("model_benchmark_progress", message))
+
             profile = run_model_benchmark(
                 allow_missing_models=True,
                 preferred_backend_key=self._selected_backend_preference(),
+                print_fn=report_progress,
             )
             if not any(item.get("ok") for item in profile.get("results", {}).values()):
                 raise RuntimeError("No local models were available for benchmark.")
@@ -1102,8 +1271,8 @@ class VoiceHelperApp:
             self.ui_queue.put(("benchmark_error", self._format_problem_message(
                 "Не удалось выполнить бенчмарк моделей.",
                 [
-                    "Проверьте, что рядом с VoiceHelper.exe есть папки models и .tools.",
-                    "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
+                    "Проверьте, что рядом с Dicta.exe есть папки models и .tools.",
+                    "Запустите scripts\\diagnose_dicta.cmd для проверки состава папки.",
                 ],
                 technical=self._shorten_technical_text(str(exc)),
             )))
@@ -1115,19 +1284,27 @@ class VoiceHelperApp:
             return
 
         self.is_benchmarking = True
-        self._set_status("Бенчмарк backend...")
+        self._set_status("Backend тест: подготовка...")
+        self.speed_status_var.set("Backend тест: идет проверка backend и потоков")
         self._set_record_button_busy("Бенчмарк")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
         self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
-        self.backend_benchmark_button.configure(state=tk.DISABLED)
+        self.backend_benchmark_button.configure(text="Идет тест...", state=tk.DISABLED)
         threading.Thread(target=self._benchmark_backends_worker, daemon=True).start()
 
     def _benchmark_backends_worker(self) -> None:
         try:
-            profile = run_backend_benchmark(model_key=self._selected_model_key(), allow_missing_models=True)
+            def report_progress(message: str) -> None:
+                self.ui_queue.put(("backend_benchmark_progress", message))
+
+            profile = run_backend_benchmark(
+                model_key=self._selected_model_key(),
+                allow_missing_models=True,
+                print_fn=report_progress,
+            )
             if not any(profile.get("results", {}).get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS):
                 raise RuntimeError("No local whisper.cpp backends completed the benchmark.")
             self.ui_queue.put(("backend_benchmark_result", profile))
@@ -1135,9 +1312,9 @@ class VoiceHelperApp:
             self.ui_queue.put(("benchmark_error", self._format_problem_message(
                 "Не удалось выполнить бенчмарк backend.",
                 [
-                    "Проверьте, что рядом с VoiceHelper.exe есть папки models и .tools.",
+                    "Проверьте, что рядом с Dicta.exe есть папки models и .tools.",
                     "GPU backend считаются optional: если их нет, должен сработать AVX2 или Compat.",
-                    "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
+                    "Запустите scripts\\diagnose_dicta.cmd для проверки состава папки.",
                 ],
                 technical=self._shorten_technical_text(str(exc)),
             )))
@@ -1273,7 +1450,7 @@ class VoiceHelperApp:
         label = self.input_device_var.get()
         if label in self.input_devices:
             return self.input_devices[label]
-        raise RuntimeError("Не найден доступный микрофон в списке VoiceHelper.")
+        raise RuntimeError("Не найден доступный микрофон в списке Dicta.")
 
     def _input_device_default_sample_rate(self, device_index: int) -> int:
         try:
@@ -1299,7 +1476,7 @@ class VoiceHelperApp:
             self.mic_test_stream = None
             self._set_status("Ошибка микрофона")
             messagebox.showerror(
-                "VoiceHelper",
+                "Dicta",
                 self._format_microphone_error(
                     "Не удалось проверить микрофон.",
                     exc,
@@ -1352,7 +1529,7 @@ class VoiceHelperApp:
             self._set_status("Микрофон открыт, но звук не обнаружен")
             self.input_level_text_var.set("Уровень: тишина")
             messagebox.showwarning(
-                "VoiceHelper",
+                "Dicta",
                 self._format_problem_message(
                     "Микрофон удалось открыть, но заметного звука за 3 секунды не обнаружено.",
                     [
@@ -1379,7 +1556,7 @@ class VoiceHelperApp:
             self.stream = None
             self._set_status("Ошибка микрофона")
             messagebox.showerror(
-                "VoiceHelper",
+                "Dicta",
                 self._format_microphone_error(
                     "Не удалось начать запись.",
                     exc,
@@ -1449,13 +1626,13 @@ class VoiceHelperApp:
             self.refresh_input_button.configure(state=tk.NORMAL)
             self.test_input_button.configure(state=tk.NORMAL)
             messagebox.showwarning(
-                "VoiceHelper",
+                "Dicta",
                 self._format_problem_message(
-                    "Запись пустая: VoiceHelper не получил аудиоданные от микрофона.",
+                    "Запись пустая: Dicta не получил аудиоданные от микрофона.",
                     [
                         "Нажмите Проверить и скажите несколько слов.",
                         "Если индикатор уровня не двигается, выберите другой микрофон или нажмите Обновить.",
-                        "Если проблема повторяется, запустите scripts\\diagnose_voicehelper.cmd.",
+                        "Если проблема повторяется, запустите scripts\\diagnose_dicta.cmd.",
                     ],
                 ),
             )
@@ -1770,12 +1947,12 @@ class VoiceHelperApp:
         target = self._firewall_target_path()
         if not target.exists():
             messagebox.showerror(
-                "VoiceHelper",
+                "Dicta",
                 self._format_problem_message(
                     "Не найден файл, для которого нужно включить сетевую блокировку.",
                     [
-                        "Запускайте приложение из полной папки VoiceHelper.",
-                        "Если это исходники, сначала соберите EXE или откройте dist\\VoiceHelper\\VoiceHelper.exe.",
+                        "Запускайте приложение из полной папки Dicta.",
+                        "Если это исходники, сначала соберите EXE или откройте dist\\Dicta\\Dicta.exe.",
                     ],
                     technical=str(target),
                 ),
@@ -1784,9 +1961,9 @@ class VoiceHelperApp:
 
         if not getattr(sys, "frozen", False):
             proceed = messagebox.askyesno(
-                "VoiceHelper",
+                "Dicta",
                 "Сейчас приложение запущено через Python.\n\n"
-                "Для чистого пилота лучше открыть dist\\VoiceHelper\\VoiceHelper.exe и нажать кнопку там.\n\n"
+                "Для чистого пилота лучше открыть dist\\Dicta\\Dicta.exe и нажать кнопку там.\n\n"
                 f"Продолжить и заблокировать сеть для:\n{target}?",
             )
             if not proceed:
@@ -1797,13 +1974,13 @@ class VoiceHelperApp:
             self._run_cmd_elevated(script_path)
         except Exception as exc:
             messagebox.showerror(
-                "VoiceHelper",
+                "Dicta",
                 self._format_problem_message(
                     "Не удалось запустить настройку Windows Firewall.",
                     [
                         "Проверьте, что подтвердили UAC-запрос Windows.",
-                        "Если UAC-запрос не появился, запустите scripts\\diagnose_voicehelper.cmd.",
-                        "Посмотрите лог: %TEMP%\\voicehelper_firewall.log.",
+                        "Если UAC-запрос не появился, запустите scripts\\diagnose_dicta.cmd.",
+                        "Посмотрите лог: %TEMP%\\dicta_firewall.log.",
                     ],
                     technical=str(exc),
                 ),
@@ -1817,11 +1994,11 @@ class VoiceHelperApp:
         target = self._firewall_target_path()
         if not target.exists():
             messagebox.showerror(
-                "VoiceHelper",
+                "Dicta",
                 self._format_problem_message(
                     "Не найден файл, для которого нужно снять сетевую блокировку.",
                     [
-                        "Проверьте, что приложение запущено из полной папки VoiceHelper.",
+                        "Проверьте, что приложение запущено из полной папки Dicta.",
                         "Если папку перенесли, старое firewall-правило можно удалить вручную в Windows Firewall.",
                     ],
                     technical=str(target),
@@ -1830,8 +2007,8 @@ class VoiceHelperApp:
             return
 
         proceed = messagebox.askyesno(
-            "VoiceHelper",
-            "Удалить firewall-правило VoiceHelper для этого приложения?\n\n"
+            "Dicta",
+            "Удалить firewall-правило Dicta для этого приложения?\n\n"
             f"{target}",
         )
         if not proceed:
@@ -1842,12 +2019,12 @@ class VoiceHelperApp:
             self._run_cmd_elevated(script_path)
         except Exception as exc:
             messagebox.showerror(
-                "VoiceHelper",
+                "Dicta",
                 self._format_problem_message(
                     "Не удалось запустить снятие firewall-правила.",
                     [
                         "Проверьте, что подтвердили UAC-запрос Windows.",
-                        "Посмотрите лог: %TEMP%\\voicehelper_firewall.log.",
+                        "Посмотрите лог: %TEMP%\\dicta_firewall.log.",
                         "Если правило не снимается из приложения, удалите его в Windows Firewall вручную.",
                     ],
                     technical=str(exc),
@@ -1923,7 +2100,7 @@ class VoiceHelperApp:
         started_at = time.perf_counter()
 
         try:
-            with tempfile.NamedTemporaryFile(prefix="voicehelper_", suffix=".wav", delete=False) as wav_file:
+            with tempfile.NamedTemporaryFile(prefix="dicta_", suffix=".wav", delete=False) as wav_file:
                 wav_path = Path(wav_file.name)
 
             selected_model = self._selected_model_path()
@@ -1950,7 +2127,7 @@ class VoiceHelperApp:
             if txt_path.exists():
                 txt_path.unlink()
 
-            backend_name, completed = run_whisper_with_fallback(
+            backend_name, backend_threads, completed = run_whisper_with_fallback(
                 selected_model,
                 wav_path,
                 out_base,
@@ -1963,7 +2140,7 @@ class VoiceHelperApp:
                 raise RuntimeError("missing-recognition-output")
 
             recognized = txt_path.read_text(encoding="utf-8").strip()
-            self.ui_queue.put(("recognized", (recognized, elapsed, backend_name, vad_stats)))
+            self.ui_queue.put(("recognized", (recognized, elapsed, backend_name, backend_threads, vad_stats)))
         except Exception as exc:
             self.ui_queue.put(("error", self._format_recognition_error(exc)))
         finally:
@@ -1992,7 +2169,7 @@ class VoiceHelperApp:
             elif event == "hotkey_status":
                 self.hotkey_status_var.set(str(value))
             elif event == "recognized":
-                recognized, elapsed, backend_name, vad_stats = value
+                recognized, elapsed, backend_name, backend_threads, vad_stats = value
                 prepared = prepare_recognized_text(
                     str(recognized),
                     use_formatting=self.format_text_var.get(),
@@ -2003,7 +2180,11 @@ class VoiceHelperApp:
                 self.format_undo_snapshot = None
                 self.format_button.configure(text="Автоформат")
                 self.recognition_time_var.set(f"Распознавание: {elapsed:.1f} с")
-                self._update_speed_status(vad_stats=vad_stats, backend_name=backend_name)
+                self._update_speed_status(
+                    vad_stats=vad_stats,
+                    backend_name=backend_name,
+                    backend_threads=backend_threads,
+                )
                 if self.auto_copy_var.get() and prepared:
                     self._copy_value_to_clipboard(prepared)
                     self._set_status("Скопировано автоматически")
@@ -2012,7 +2193,7 @@ class VoiceHelperApp:
                 self._schedule_spellcheck(delay_ms=100)
             elif event == "error":
                 self._set_status("Ошибка распознавания")
-                messagebox.showerror("VoiceHelper", str(value))
+                messagebox.showerror("Dicta", str(value))
             elif event == "ready":
                 self.is_recognizing = False
                 self._set_record_button_idle()
@@ -2032,25 +2213,34 @@ class VoiceHelperApp:
                 self._select_model_key(selected_model)
                 self._update_speed_status()
                 self._set_status(f"Бенчмарк готов: выбрана модель {selected_model}")
+            elif event == "model_benchmark_progress":
+                message = str(value)
+                self._set_status(f"Бенчмарк моделей: {message}")
+                self.speed_status_var.set(f"Бенчмарк моделей: {message}")
             elif event == "backend_benchmark_result":
                 profile = value
                 selected_backend = profile.get("selected_backend", FALLBACK_AUTO_BACKEND_KEY)
+                selected_threads = parse_positive_int(profile.get("selected_threads")) or choose_backend_threads(selected_backend)
                 self._select_backend_key("auto")
                 self._save_current_settings()
                 self._update_speed_status()
-                self._set_status(f"Backend бенчмарк готов: выбран {selected_backend}")
+                self._set_status(f"Backend бенчмарк готов: выбран {selected_backend}, t={selected_threads}")
+            elif event == "backend_benchmark_progress":
+                message = str(value)
+                self._set_status(f"Backend тест: {message}")
+                self.speed_status_var.set(f"Backend тест: {message}")
             elif event == "benchmark_error":
                 self._set_status("Ошибка бенчмарка")
-                messagebox.showerror("VoiceHelper", str(value))
+                messagebox.showerror("Dicta", str(value))
             elif event == "benchmark_ready":
                 self.is_benchmarking = False
                 self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
                 self.profile_box.configure(state="readonly")
-                self.benchmark_button.configure(state=tk.NORMAL)
+                self.benchmark_button.configure(text="Бенчмарк моделей", state=tk.NORMAL)
                 self.backend_box.configure(state="readonly")
-                self.backend_benchmark_button.configure(state=tk.NORMAL)
+                self.backend_benchmark_button.configure(text="Backend тест", state=tk.NORMAL)
                 self.input_device_box.configure(state="readonly")
                 self.refresh_input_button.configure(state=tk.NORMAL)
                 self.test_input_button.configure(state=tk.NORMAL)
@@ -2125,7 +2315,7 @@ class VoiceHelperApp:
             "Проверьте доступ к микрофону в настройках конфиденциальности Windows.",
         ]
         if include_diagnostics:
-            steps.append("Если ошибка повторяется, запустите scripts\\diagnose_voicehelper.cmd и пришлите отчет из папки diagnostics.")
+            steps.append("Если ошибка повторяется, запустите scripts\\diagnose_dicta.cmd и пришлите отчет из папки diagnostics.")
 
         return self._format_problem_message(
             summary,
@@ -2152,10 +2342,10 @@ class VoiceHelperApp:
             return self._format_problem_message(
                 "Не найден локальный движок распознавания whisper-cli.exe.",
                 [
-                    "Запускайте VoiceHelper из полной распакованной папки.",
+                    "Запускайте Dicta из полной распакованной папки.",
                     "Проверьте, что рядом есть папка .tools.",
                     "Если это GitHub artifact, распакуйте ZIP целиком.",
-                    "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
+                    "Запустите scripts\\diagnose_dicta.cmd для проверки состава папки.",
                 ],
                 technical=path,
             )
@@ -2165,10 +2355,10 @@ class VoiceHelperApp:
             return self._format_problem_message(
                 "Не найдена выбранная локальная модель Whisper.",
                 [
-                    "Запускайте VoiceHelper из полной распакованной папки.",
+                    "Запускайте Dicta из полной распакованной папки.",
                     "Проверьте, что рядом есть папка models.",
                     "Выберите другую модель в списке и повторите запись.",
-                    "Запустите scripts\\diagnose_voicehelper.cmd для проверки состава папки.",
+                    "Запустите scripts\\diagnose_dicta.cmd для проверки состава папки.",
                 ],
                 technical=path,
             )
@@ -2179,8 +2369,8 @@ class VoiceHelperApp:
                 "Локальный движок распознавания завершился с ошибкой.",
                 [
                     "Повторите запись короткой фразой.",
-                    "Проверьте, что модель выбрана и папка VoiceHelper распакована целиком.",
-                    "Запустите scripts\\diagnose_voicehelper.cmd и пришлите отчет, если ошибка повторяется.",
+                    "Проверьте, что модель выбрана и папка Dicta распакована целиком.",
+                    "Запустите scripts\\diagnose_dicta.cmd и пришлите отчет, если ошибка повторяется.",
                 ],
                 details=f"Код завершения whisper-cli: {code}",
                 technical=self._shorten_technical_text(technical or "stderr/stdout пустой"),
@@ -2192,7 +2382,7 @@ class VoiceHelperApp:
                 [
                     "Повторите запись.",
                     "Проверьте, что антивирус или EDR не блокирует временные файлы в TEMP.",
-                    "Запустите scripts\\diagnose_voicehelper.cmd и пришлите отчет.",
+                    "Запустите scripts\\diagnose_dicta.cmd и пришлите отчет.",
                 ],
             )
 
@@ -2200,7 +2390,7 @@ class VoiceHelperApp:
             "Не удалось распознать запись.",
             [
                 "Повторите запись короткой фразой.",
-                "Если ошибка повторяется, запустите scripts\\diagnose_voicehelper.cmd.",
+                "Если ошибка повторяется, запустите scripts\\diagnose_dicta.cmd.",
             ],
             technical=self._shorten_technical_text(raw),
         )
@@ -2218,7 +2408,7 @@ class VoiceHelperApp:
         if getattr(sys, "frozen", False):
             return Path(sys.executable).resolve()
 
-        packaged = APP_DIR / "dist" / "VoiceHelper" / "VoiceHelper.exe"
+        packaged = APP_DIR / "dist" / "Dicta" / "Dicta.exe"
         if packaged.exists():
             return packaged.resolve()
         return Path(sys.executable).resolve()
@@ -2245,14 +2435,14 @@ class VoiceHelperApp:
     def _write_firewall_script(self, target: Path, remove: bool = False) -> Path:
         target_text = str(target)
         action = "remove" if remove else "enable"
-        script_path = Path(tempfile.gettempdir()) / f"voicehelper_{action}_firewall.cmd"
-        log_path = Path(tempfile.gettempdir()) / "voicehelper_firewall.log"
+        script_path = Path(tempfile.gettempdir()) / f"dicta_{action}_firewall.cmd"
+        log_path = Path(tempfile.gettempdir()) / "dicta_firewall.log"
 
         if remove:
             content = f"""@echo off
 setlocal
 set "LOG={log_path}"
-echo VoiceHelper firewall remove started > "%LOG%"
+echo Dicta firewall remove started > "%LOG%"
 echo Program: {target_text} >> "%LOG%"
 netsh advfirewall firewall delete rule name="{FIREWALL_RULE_NAME}" program="{target_text}" dir=out >> "%LOG%" 2>&1
 echo ExitCode: %ERRORLEVEL% >> "%LOG%"
@@ -2262,10 +2452,10 @@ del "%~f0" >nul 2>nul
             content = f"""@echo off
 setlocal
 set "LOG={log_path}"
-echo VoiceHelper firewall enable started > "%LOG%"
+echo Dicta firewall enable started > "%LOG%"
 echo Program: {target_text} >> "%LOG%"
 netsh advfirewall firewall delete rule name="{FIREWALL_RULE_NAME}" program="{target_text}" dir=out >> "%LOG%" 2>&1
-netsh advfirewall firewall add rule name="{FIREWALL_RULE_NAME}" dir=out action=block program="{target_text}" enable=yes profile=any description="VoiceHelper confidentiality control: block outbound network access." >> "%LOG%" 2>&1
+netsh advfirewall firewall add rule name="{FIREWALL_RULE_NAME}" dir=out action=block program="{target_text}" enable=yes profile=any description="Dicta confidentiality control: block outbound network access." >> "%LOG%" 2>&1
 echo ExitCode: %ERRORLEVEL% >> "%LOG%"
 del "%~f0" >nul 2>nul
 """
@@ -2430,13 +2620,13 @@ def main() -> None:
         issues = check_text("тест превет", language_tag="ru-RU")
         print(f"issues={[(issue.word, issue.suggestions[:3]) for issue in issues]}")
         if not any(issue.word == "превет" for issue in issues):
-            print("VoiceHelper spell-test note: test word is not flagged; it may already be in the user dictionary.")
-        print("VoiceHelper spell-test passed.")
+            print("Dicta spell-test note: test word is not flagged; it may already be in the user dictionary.")
+        print("Dicta spell-test passed.")
         raise SystemExit(0)
 
     if "--format-test" in sys.argv:
         run_text_cleanup_self_test()
-        print("VoiceHelper format-test passed.")
+        print("Dicta format-test passed.")
         raise SystemExit(0)
 
     if "--benchmark-models" in sys.argv:
@@ -2462,7 +2652,10 @@ def main() -> None:
             include_faster_whisper=include_faster_whisper,
             print_fn=print,
         )
-        print(f"selected_backend={profile.get('selected_backend', FALLBACK_AUTO_BACKEND_KEY)}")
+        selected_backend = profile.get("selected_backend", FALLBACK_AUTO_BACKEND_KEY)
+        selected_threads = parse_positive_int(profile.get("selected_threads")) or choose_backend_threads(selected_backend)
+        print(f"selected_backend={selected_backend}")
+        print(f"selected_threads={selected_threads}")
         print(f"profile={BACKEND_PROFILE_PATH}")
         results = profile.get("results", {})
         if not any(results.get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS):
@@ -2475,20 +2668,21 @@ def main() -> None:
         required = [WHISPER_EXE] if allow_missing_models else [WHISPER_EXE, *MODEL_OPTIONS.values()]
         missing = [path for path in required if not path.exists()]
         if missing:
-            print("VoiceHelper self-test failed. Missing files:")
+            print("Dicta self-test failed. Missing files:")
             for path in missing:
                 print(path)
             raise SystemExit(1)
         if allow_missing_models:
             missing_models = [path for path in MODEL_OPTIONS.values() if not path.exists()]
             if missing_models:
-                print("VoiceHelper self-test warning: models are not included in this code-only package.")
+                print("Dicta self-test warning: models are not included in this code-only package.")
                 for path in missing_models:
                     print(path)
-        print("VoiceHelper self-test passed.")
+        print("Dicta self-test passed.")
         print(f"APP_DIR={APP_DIR}")
         print(f"APP_ICON={APP_ICON}")
         print(f"WHISPER_BACKENDS={[(name, str(path), path.exists()) for name, path in WHISPER_BACKENDS.items()]}")
+        print(f"DEFAULT_WHISPER_THREADS={DEFAULT_WHISPER_THREADS}")
         print(f"PERFORMANCE_PROFILE={PERFORMANCE_PROFILE_PATH}")
         print(f"BACKEND_PROFILE={BACKEND_PROFILE_PATH}")
         print(f"USER_SETTINGS={USER_SETTINGS_PATH}")
@@ -2498,7 +2692,7 @@ def main() -> None:
     style = ttk.Style(root)
     if "vista" in style.theme_names():
         style.theme_use("vista")
-    VoiceHelperApp(root)
+    DictaApp(root)
     root.mainloop()
 
 

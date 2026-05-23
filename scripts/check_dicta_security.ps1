@@ -12,18 +12,18 @@ if ([string]::IsNullOrWhiteSpace($Root)) {
 $whisper = Join-Path $root ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe"
 $manifest = Join-Path $root "manifest.json"
 $shaSums = Join-Path $root "SHA256SUMS.txt"
-$verifyScript = Join-Path $root "scripts\verify_voicehelper_package.ps1"
+$verifyScript = Join-Path $root "scripts\verify_dicta_package.ps1"
 $models = @(
     Join-Path $root "models\ggml-tiny-q5_1.bin"
     Join-Path $root "models\ggml-base-q5_1.bin"
     Join-Path $root "models\ggml-small-q5_1.bin"
 )
 $tempPatterns = @(
-    "voicehelper_*.wav",
-    "voicehelper_*_out.txt"
+    "dicta_*.wav",
+    "dicta_*_out.txt"
 )
 
-Write-Host "VoiceHelper security check"
+Write-Host "Dicta security check"
 Write-Host "Root: $root"
 Write-Host ""
 
@@ -72,30 +72,30 @@ foreach ($model in $models) {
 }
 
 Write-Host ""
-Write-Host "Firewall rules matching VoiceHelper:"
-$netshOutput = @(netsh advfirewall firewall show rule name="VoiceHelper Block Outbound" verbose 2>$null)
+Write-Host "Firewall rules matching Dicta:"
+$netshOutput = @(netsh advfirewall firewall show rule name="Dicta Block Outbound" verbose 2>$null)
 $netshText = ($netshOutput -join "`n")
-$programText = $whisper -replace "\\.tools\\whisper\.cpp-build-compat\\bin\\whisper-cli\.exe$", "VoiceHelper.exe"
+$programText = $whisper -replace "\\.tools\\whisper\.cpp-build-compat\\bin\\whisper-cli\.exe$", "Dicta.exe"
 
 if ($LASTEXITCODE -eq 0 -and $netshText -like "*$programText*") {
-    Write-Host "[OK] VoiceHelper Block Outbound is present for: $programText"
+    Write-Host "[OK] Dicta Block Outbound is present for: $programText"
 } elseif ($LASTEXITCODE -eq 0) {
-    Write-Host "[WARN] VoiceHelper firewall rule exists, but not for this checked root."
+    Write-Host "[WARN] Dicta firewall rule exists, but not for this checked root."
     Write-Host $netshText
 } else {
-    Write-Host "[WARN] VoiceHelper outbound firewall rule was not found."
-    Write-Host "       Create it manually when ready: .\scripts\add_voicehelper_firewall_block.ps1"
+    Write-Host "[WARN] Dicta outbound firewall rule was not found."
+    Write-Host "       Create it manually when ready: .\scripts\add_dicta_firewall_block.ps1"
 }
 
 Write-Host ""
-Write-Host "Temporary VoiceHelper files:"
+Write-Host "Temporary Dicta files:"
 $leftovers = @()
 foreach ($pattern in $tempPatterns) {
     $leftovers += Get-ChildItem -Path $env:TEMP -Filter $pattern -ErrorAction SilentlyContinue
 }
 
 if ($leftovers.Count -eq 0) {
-    Write-Host "[OK] no VoiceHelper temp WAV/TXT leftovers found in $env:TEMP"
+    Write-Host "[OK] no Dicta temp WAV/TXT leftovers found in $env:TEMP"
 } else {
     Write-Host "[WARN] temp leftovers found:"
     foreach ($item in $leftovers) {

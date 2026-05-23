@@ -1,12 +1,12 @@
-# VoiceHelper: процедура обновления
+# Dicta: процедура обновления
 
 ## Коротко
 
-VoiceHelper обновляется заменой всей папки приложения. Один `VoiceHelper.exe` отдельно переносить нельзя: рядом должны оставаться `_internal`, `.tools`, `models`, `assets`, `docs`, `scripts`, `manifest.json` и `SHA256SUMS.txt`.
+Dicta обновляется заменой всей папки приложения. Один `Dicta.exe` отдельно переносить нельзя: рядом должны оставаться `_internal`, `.tools`, `models`, `assets`, `docs`, `scripts`, `manifest.json` и `SHA256SUMS.txt`.
 
 ## Перед обновлением
 
-1. Закрыть `VoiceHelper.exe`.
+1. Закрыть `Dicta.exe`.
 2. Если в старой папке есть вручную добавленные модели, сохранить их отдельно или оставить старую папку как источник:
 
 ```text
@@ -15,25 +15,25 @@ models\ggml-base-q5_1.bin
 models\ggml-small-q5_1.bin
 ```
 
-3. Если включалась блокировка сети, учесть, что firewall-правило привязано к конкретному пути `VoiceHelper.exe`.
+3. Если включалась блокировка сети, учесть, что firewall-правило привязано к конкретному пути `Dicta.exe`.
 
 ## Установка новой версии
 
-1. Распаковать новый ZIP целиком в отдельную папку `VoiceHelper`.
+1. Распаковать новый ZIP целиком в отдельную папку `Dicta`.
 2. Запустить проверку целостности code-only пакета:
 
 ```text
-scripts\verify_voicehelper_package.cmd
+scripts\verify_dicta_package.cmd
 ```
 
-3. Вручную скопировать модели в папку `models` рядом с новым `VoiceHelper.exe`.
+3. Вручную скопировать модели в папку `models` рядом с новым `Dicta.exe`.
 4. Запустить:
 
 ```text
-scripts\diagnose_voicehelper.cmd
+scripts\diagnose_dicta.cmd
 ```
 
-5. Открыть `VoiceHelper.exe` и проверить:
+5. Открыть `Dicta.exe` и проверить:
    - главное окно открывается;
    - нужный микрофон выбран в `Настройки` -> `Запись`;
    - `Проверить` показывает уровень микрофона;
@@ -57,18 +57,18 @@ scripts\check_firewall_block.cmd
 ## Откат
 
 1. Закрыть новую версию.
-2. Вернуть старую папку `VoiceHelper`.
+2. Вернуть старую папку `Dicta`.
 3. Если путь изменился, заново создать firewall-правило из старой папки через `Настройки` -> `Безопасность` -> `Блокировать сеть`.
-4. Запустить `scripts\diagnose_voicehelper.cmd` в старой папке.
+4. Запустить `scripts\diagnose_dicta.cmd` в старой папке.
 
 ## Что не переносится автоматически
 
-VoiceHelper не переносит историю диктовок, потому что она не хранится. Технические профили и настройки лежат в:
+Dicta не переносит историю диктовок, потому что она не хранится. Технические профили и настройки лежат в:
 
 ```text
-%LOCALAPPDATA%\VoiceHelper\performance_profile.json
-%LOCALAPPDATA%\VoiceHelper\backend_profile.json
-%LOCALAPPDATA%\VoiceHelper\settings.json
+%LOCALAPPDATA%\Dicta\performance_profile.json
+%LOCALAPPDATA%\Dicta\backend_profile.json
+%LOCALAPPDATA%\Dicta\settings.json
 ```
 
-В этих файлах нет аудио, распознанного текста или истории диктовок.
+В этих файлах нет аудио, распознанного текста или истории диктовок. `backend_profile.json` хранит только технические времена backend/thread-бенчмарка, выбранный backend и выбранное число потоков.

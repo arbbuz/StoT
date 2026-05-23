@@ -7,14 +7,14 @@ $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($ProgramPath)) {
     $packageRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
-    $ProgramPath = Join-Path $packageRoot "VoiceHelper.exe"
+    $ProgramPath = Join-Path $packageRoot "Dicta.exe"
 }
 
 $resolved = Resolve-Path -LiteralPath $ProgramPath
 $program = $resolved.Path
-$ruleName = "VoiceHelper Block Outbound"
+$ruleName = "Dicta Block Outbound"
 
-Write-Host "VoiceHelper network audit"
+Write-Host "Dicta network audit"
 Write-Host "Program: $program"
 Write-Host "Window:  $Seconds seconds"
 Write-Host ""
@@ -26,23 +26,23 @@ $netshText = ($netshOutput -join "`n")
 if ($LASTEXITCODE -eq 0 -and $netshText -like "*$program*") {
     Write-Host "[OK] $ruleName is present for this exact exe."
 } elseif ($LASTEXITCODE -eq 0) {
-    Write-Host "[WARN] A VoiceHelper firewall rule exists, but not for this exact exe."
+    Write-Host "[WARN] A Dicta firewall rule exists, but not for this exact exe."
     Write-Host $netshText
 } else {
     Write-Host "[WARN] Active outbound block rule for this exact exe was not found."
     Write-Host "       Use the app button 'Блокировать сеть' or run:"
-    Write-Host "       .\scripts\add_voicehelper_firewall_block.ps1 -ProgramPath `"$program`""
+    Write-Host "       .\scripts\add_dicta_firewall_block.ps1 -ProgramPath `"$program`""
 }
 
 Write-Host ""
 Write-Host "Process check:"
-$processes = @(Get-Process -Name "VoiceHelper" -ErrorAction SilentlyContinue |
+$processes = @(Get-Process -Name "Dicta" -ErrorAction SilentlyContinue |
     Where-Object {
         try { $_.Path -eq $program } catch { $false }
     })
 
 if ($processes.Count -eq 0) {
-    Write-Host "[WARN] VoiceHelper is not running from this path."
+    Write-Host "[WARN] Dicta is not running from this path."
     Write-Host "       Start the app first, then run this audit again."
     exit 0
 }
@@ -52,7 +52,7 @@ foreach ($proc in $processes) {
 }
 
 Write-Host ""
-Write-Host "Monitoring TCP connections owned by VoiceHelper..."
+Write-Host "Monitoring TCP connections owned by Dicta..."
 $deadline = (Get-Date).AddSeconds($Seconds)
 $seen = @{}
 
@@ -72,7 +72,7 @@ while ((Get-Date) -lt $deadline) {
 
 Write-Host ""
 if ($seen.Count -eq 0) {
-    Write-Host "[OK] No TCP connections owned by VoiceHelper were observed."
+    Write-Host "[OK] No TCP connections owned by Dicta were observed."
 } else {
     Write-Host "[WARN] TCP connection records were observed. Review the lines above."
 }

@@ -33,7 +33,7 @@ function Convert-ToPackagePath {
     return [System.Uri]::UnescapeDataString($script:RootUri.MakeRelativeUri($fileUri).ToString())
 }
 
-Write-Host "VoiceHelper package verification"
+Write-Host "Dicta package verification"
 Write-Host "Root: $root"
 Write-Host ""
 
@@ -44,7 +44,7 @@ if (-not (Test-Path -LiteralPath $manifestPath)) {
     try {
         $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
         Write-Host "[OK] manifest.json found: $($manifest.packageName) $($manifest.packageVersion) ($($manifest.packageKind))"
-        if ($manifest.packageName -ne "VoiceHelper") {
+        if ($manifest.packageName -ne "Dicta") {
             Write-Host "[WARN] manifest packageName is unexpected: $($manifest.packageName)"
             $warnings += 1
         }

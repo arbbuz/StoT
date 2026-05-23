@@ -1,18 +1,18 @@
-Write-Host "VoiceHelper audio devices"
+Write-Host "Dicta audio devices"
 Write-Host ""
 
 $packageRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
-$program = Join-Path $packageRoot "VoiceHelper.exe"
+$program = Join-Path $packageRoot "Dicta.exe"
 
 if (-not (Test-Path -LiteralPath $program)) {
-    Write-Host "[WARN] VoiceHelper.exe was not found next to scripts folder."
+    Write-Host "[WARN] Dicta.exe was not found next to scripts folder."
     Write-Host "       Fallback: checking with system Python, if available."
     python -c "import sounddevice as sd; print('default=', sd.default.device); print(sd.query_devices())"
     exit $LASTEXITCODE
 }
 
-$stdoutPath = Join-Path $env:TEMP "voicehelper_audio_devices_stdout.txt"
-$stderrPath = Join-Path $env:TEMP "voicehelper_audio_devices_stderr.txt"
+$stdoutPath = Join-Path $env:TEMP "dicta_audio_devices_stdout.txt"
+$stderrPath = Join-Path $env:TEMP "dicta_audio_devices_stderr.txt"
 Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
 
 $process = Start-Process `

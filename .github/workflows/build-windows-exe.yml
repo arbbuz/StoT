@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-windows-exe:
-    name: Build VoiceHelper Windows artifact
+    name: Build Dicta Windows artifact
     runs-on: windows-latest
 
     steps:
@@ -23,26 +23,26 @@ jobs:
 
       - name: Prepare local Whisper assets
         shell: pwsh
-        run: .\scripts\prepare_voicehelper_assets.ps1 -SkipModels
+        run: .\scripts\prepare_dicta_assets.ps1 -SkipModels
 
       - name: Build EXE
         shell: pwsh
-        run: .\scripts\build_voicehelper_exe.ps1 -SkipModels
+        run: .\scripts\build_dicta_exe.ps1 -SkipModels
 
       - name: Create ZIP package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          $zip = "artifacts\VoiceHelper-windows-code-only-${{ github.sha }}.zip"
+          $zip = "artifacts\Dicta-windows-code-only-${{ github.sha }}.zip"
           if (Test-Path -LiteralPath $zip) {
             Remove-Item -LiteralPath $zip -Force
           }
-          Compress-Archive -Path "dist\VoiceHelper\*" -DestinationPath $zip -Force
+          Compress-Archive -Path "dist\Dicta\*" -DestinationPath $zip -Force
           Get-Item -LiteralPath $zip | Select-Object FullName,Length,LastWriteTime
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VoiceHelper-windows-code-only-${{ github.sha }}
-          path: artifacts/VoiceHelper-windows-code-only-${{ github.sha }}.zip
+          name: Dicta-windows-code-only-${{ github.sha }}
+          path: artifacts/Dicta-windows-code-only-${{ github.sha }}.zip
           retention-days: 30

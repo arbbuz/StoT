@@ -9,14 +9,14 @@ if ([string]::IsNullOrWhiteSpace($ProgramPath)) {
 }
 
 $resolved = Resolve-Path -LiteralPath $ProgramPath
-$ruleName = "VoiceHelper Block Outbound"
+$ruleName = "Dicta Block Outbound"
 
 Write-Host "Будет создано правило Windows Firewall для запрета исходящих соединений:"
 Write-Host "  $ruleName"
 Write-Host "  $($resolved.Path)"
 Write-Host ""
-Write-Host "Важно: если указан python.exe, правило заблокирует сеть для этого Python, а не только для VoiceHelper."
-Write-Host "Для будущей .exe-сборки лучше передать путь именно к VoiceHelper.exe."
+Write-Host "Важно: если указан python.exe, правило заблокирует сеть для этого Python, а не только для Dicta."
+Write-Host "Для будущей .exe-сборки лучше передать путь именно к Dicta.exe."
 
 $existing = @(Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
     Where-Object { $_.Direction -eq "Outbound" -and $_.Action -eq "Block" } |
@@ -29,7 +29,7 @@ if ($existing.Count -eq 0) {
         -Program $resolved.Path `
         -Action Block `
         -Profile Any `
-        -Description "VoiceHelper confidentiality control: block outbound network access."
+        -Description "Dicta confidentiality control: block outbound network access."
 } else {
     Write-Host "Подходящее правило уже существует."
 }

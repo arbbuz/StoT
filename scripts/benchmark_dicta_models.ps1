@@ -1,24 +1,23 @@
-Write-Host "VoiceHelper backend comparison"
+Write-Host "Dicta model benchmark"
 Write-Host ""
 
 $packageRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
-$program = Join-Path $packageRoot "VoiceHelper.exe"
-$arguments = @("--benchmark-backends", "--include-faster-whisper")
+$program = Join-Path $packageRoot "Dicta.exe"
 
 if (-not (Test-Path -LiteralPath $program)) {
-    Write-Host "[WARN] VoiceHelper.exe was not found next to scripts folder."
+    Write-Host "[WARN] Dicta.exe was not found next to scripts folder."
     Write-Host "       Fallback: checking with system Python, if available."
-    python (Join-Path $packageRoot "voicehelper.py") @arguments
+    python (Join-Path $packageRoot "dicta.py") --benchmark-models
     exit $LASTEXITCODE
 }
 
-$stdoutPath = Join-Path $env:TEMP "voicehelper_backend_compare_stdout.txt"
-$stderrPath = Join-Path $env:TEMP "voicehelper_backend_compare_stderr.txt"
+$stdoutPath = Join-Path $env:TEMP "dicta_benchmark_stdout.txt"
+$stderrPath = Join-Path $env:TEMP "dicta_benchmark_stderr.txt"
 Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
 
 $process = Start-Process `
     -FilePath $program `
-    -ArgumentList $arguments `
+    -ArgumentList "--benchmark-models" `
     -Wait `
     -PassThru `
     -RedirectStandardOutput $stdoutPath `

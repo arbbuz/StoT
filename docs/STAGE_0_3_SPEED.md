@@ -1,4 +1,4 @@
-# VoiceHelper 0.3: скорость распознавания
+# Dicta 0.3: скорость распознавания
 
 Дата: 2026-05-23
 Статус: реализовано в пилотной сборке
@@ -14,18 +14,18 @@
   - "Точно".
 - Бенчмарк моделей `tiny-q5_1`, `base-q5_1`, `small-q5_1`.
 - Автоподбор модели по результатам бенчмарка.
-- Optional AVX2 backend: если рядом с приложением есть `.tools\whisper.cpp-build-avx2\bin\whisper-cli.exe`, VoiceHelper пробует его первым.
+- Optional AVX2 backend: если рядом с приложением есть `.tools\whisper.cpp-build-avx2\bin\whisper-cli.exe`, Dicta пробует его первым.
 - Fallback на scalar compat backend: если AVX2 backend отсутствует или завершается ошибкой, используется `.tools\whisper.cpp-build-compat\bin\whisper-cli.exe`, собранный без AVX/AVX2/FMA/F16C/SSE4.2/BMI2.
 - Отдельный запуск бенчмарка:
 
 ```text
-scripts\benchmark_voicehelper_models.cmd
+scripts\benchmark_dicta_models.cmd
 ```
 
 ## Как работает VAD
 
 1. После нажатия "Стоп" аудио остается в памяти приложения.
-2. VoiceHelper делит аудио на короткие фреймы.
+2. Dicta делит аудио на короткие фреймы.
 3. Для каждого фрейма считает RMS и peak.
 4. Порог речи выбирается адаптивно от локального шумового пола.
 5. Длинная тишина в начале, конце и между фрагментами речи удаляется.
@@ -54,7 +54,7 @@ VAD не отправляет аудио в интернет и не испол�
 Результат сохраняется в локальный технический файл:
 
 ```text
-%LOCALAPPDATA%\VoiceHelper\performance_profile.json
+%LOCALAPPDATA%\Dicta\performance_profile.json
 ```
 
 В нем нет аудио, распознанного текста или истории диктовок. Хранятся только:
@@ -66,7 +66,7 @@ VAD не отправляет аудио в интернет и не испол�
 
 ## AVX2 fallback
 
-VoiceHelper поддерживает два CPU backend:
+Dicta поддерживает два CPU backend:
 
 ```text
 .tools\whisper.cpp-build-avx2\bin\whisper-cli.exe
@@ -75,8 +75,8 @@ VoiceHelper поддерживает два CPU backend:
 
 Порядок запуска:
 
-1. Если AVX2 backend есть в поставке, VoiceHelper пробует его первым.
-2. Если AVX2 backend отсутствует или завершается ошибкой, VoiceHelper автоматически запускает compat backend.
+1. Если AVX2 backend есть в поставке, Dicta пробует его первым.
+2. Если AVX2 backend отсутствует или завершается ошибкой, Dicta автоматически запускает compat backend.
 3. Compat backend собирается как максимально совместимый scalar build.
 4. Если compat backend тоже недоступен, пользователь получает понятное сообщение об ошибке.
 

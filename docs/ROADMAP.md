@@ -1,11 +1,11 @@
-# VoiceHelper: roadmap развития
+# Dicta: roadmap развития
 
 Дата фиксации: 2026-05-22
 Статус: принято как направление развития пилота
 
 ## Цель
 
-Развивать VoiceHelper как локальный ИБ-дружественный инструмент для голосовой диктовки административных текстов, заметок и ответов, без облачного распознавания и без автоматической отправки данных во внешние системы.
+Развивать Dicta как локальный ИБ-дружественный инструмент для голосовой диктовки административных текстов, заметок и ответов, без облачного распознавания и без автоматической отправки данных во внешние системы.
 
 Ключевые принципы:
 
@@ -31,7 +31,7 @@
   - нет доступа к микрофону;
   - запись похожа на тишину;
   - модель/whisper-cli не найдены;
-- единый диагностический скрипт `diagnose_voicehelper.cmd`.
+- единый диагностический скрипт `diagnose_dicta.cmd`.
 
 Ожидаемый результат: пользователь видит один понятный микрофон, может быстро проверить запись, а ИБ/администратор получает диагностику одним запуском.
 
@@ -90,14 +90,14 @@
 
 - `SHA256SUMS.txt` для файлов поставки;
 - `manifest.json` с версией, датой сборки и составом компонентов;
-- единый `diagnose_voicehelper.cmd`;
+- единый `diagnose_dicta.cmd`;
 - описание всех временных файлов;
 - описание сетевой модели;
 - описание firewall-блокировки;
 - описание проверки орфографии через локальный Windows Spell Checking API;
 - политика "аудио не хранить";
 - история распознаваний выключена по умолчанию;
-- подпись `VoiceHelper.exe` сертификатом организации при промышленном внедрении.
+- подпись `Dicta.exe` сертификатом организации при промышленном внедрении.
 
 ## Версионный план
 
@@ -154,14 +154,14 @@
 ## Выполнено по версии 0.2
 
 - 0.2.1: сгруппированный выбор микрофона, кнопка "Проверить", индикатор уровня, автопроба Windows audio backend.
-- 0.2.2: единая диагностика `scripts\diagnose_voicehelper.cmd` и отчет `diagnostics\voicehelper_diagnostic_YYYYMMDD_HHMMSS.txt`.
+- 0.2.2: единая диагностика `scripts\diagnose_dicta.cmd` и отчет `diagnostics\dicta_diagnostic_YYYYMMDD_HHMMSS.txt`.
 - 0.2.3: понятные сообщения об ошибках с причиной, действиями и техническими деталями отдельным блоком.
 
 ## Выполнено по версии 0.3
 
 - Простой локальный VAD без новых зависимостей и с peak-based fallback.
 - Профили "Авто", "Быстро", "Баланс", "Точно".
-- Бенчмарк моделей через `scripts\benchmark_voicehelper_models.cmd`.
+- Бенчмарк моделей через `scripts\benchmark_dicta_models.cmd`.
 - Автоподбор модели для профиля "Авто" по сохраненному бенчмарку.
 - Optional AVX2 backend с fallback на compat backend.
 
@@ -175,15 +175,20 @@
 ## Выполнено по версии 0.5
 
 - Optional hooks для GPU backend `whisper.cpp`: Vulkan, CUDA, OpenVINO.
-- Сравнение backend через `scripts\compare_voicehelper_backends.cmd`.
+- Сравнение backend через `scripts\compare_dicta_backends.cmd`.
 - Experimental optional comparison с `faster-whisper` без замены текущего `whisper.cpp`.
 - Выбор backend в интерфейсе и режим "Авто" с автоподбором по backend-бенчмарку.
 
 ## Выполнено по версии 1.0
 
 - `manifest.json` и `SHA256SUMS.txt` создаются при сборке поставки.
-- `scripts\verify_voicehelper_package.cmd` проверяет целостность code-only пакета по SHA256.
-- `scripts\diagnose_voicehelper.cmd` включает проверку manifest/SHA256.
+- `scripts\verify_dicta_package.cmd` проверяет целостность code-only пакета по SHA256.
+- `scripts\diagnose_dicta.cmd` включает проверку manifest/SHA256.
 - Добавлена процедура обновления и отката `docs\UPDATE_PROCEDURE.md`.
 - Добавлено описание корпоративного пилота `docs\STAGE_1_0_CORPORATE_PILOT.md`.
-- GitHub Actions artifact остается code-only без `models\*.bin`; модели копируются вручную в `models` рядом с `VoiceHelper.exe`.
+- GitHub Actions artifact остается code-only без `models\*.bin`; модели копируются вручную в `models` рядом с `Dicta.exe`.
+
+## Выполнено по версии 1.1
+
+- Backend-бенчмарк стал двумерным: проверяет доступные `whisper.cpp` backend с несколькими значениями `-t`.
+- Режим "Авто" сохраняет и использует выбранную пару backend + число потоков.

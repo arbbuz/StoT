@@ -22,7 +22,7 @@ $diagnosticsDir = Join-Path $root "diagnostics"
 New-Item -ItemType Directory -Force -Path $diagnosticsDir | Out-Null
 
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$script:ReportPath = Join-Path $diagnosticsDir "voicehelper_diagnostic_$stamp.txt"
+$script:ReportPath = Join-Path $diagnosticsDir "dicta_diagnostic_$stamp.txt"
 $script:BlockingFailures = 0
 $script:Warnings = 0
 
@@ -135,7 +135,7 @@ function Test-OptionalFile {
     Write-Check -Level "OK" -Message "$RelativePath found ($sizeMb MB)."
 }
 
-Write-ReportLine "VoiceHelper unified diagnostic report"
+Write-ReportLine "Dicta unified diagnostic report"
 Write-ReportLine "Created:  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
 Write-ReportLine "Root:     $root"
 Write-ReportLine "Report:   $script:ReportPath"
@@ -161,7 +161,7 @@ try {
 }
 
 Write-Section "Required Files"
-Test-RequiredFile -RelativePath "VoiceHelper.exe" -Hash
+Test-RequiredFile -RelativePath "Dicta.exe" -Hash
 Test-RequiredFile -RelativePath "manifest.json" -Hash
 Test-RequiredFile -RelativePath "SHA256SUMS.txt"
 Test-RequiredFile -RelativePath ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe" -Hash
@@ -183,35 +183,35 @@ Test-RequiredFile -RelativePath "docs\STAGE_0_2_3_ERROR_MESSAGES.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_3_SPEED.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_4_CONVENIENCE.md"
 Test-RequiredFile -RelativePath "docs\STAGE_0_5_PERFORMANCE.md"
-Test-RequiredFile -RelativePath "scripts\benchmark_voicehelper_models.cmd"
-Test-RequiredFile -RelativePath "scripts\benchmark_voicehelper_models.ps1"
-Test-RequiredFile -RelativePath "scripts\compare_voicehelper_backends.cmd"
-Test-RequiredFile -RelativePath "scripts\compare_voicehelper_backends.ps1"
-Test-RequiredFile -RelativePath "scripts\verify_voicehelper_package.cmd"
-Test-RequiredFile -RelativePath "scripts\verify_voicehelper_package.ps1"
+Test-RequiredFile -RelativePath "scripts\benchmark_dicta_models.cmd"
+Test-RequiredFile -RelativePath "scripts\benchmark_dicta_models.ps1"
+Test-RequiredFile -RelativePath "scripts\compare_dicta_backends.cmd"
+Test-RequiredFile -RelativePath "scripts\compare_dicta_backends.ps1"
+Test-RequiredFile -RelativePath "scripts\verify_dicta_package.cmd"
+Test-RequiredFile -RelativePath "scripts\verify_dicta_package.ps1"
 
-$program = Join-Path $root "VoiceHelper.exe"
+$program = Join-Path $root "Dicta.exe"
 $powershellArgsPrefix = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File")
 
 if (Test-Path -LiteralPath $program) {
     Invoke-ReportCommand `
-        -Title "VoiceHelper self-test" `
+        -Title "Dicta self-test" `
         -FilePath $program `
         -Arguments @("--self-test") `
         -BlockingExitCodes @(1, 2, 3, 999)
 } else {
-    Write-Section "VoiceHelper self-test"
-    Write-Check -Level "FAIL" -Message "VoiceHelper.exe is missing, self-test skipped." -Blocking
+    Write-Section "Dicta self-test"
+    Write-Check -Level "FAIL" -Message "Dicta.exe is missing, self-test skipped." -Blocking
 }
 
 Invoke-ReportCommand `
     -Title "Package manifest and SHA256 verification" `
     -FilePath "powershell" `
-    -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "verify_voicehelper_package.ps1"), "-Root", $root)) `
+    -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "verify_dicta_package.ps1"), "-Root", $root)) `
     -BlockingExitCodes @(1, 999)
 
 Invoke-ReportCommand `
-    -Title "Audio devices visible to VoiceHelper" `
+    -Title "Audio devices visible to Dicta" `
     -FilePath "powershell" `
     -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "list_audio_devices.ps1"))) `
     -BlockingExitCodes @(999)
@@ -225,7 +225,7 @@ Invoke-ReportCommand `
 Invoke-ReportCommand `
     -Title "Security package check" `
     -FilePath "powershell" `
-    -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "check_voicehelper_security.ps1"), "-Root", $root)) `
+    -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "check_dicta_security.ps1"), "-Root", $root)) `
     -BlockingExitCodes @(1, 999)
 
 Invoke-ReportCommand `
@@ -234,15 +234,15 @@ Invoke-ReportCommand `
     -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "check_firewall_block.ps1"), "-ProgramPath", $program)) `
     -BlockingExitCodes @()
 
-Write-Section "Temporary VoiceHelper Files"
+Write-Section "Temporary Dicta Files"
 $leftovers = @()
-foreach ($pattern in @("voicehelper_*.wav", "voicehelper_*_out.txt")) {
+foreach ($pattern in @("dicta_*.wav", "dicta_*_out.txt")) {
     $leftovers += Get-ChildItem -Path $env:TEMP -Filter $pattern -ErrorAction SilentlyContinue
 }
 if ($leftovers.Count -eq 0) {
-    Write-Check -Level "OK" -Message "No VoiceHelper WAV/TXT leftovers found in TEMP."
+    Write-Check -Level "OK" -Message "No Dicta WAV/TXT leftovers found in TEMP."
 } else {
-    Write-Check -Level "WARN" -Message "VoiceHelper temporary leftovers found in TEMP."
+    Write-Check -Level "WARN" -Message "Dicta temporary leftovers found in TEMP."
     foreach ($item in $leftovers) {
         Write-ReportLine "       $($item.FullName) ($($item.Length) bytes)"
     }
@@ -255,7 +255,7 @@ if ($SkipNetworkAudit) {
     Invoke-ReportCommand `
         -Title "Network audit" `
         -FilePath "powershell" `
-        -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "audit_voicehelper_network.ps1"), "-ProgramPath", $program, "-Seconds", "$NetworkSeconds")) `
+        -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "audit_dicta_network.ps1"), "-ProgramPath", $program, "-Seconds", "$NetworkSeconds")) `
         -BlockingExitCodes @()
 }
 
