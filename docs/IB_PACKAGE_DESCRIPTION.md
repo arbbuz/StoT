@@ -14,6 +14,8 @@ VoiceHelper - локальное Windows-приложение для дикто�
 ```text
 VoiceHelper/
   VoiceHelper.exe
+  manifest.json
+  SHA256SUMS.txt
   assets/
     app_icon.ico
     app_icon.png
@@ -27,10 +29,15 @@ VoiceHelper/
     STAGE_0_3_SPEED.md
     STAGE_0_4_CONVENIENCE.md
     STAGE_0_5_PERFORMANCE.md
+    STAGE_1_0_CORPORATE_PILOT.md
+    UPDATE_PROCEDURE.md
     USER_CHECKLIST.md
   scripts/
     diagnose_voicehelper.cmd
     diagnose_voicehelper.ps1
+    verify_voicehelper_package.cmd
+    verify_voicehelper_package.ps1
+    generate_voicehelper_manifest.ps1
     benchmark_voicehelper_models.cmd
     benchmark_voicehelper_models.ps1
     compare_voicehelper_backends.cmd
@@ -74,6 +81,8 @@ VoiceHelper/
 | Компонент | Назначение |
 |---|---|
 | `VoiceHelper.exe` | Основное GUI-приложение. Записывает звук с микрофона, запускает локальный `whisper-cli.exe`, показывает распознанный текст. |
+| `manifest.json` | Машинно-читаемый состав поставки: версия пакета, тип пакета, дата генерации, исходный commit и список файлов с SHA256. |
+| `SHA256SUMS.txt` | Контрольные SHA256-суммы файлов code-only поставки. Используется скриптом `verify_voicehelper_package.ps1`. |
 | `_internal/` | Runtime PyInstaller: Python, Tkinter, sounddevice, CFFI и служебные DLL. Нужен для запуска без установки Python на ПК. |
 | `models/*.bin` | Локальные модели Whisper в формате ggml. Это веса модели, не пользовательские данные и не журналы. В GitHub Actions code-only artifact не входят и копируются вручную рядом с `VoiceHelper.exe`. |
 | `.tools/whisper.cpp-build-compat/bin/whisper-cli.exe` | Локальный scalar compat backend whisper.cpp без AVX/AVX2/FMA/F16C/SSE4.2/BMI2. Работает как fallback на старых CPU. |
@@ -85,6 +94,9 @@ VoiceHelper/
 | `docs/` | Документация для ИБ и пользователя. |
 | `scripts/diagnose_voicehelper.ps1` | Единая диагностика: состав поставки, хэши, self-test, аудиоустройства, орфография, firewall, временные файлы, сетевой аудит. |
 | `scripts/diagnose_voicehelper.cmd` | Запуск единой диагностики двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/verify_voicehelper_package.ps1` | Проверяет `manifest.json` и SHA256-суммы файлов поставки без запуска GUI. |
+| `scripts/verify_voicehelper_package.cmd` | Запуск проверки целостности двойным кликом; окно остается открытым до нажатия клавиши. |
+| `scripts/generate_voicehelper_manifest.ps1` | Создает `manifest.json` и `SHA256SUMS.txt` во время сборки поставки. |
 | `scripts/benchmark_voicehelper_models.ps1` | Локальный бенчмарк моделей для выбора профиля скорости. |
 | `scripts/benchmark_voicehelper_models.cmd` | Запуск бенчмарка двойным кликом; окно остается открытым до нажатия клавиши. |
 | `scripts/compare_voicehelper_backends.ps1` | Локальное сравнение backend `whisper.cpp`; если вручную подготовлен `faster-whisper`, показывает его как experimental result. |
@@ -161,6 +173,7 @@ Firewall-правило привязано к конкретному пути `V
 
 ```text
 scripts\diagnose_voicehelper.cmd
+scripts\verify_voicehelper_package.cmd
 scripts\check_firewall_block.cmd
 scripts\check_russian_spellcheck.cmd
 scripts\check_voicehelper_security.cmd
@@ -171,6 +184,7 @@ scripts\audit_voicehelper_network.cmd
 
 ```powershell
 .\scripts\diagnose_voicehelper.ps1 -Root "."
+.\scripts\verify_voicehelper_package.ps1 -Root "."
 .\scripts\check_firewall_block.ps1
 .\scripts\check_russian_spellcheck.ps1
 .\scripts\check_voicehelper_security.ps1 -Root "."
@@ -180,6 +194,8 @@ scripts\audit_voicehelper_network.cmd
 `check_firewall_block.ps1` должен вернуть `[OK] Outbound firewall block is enabled for this exact VoiceHelper.exe.` после нажатия "Блокировать сеть" в приложении и подтверждения UAC.
 
 `diagnose_voicehelper.ps1` сохраняет полный отчет в `diagnostics\voicehelper_diagnostic_YYYYMMDD_HHMMSS.txt`. Отчет можно передать ИБ или разработчику без скриншотов окна.
+
+`verify_voicehelper_package.ps1` проверяет хэши code-only файлов из `SHA256SUMS.txt`. Если после проверки в `models` вручную добавлены `.bin` модели, скрипт может показать предупреждение о дополнительных файлах; это не означает изменение code-only артефакта.
 
 ## Важные ограничения
 

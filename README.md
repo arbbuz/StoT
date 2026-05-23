@@ -43,6 +43,19 @@ models\ggml-base-q5_1.bin
 models\ggml-small-q5_1.bin
 ```
 
+В поставке 1.0 дополнительно создаются:
+
+```text
+manifest.json
+SHA256SUMS.txt
+```
+
+Проверка целостности code-only пакета:
+
+```powershell
+.\scripts\verify_voicehelper_package.ps1 -Root ".\dist\VoiceHelper"
+```
+
 ## Что делает текущий MVP
 
 - записывает звук с микрофона;
@@ -110,6 +123,12 @@ models\ggml-small-q5_1.bin
 .\scripts\check_voicehelper_security.ps1 -Root ".\dist\VoiceHelper"
 ```
 
+Для проверки manifest и SHA256:
+
+```powershell
+.\scripts\verify_voicehelper_package.ps1 -Root ".\dist\VoiceHelper"
+```
+
 Для наблюдения сетевой активности запущенного приложения:
 
 ```powershell
@@ -142,6 +161,7 @@ GPU backend и `faster-whisper` являются optional. Если рядом �
 
 ## Документы пилота
 
-- `pilot_user_instruction.tmp.md` - инструкция для руководителя.
-- `pilot_feedback_log.tmp.md` - журнал обратной связи.
-- `security_package_description.tmp.md` - состав поставки и пояснения для ИБ.
+- `docs\USER_CHECKLIST.md` - короткая инструкция и чек-лист пользователя.
+- `docs\IB_PACKAGE_DESCRIPTION.md` - состав поставки и пояснения для ИБ.
+- `docs\UPDATE_PROCEDURE.md` - процедура обновления и отката.
+- `docs\STAGE_1_0_CORPORATE_PILOT.md` - изменения версии 1.0.

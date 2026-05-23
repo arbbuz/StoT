@@ -162,6 +162,8 @@ try {
 
 Write-Section "Required Files"
 Test-RequiredFile -RelativePath "VoiceHelper.exe" -Hash
+Test-RequiredFile -RelativePath "manifest.json" -Hash
+Test-RequiredFile -RelativePath "SHA256SUMS.txt"
 Test-RequiredFile -RelativePath ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe" -Hash
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-avx2\bin\whisper-cli.exe"
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-vulkan\bin\whisper-cli.exe"
@@ -185,6 +187,8 @@ Test-RequiredFile -RelativePath "scripts\benchmark_voicehelper_models.cmd"
 Test-RequiredFile -RelativePath "scripts\benchmark_voicehelper_models.ps1"
 Test-RequiredFile -RelativePath "scripts\compare_voicehelper_backends.cmd"
 Test-RequiredFile -RelativePath "scripts\compare_voicehelper_backends.ps1"
+Test-RequiredFile -RelativePath "scripts\verify_voicehelper_package.cmd"
+Test-RequiredFile -RelativePath "scripts\verify_voicehelper_package.ps1"
 
 $program = Join-Path $root "VoiceHelper.exe"
 $powershellArgsPrefix = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File")
@@ -199,6 +203,12 @@ if (Test-Path -LiteralPath $program) {
     Write-Section "VoiceHelper self-test"
     Write-Check -Level "FAIL" -Message "VoiceHelper.exe is missing, self-test skipped." -Blocking
 }
+
+Invoke-ReportCommand `
+    -Title "Package manifest and SHA256 verification" `
+    -FilePath "powershell" `
+    -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "verify_voicehelper_package.ps1"), "-Root", $root)) `
+    -BlockingExitCodes @(1, 999)
 
 Invoke-ReportCommand `
     -Title "Audio devices visible to VoiceHelper" `

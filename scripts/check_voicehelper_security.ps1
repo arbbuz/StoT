@@ -10,6 +10,9 @@ if ([string]::IsNullOrWhiteSpace($Root)) {
     $root = Resolve-Path -LiteralPath $Root
 }
 $whisper = Join-Path $root ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe"
+$manifest = Join-Path $root "manifest.json"
+$shaSums = Join-Path $root "SHA256SUMS.txt"
+$verifyScript = Join-Path $root "scripts\verify_voicehelper_package.ps1"
 $models = @(
     Join-Path $root "models\ggml-tiny-q5_1.bin"
     Join-Path $root "models\ggml-base-q5_1.bin"
@@ -31,6 +34,31 @@ if (Test-Path -LiteralPath $whisper) {
 } else {
     Write-Host "[FAIL] whisper-cli not found: $whisper"
     $ok = $false
+}
+
+if (Test-Path -LiteralPath $manifest) {
+    Write-Host "[OK] manifest found: $manifest"
+} else {
+    Write-Host "[FAIL] manifest not found: $manifest"
+    $ok = $false
+}
+
+if (Test-Path -LiteralPath $shaSums) {
+    Write-Host "[OK] SHA256SUMS found: $shaSums"
+} else {
+    Write-Host "[FAIL] SHA256SUMS not found: $shaSums"
+    $ok = $false
+}
+
+if (Test-Path -LiteralPath $verifyScript) {
+    Write-Host ""
+    Write-Host "Package manifest verification:"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $verifyScript -Root $root
+    if ($LASTEXITCODE -ne 0) {
+        $ok = $false
+    }
+} else {
+    Write-Host "[WARN] package verification script not found: $verifyScript"
 }
 
 foreach ($model in $models) {

@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipModels
+    [switch]$SkipModels,
+    [string]$PackageVersion = "1.0-pilot"
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,6 +82,8 @@ Copy-Item -LiteralPath `
     "docs\STAGE_0_3_SPEED.md", `
     "docs\STAGE_0_4_CONVENIENCE.md", `
     "docs\STAGE_0_5_PERFORMANCE.md", `
+    "docs\STAGE_1_0_CORPORATE_PILOT.md", `
+    "docs\UPDATE_PROCEDURE.md", `
     "docs\USER_CHECKLIST.md" `
     -Destination "$dist\docs" `
     -Force
@@ -94,6 +97,9 @@ Copy-Item -LiteralPath `
     "scripts\check_russian_spellcheck.cmd", `
     "scripts\diagnose_voicehelper.ps1", `
     "scripts\diagnose_voicehelper.cmd", `
+    "scripts\generate_voicehelper_manifest.ps1", `
+    "scripts\verify_voicehelper_package.ps1", `
+    "scripts\verify_voicehelper_package.cmd", `
     "scripts\benchmark_voicehelper_models.ps1", `
     "scripts\benchmark_voicehelper_models.cmd", `
     "scripts\compare_voicehelper_backends.ps1", `
@@ -104,6 +110,21 @@ Copy-Item -LiteralPath `
     "scripts\audit_voicehelper_network.cmd" `
     -Destination "$dist\scripts" `
     -Force
+
+$sourceCommit = ""
+try {
+    $sourceCommit = (git rev-parse HEAD 2>$null).Trim()
+} catch {
+    $sourceCommit = ""
+}
+
+& ".\scripts\generate_voicehelper_manifest.ps1" `
+    -Root $dist `
+    -PackageVersion $PackageVersion `
+    -SourceCommit $sourceCommit `
+    -CodeOnly:$SkipModels
+
+& "$dist\scripts\verify_voicehelper_package.ps1" -Root $dist
 
 if ($SkipModels) {
     & "$dist\VoiceHelper.exe" --self-test --allow-missing-models

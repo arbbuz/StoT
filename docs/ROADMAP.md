@@ -178,3 +178,12 @@
 - Сравнение backend через `scripts\compare_voicehelper_backends.cmd`.
 - Experimental optional comparison с `faster-whisper` без замены текущего `whisper.cpp`.
 - Выбор backend в интерфейсе и режим "Авто" с автоподбором по backend-бенчмарку.
+
+## Выполнено по версии 1.0
+
+- `manifest.json` и `SHA256SUMS.txt` создаются при сборке поставки.
+- `scripts\verify_voicehelper_package.cmd` проверяет целостность code-only пакета по SHA256.
+- `scripts\diagnose_voicehelper.cmd` включает проверку manifest/SHA256.
+- Добавлена процедура обновления и отката `docs\UPDATE_PROCEDURE.md`.
+- Добавлено описание корпоративного пилота `docs\STAGE_1_0_CORPORATE_PILOT.md`.
+- GitHub Actions artifact остается code-only без `models\*.bin`; модели копируются вручную в `models` рядом с `VoiceHelper.exe`.
