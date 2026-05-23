@@ -793,7 +793,9 @@ class VoiceHelperApp:
         self.text.grid(row=0, column=0, sticky="nsew")
         self.text.tag_configure("spelling_error", underline=True)
         self.text.bind("<<Modified>>", self._on_text_modified)
-        self.text.bind("<Button-3>", self._show_spelling_menu)
+        self.text.bind("<Button-3>", self._show_text_context_menu)
+        self.text.bind("<Menu>", self._show_text_context_menu)
+        self.text.bind("<Shift-F10>", self._show_text_context_menu)
 
         scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.text.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -1488,6 +1490,74 @@ class VoiceHelperApp:
         self._copy_value_to_clipboard(value)
         self._set_status("Скопировано")
 
+    def _has_text_selection(self) -> bool:
+        try:
+            self.text.index(tk.SEL_FIRST)
+            self.text.index(tk.SEL_LAST)
+            return True
+        except tk.TclError:
+            return False
+
+    def _is_index_in_selection(self, index: str) -> bool:
+        if not self._has_text_selection():
+            return False
+        return bool(
+            self.text.compare(index, ">=", tk.SEL_FIRST)
+            and self.text.compare(index, "<", tk.SEL_LAST)
+        )
+
+    def _clipboard_has_text(self) -> bool:
+        try:
+            return bool(self.root.clipboard_get())
+        except tk.TclError:
+            return False
+
+    def _reset_format_undo(self) -> None:
+        self.format_undo_snapshot = None
+        self.format_button.configure(text="Автоформат")
+
+    def _copy_selection(self) -> None:
+        if not self._has_text_selection():
+            return
+        value = self.text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        self._copy_value_to_clipboard(value)
+        self._set_status("Скопировано")
+
+    def _cut_selection(self) -> None:
+        if not self._has_text_selection():
+            return
+        value = self.text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        self._copy_value_to_clipboard(value)
+        self.text.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        self._reset_format_undo()
+        self._set_status("Вырезано")
+        self._schedule_spellcheck(delay_ms=150)
+
+    def _paste_clipboard(self) -> None:
+        try:
+            value = self.root.clipboard_get()
+        except tk.TclError:
+            return
+        if not value:
+            return
+        if self._has_text_selection():
+            insert_index = self.text.index(tk.SEL_FIRST)
+            self.text.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            self.text.mark_set(tk.INSERT, insert_index)
+        self.text.insert(tk.INSERT, value)
+        self._reset_format_undo()
+        self._set_status("Вставлено")
+        self._schedule_spellcheck(delay_ms=150)
+
+    def _select_all_text(self) -> None:
+        if not self.text.get("1.0", tk.END).strip():
+            return
+        self.text.tag_add(tk.SEL, "1.0", "end-1c")
+        self.text.mark_set(tk.INSERT, "end-1c")
+        self.text.see(tk.INSERT)
+        self.text.focus_set()
+        self._set_status("Текст выделен")
+
     def format_current_text(self) -> None:
         value = self.text.get("1.0", tk.END).strip()
         if not value:
@@ -1588,27 +1658,65 @@ class VoiceHelperApp:
             self.text.tag_add(tag_name, start, end)
             self.spelling_issues[tag_name] = issue
 
-    def _show_spelling_menu(self, event) -> str | None:
-        index = self.text.index(f"@{event.x},{event.y}")
-        issue_tag = next((tag for tag in self.text.tag_names(index) if tag in self.spelling_issues), None)
-        if issue_tag is None:
-            return None
+    def _context_menu_position(self, event, index: str) -> tuple[int, int]:
+        x_root = getattr(event, "x_root", 0)
+        y_root = getattr(event, "y_root", 0)
+        if x_root and y_root:
+            return int(x_root), int(y_root)
 
-        issue = self.spelling_issues[issue_tag]
-        menu = tk.Menu(self.root, tearoff=False)
-        if issue.suggestions:
-            for suggestion in issue.suggestions:
-                menu.add_command(
-                    label=suggestion,
-                    command=lambda value=suggestion, tag=issue_tag: self._replace_spelling_issue(tag, value),
-                )
+        bbox = self.text.bbox(index)
+        if bbox is None:
+            return self.text.winfo_rootx() + 12, self.text.winfo_rooty() + 12
+        x, y, _width, height = bbox
+        return self.text.winfo_rootx() + x, self.text.winfo_rooty() + y + height
+
+    def _show_text_context_menu(self, event) -> str:
+        is_mouse_event = bool(getattr(event, "x_root", 0) and getattr(event, "y_root", 0))
+        if is_mouse_event:
+            index = self.text.index(f"@{event.x},{event.y}")
         else:
-            menu.add_command(label="Нет вариантов", state=tk.DISABLED)
+            index = self.text.index(tk.INSERT)
 
+        if not self._is_index_in_selection(index):
+            self.text.tag_remove(tk.SEL, "1.0", tk.END)
+            self.text.mark_set(tk.INSERT, index)
+        self.text.focus_set()
+
+        issue_tag = next((tag for tag in self.text.tag_names(index) if tag in self.spelling_issues), None)
+        menu = tk.Menu(self.root, tearoff=False)
+
+        if issue_tag is not None:
+            issue = self.spelling_issues[issue_tag]
+            if issue.suggestions:
+                for suggestion in issue.suggestions:
+                    menu.add_command(
+                        label=suggestion,
+                        command=lambda value=suggestion, tag=issue_tag: self._replace_spelling_issue(tag, value),
+                    )
+            else:
+                menu.add_command(label="Нет вариантов", state=tk.DISABLED)
+
+            menu.add_separator()
+            menu.add_command(label="Добавить в словарь", command=lambda tag=issue_tag: self._add_spelling_word(tag))
+            menu.add_command(label="Пропустить", command=lambda tag=issue_tag: self._ignore_spelling_issue(tag))
+            menu.add_separator()
+
+        has_selection = self._has_text_selection()
+        has_text = bool(self.text.get("1.0", tk.END).strip())
+        can_paste = self._clipboard_has_text()
+        selection_state = tk.NORMAL if has_selection else tk.DISABLED
+
+        menu.add_command(label="Вырезать", command=self._cut_selection, state=selection_state)
+        menu.add_command(label="Копировать", command=self._copy_selection, state=selection_state)
+        menu.add_command(label="Вставить", command=self._paste_clipboard, state=tk.NORMAL if can_paste else tk.DISABLED)
         menu.add_separator()
-        menu.add_command(label="Добавить в словарь", command=lambda tag=issue_tag: self._add_spelling_word(tag))
-        menu.add_command(label="Пропустить", command=lambda tag=issue_tag: self._ignore_spelling_issue(tag))
-        menu.tk_popup(event.x_root, event.y_root)
+        menu.add_command(label="Выделить всё", command=self._select_all_text, state=tk.NORMAL if has_text else tk.DISABLED)
+
+        x_root, y_root = self._context_menu_position(event, index)
+        try:
+            menu.tk_popup(x_root, y_root)
+        finally:
+            menu.grab_release()
         return "break"
 
     def _replace_spelling_issue(self, tag_name: str, replacement: str) -> None:
