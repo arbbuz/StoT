@@ -88,16 +88,15 @@ Reason:
 - Some WASAPI devices accept stream construction for an unsupported format, then fail only on `start()` with `AUDCLNT_E_UNSUPPORTED_FORMAT`.
 - Selecting a WDM-KS fallback that opens but stays silent makes the UI look like Dicta chose the wrong microphone.
 
-## 2026-05-24: Settings Save And Cancel Stay In Window
+## 2026-05-24: Settings Save And Cancel Close Window
 
 Decision:
 
 - Add "Сохранить" and "Отмена" buttons to the settings window footer.
-- Pressing either button must not close the settings window.
-- "Сохранить" writes the supported user settings to `settings.json` and updates the in-memory rollback snapshot.
-- "Отмена" restores visible settings controls to the last saved snapshot.
+- "Сохранить" writes the supported user settings to `settings.json`, updates the in-memory rollback snapshot, and closes the settings window after a successful save.
+- "Отмена" restores visible settings controls to the last saved snapshot and closes the settings window.
 - Text checkboxes and backend selection no longer auto-save immediately on every click/change.
 
 Reason:
 
-- Users need a clear way to try settings changes, save them deliberately, or undo the latest unsaved changes without losing the open settings context.
+- Users need a clear, visible result after pressing footer buttons; closing the settings window makes it obvious that save/cancel was applied.

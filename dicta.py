@@ -2077,7 +2077,7 @@ class DictaApp:
         self.worker = threading.Thread(target=self._recognize_audio, daemon=True)
         self.worker.start()
 
-    def _save_current_settings(self) -> None:
+    def _save_current_settings(self) -> bool:
         settings = {
             "auto_copy": self.auto_copy_var.get(),
             "format_text": self.format_text_var.get(),
@@ -2089,8 +2089,10 @@ class DictaApp:
             self.settings = load_user_settings()
             self.settings_snapshot = self._capture_settings_state()
             self._set_status("Настройки сохранены")
+            return True
         except Exception as exc:
             self._set_status(f"Не удалось сохранить настройки: {exc}")
+            return False
 
     def _capture_settings_state(self) -> dict[str, object]:
         return {
@@ -2116,11 +2118,13 @@ class DictaApp:
         self._update_speed_status()
 
     def save_settings_changes(self) -> None:
-        self._save_current_settings()
+        if self._save_current_settings():
+            self.hide_settings()
 
     def cancel_settings_changes(self) -> None:
         self._restore_settings_state(self.settings_snapshot)
         self._set_status("Изменения настроек отменены")
+        self.hide_settings()
 
     def _copy_value_to_clipboard(self, value: str) -> None:
         self.root.clipboard_clear()

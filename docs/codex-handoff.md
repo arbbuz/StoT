@@ -20,7 +20,7 @@ Packaged app: `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`
 - Follow-up fix: input modes are now accepted only after `RawInputStream.start()` succeeds, and "Найти микрофон" no longer switches selection to a silent fallback device.
 - Follow-up UI fix: the search progressbar is cleared when "Проверить" starts/finishes and when microphone search completes, so it does not look like a stuck level meter.
 - Follow-up UI fix: the settings-tab bar is now bound to the actual microphone level, not to internal search progress.
-- Follow-up settings UI: added "Сохранить" and "Отмена" buttons in the settings window; they save or restore settings without closing the window.
+- Follow-up settings UI: added "Сохранить" and "Отмена" buttons in the settings window; they save or restore settings, then close the window.
 - `scripts\diagnose_dicta.ps1`: added "Microphone quick open test" and redirected windowed `Dicta.exe` stdout/stderr through `Start-Process`.
 - `docs\USER_CHECKLIST.md`, `docs\STAGE_0_2_1_MICROPHONE.md`, `docs\STAGE_0_2_2_DIAGNOSTICS.md`: updated for microphone search and diagnostics.
 - `AGENTS.md`, `docs\codex-handoff.md`, `docs\plans.md`, `docs\decision-log.md`: split global/project Codex rules and created Dicta-specific continuity docs.
@@ -38,8 +38,8 @@ Packaged app: `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`
 
 Latest successful build log:
 
-- `artifacts\build_dicta_20260524_124454.stdout.log`
-- `artifacts\build_dicta_20260524_124454.stderr.log`
+- `artifacts\build_dicta_20260524_133834.stdout.log`
+- `artifacts\build_dicta_20260524_133834.stderr.log`
 
 Latest successful dist diagnostic log:
 
