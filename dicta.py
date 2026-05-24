@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import wave
+from array import array
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -73,6 +74,9 @@ FALLBACK_AUTO_MODEL_KEY = "base-q5_1"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
+INPUT_SAMPLE_RATE_FALLBACKS = (48000, 44100, 32000)
+MICROPHONE_PROBE_SECONDS = 1.5
+MICROPHONE_WORKING_PEAK_PERCENT = 3
 SILENCE_WINDOW_MS = 30
 SILENCE_PADDING_MS = 250
 SILENCE_PEAK_THRESHOLD = 350
@@ -104,6 +108,389 @@ DEFAULT_USER_SETTINGS = {
     "voice_punctuation": True,
     "backend": "auto",
 }
+
+
+def clean_input_device_name(name: str) -> str:
+    return " ".join(name.replace("  ", " ").strip().split())
+
+
+def is_system_input_alias(name: str) -> bool:
+    normalized = name.lower()
+    aliases = (
+        "microsoft sound mapper",
+        "primary sound capture",
+        "первичный драйвер записи",
+    )
+    return any(alias in normalized for alias in aliases)
+
+
+def is_low_level_input_backend(hostapi_name: str) -> bool:
+    return "wdm-ks" in hostapi_name.lower()
+
+
+def input_device_hostapi_name(device: dict, hostapis: object | None = None) -> str:
+    try:
+        if hostapis is None:
+            hostapis = sd.query_hostapis()
+        return str(hostapis[int(device["hostapi"])]["name"])
+    except Exception:
+        return ""
+
+
+def input_device_default_sample_rate(device_index: int) -> int:
+    try:
+        device = sd.query_devices(device_index, "input")
+        sample_rate = int(float(device.get("default_samplerate", SAMPLE_RATE)))
+        return sample_rate if sample_rate > 0 else SAMPLE_RATE
+    except Exception:
+        return SAMPLE_RATE
+
+
+def input_device_sample_rates(device_index: int) -> list[int]:
+    candidates = [
+        SAMPLE_RATE,
+        input_device_default_sample_rate(device_index),
+        *INPUT_SAMPLE_RATE_FALLBACKS,
+    ]
+    sample_rates: list[int] = []
+    for sample_rate in candidates:
+        try:
+            sample_rate = int(sample_rate)
+        except Exception:
+            continue
+        if sample_rate > 0 and sample_rate not in sample_rates:
+            sample_rates.append(sample_rate)
+    return sample_rates or [SAMPLE_RATE]
+
+
+def input_device_channel_counts(device_index: int) -> list[int]:
+    try:
+        device = sd.query_devices(device_index, "input")
+        max_channels = int(device.get("max_input_channels", 0))
+    except Exception:
+        max_channels = 0
+
+    channel_counts = [CHANNELS]
+    if max_channels >= 2 and 2 not in channel_counts:
+        channel_counts.append(2)
+    return channel_counts
+
+
+def input_device_priority(device_index: int) -> int:
+    try:
+        device = sd.query_devices(device_index, "input")
+        hostapi_name = input_device_hostapi_name(device).lower()
+    except Exception:
+        return 99
+
+    if "wasapi" in hostapi_name:
+        return 0
+    if "directsound" in hostapi_name:
+        return 1
+    if "mme" in hostapi_name:
+        return 2
+    if "wdm-ks" in hostapi_name:
+        return 3
+    return 10
+
+
+def describe_input_device(device_index: int) -> str:
+    try:
+        device = sd.query_devices(device_index, "input")
+        name = clean_input_device_name(str(device.get("name", f"device {device_index}")))
+        hostapi_name = input_device_hostapi_name(device)
+    except Exception:
+        return f"device {device_index}"
+    return f"#{device_index} {name}" + (f" [{hostapi_name}]" if hostapi_name else "")
+
+
+def collect_input_device_groups() -> tuple[list[str], dict[str, list[int]], int | None]:
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+
+    default_input = None
+    try:
+        candidate = sd.default.device[0]
+        if isinstance(candidate, int) and candidate >= 0:
+            default_input = candidate
+    except Exception:
+        default_input = None
+
+    visible_grouped: dict[str, list[int]] = {}
+    fallback_grouped: dict[str, list[int]] = {}
+    device_is_default: dict[str, bool] = {}
+
+    for index, device in enumerate(devices):
+        if int(device.get("max_input_channels", 0)) <= 0:
+            continue
+        name = str(device.get("name", ""))
+        if is_system_input_alias(name):
+            continue
+        hostapi_name = input_device_hostapi_name(device, hostapis)
+        display_name = clean_input_device_name(name)
+        if not display_name:
+            display_name = f"device {index}"
+
+        if is_low_level_input_backend(hostapi_name):
+            fallback_grouped.setdefault(display_name, []).append(index)
+        else:
+            visible_grouped.setdefault(display_name, []).append(index)
+
+        if index == default_input:
+            device_is_default[display_name] = True
+
+    input_devices: dict[str, list[int]] = {}
+    labels: list[str] = []
+
+    def sort_names(names: list[str]) -> list[str]:
+        return sorted(names, key=lambda name: (not device_is_default.get(name, False), name.lower()))
+
+    def add_group(name: str, indexes: list[int], fallback_only: bool = False) -> None:
+        unique_indexes: list[int] = []
+        for index in indexes:
+            if index not in unique_indexes:
+                unique_indexes.append(index)
+        unique_indexes.sort(key=input_device_priority)
+        marker = " (по умолчанию)" if device_is_default.get(name, False) else ""
+        fallback_marker = " (тех. fallback)" if fallback_only else ""
+        label = f"{name}{marker}{fallback_marker}"
+        labels.append(label)
+        input_devices[label] = unique_indexes
+
+    if visible_grouped:
+        for name in sort_names(list(visible_grouped)):
+            visible_indexes = sorted(visible_grouped[name], key=input_device_priority)
+            fallback_indexes = sorted(fallback_grouped.get(name, []), key=input_device_priority)
+            add_group(name, visible_indexes + fallback_indexes)
+
+        fallback_only_names = [name for name in fallback_grouped if name not in visible_grouped]
+        for name in sort_names(fallback_only_names):
+            add_group(name, fallback_grouped[name], fallback_only=True)
+    else:
+        for name in sort_names(list(fallback_grouped)):
+            add_group(name, fallback_grouped[name])
+
+    return labels, input_devices, default_input
+
+
+def downmix_pcm16_to_mono(audio: bytes, source_channels: int) -> bytes:
+    if source_channels <= CHANNELS:
+        return bytes(audio)
+
+    frame_width = SAMPLE_WIDTH_BYTES * source_channels
+    usable_length = len(audio) - (len(audio) % frame_width)
+    if usable_length < frame_width:
+        return b""
+
+    samples = memoryview(audio[:usable_length]).cast("h")
+    mono = array("h")
+    for start in range(0, len(samples), source_channels):
+        total = 0
+        for offset in range(source_channels):
+            total += int(samples[start + offset])
+        mono.append(int(total / source_channels))
+    return mono.tobytes()
+
+
+def audio_peak_percent(audio: bytes) -> int:
+    if len(audio) < SAMPLE_WIDTH_BYTES:
+        return 0
+    try:
+        samples = memoryview(audio).cast("h")
+        peak = max(abs(sample) for sample in samples)
+    except Exception:
+        return 0
+    return min(100, int(round(peak * 100 / 32767)))
+
+
+def input_stream_config_text(config: dict | None) -> str:
+    if not config:
+        return "режим неизвестен"
+    source_channels = int(config.get("source_channels", CHANNELS))
+    channel_text = "1 канал" if source_channels == 1 else f"{source_channels}->1 канал"
+    return f"{config.get('description', 'device')}, {config.get('sample_rate', SAMPLE_RATE)} Hz, {channel_text}"
+
+
+def _mono_input_callback(callback, source_channels: int):
+    def wrapper(indata, frames, time_info, status) -> None:
+        data = bytes(indata)
+        if source_channels > CHANNELS:
+            data = downmix_pcm16_to_mono(data, source_channels)
+        callback(data, frames, time_info, status)
+
+    return wrapper
+
+
+def open_dicta_input_stream(device_indexes: list[int], callback, start: bool = False) -> tuple[sd.RawInputStream, dict]:
+    if not device_indexes:
+        raise RuntimeError("Не найден доступный микрофон в списке Dicta.")
+
+    errors: list[str] = []
+    for device_index in device_indexes:
+        description = describe_input_device(device_index)
+        for sample_rate in input_device_sample_rates(device_index):
+            for source_channels in input_device_channel_counts(device_index):
+                try:
+                    stream = sd.RawInputStream(
+                        device=device_index,
+                        samplerate=sample_rate,
+                        channels=source_channels,
+                        dtype="int16",
+                        callback=_mono_input_callback(callback, source_channels),
+                    )
+                    config = {
+                        "device_index": device_index,
+                        "description": description,
+                        "sample_rate": sample_rate,
+                        "source_channels": source_channels,
+                        "channels": CHANNELS,
+                    }
+                    if start:
+                        try:
+                            stream.start()
+                        except Exception as exc:
+                            errors.append(f"{description}, {sample_rate} Hz, {source_channels} ch start: {exc}")
+                            try:
+                                stream.close()
+                            except Exception:
+                                pass
+                            continue
+                    return stream, config
+                except Exception as exc:
+                    errors.append(f"{description}, {sample_rate} Hz, {source_channels} ch open: {exc}")
+
+    raise RuntimeError("\n".join(errors[-12:]) or "Не удалось открыть выбранный микрофон.")
+
+
+def probe_input_device_group(
+    device_indexes: list[int],
+    seconds: float = MICROPHONE_PROBE_SECONDS,
+    level_callback=None,
+) -> dict:
+    peak = 0
+    stream_statuses: list[str] = []
+    lock = threading.Lock()
+    stream: sd.RawInputStream | None = None
+    config: dict | None = None
+
+    def callback(indata, frames, time_info, status) -> None:
+        nonlocal peak
+        if status:
+            with lock:
+                stream_statuses.append(str(status))
+        level = audio_peak_percent(bytes(indata))
+        with lock:
+            peak = max(peak, level)
+        if level_callback is not None:
+            level_callback(level)
+
+    try:
+        stream, config = open_dicta_input_stream(device_indexes, callback, start=True)
+        deadline = time.perf_counter() + max(0.2, float(seconds))
+        while time.perf_counter() < deadline:
+            time.sleep(0.05)
+        with lock:
+            peak_value = peak
+            status_text = "; ".join(stream_statuses[-3:])
+        return {
+            "ok": peak_value >= MICROPHONE_WORKING_PEAK_PERCENT,
+            "opened": True,
+            "status": "working" if peak_value >= MICROPHONE_WORKING_PEAK_PERCENT else "silent",
+            "peak": peak_value,
+            "config": config,
+            "stream_status": status_text,
+            "seconds": seconds,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "opened": False,
+            "status": "failed",
+            "peak": 0,
+            "error": str(exc),
+            "seconds": seconds,
+        }
+    finally:
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+
+def print_audio_devices() -> None:
+    print(f"default={sd.default.device}")
+    labels, input_devices, _default_input = collect_input_device_groups()
+    print("")
+    print("Dicta grouped input devices:")
+    if not labels:
+        print("  no input devices")
+    for label in labels:
+        indexes = ", ".join(describe_input_device(index) for index in input_devices[label])
+        print(f"  {label}: {indexes}")
+    print("")
+    print("Open modes tried for each device:")
+    print(f"  sample rates: {SAMPLE_RATE}, default, {', '.join(str(rate) for rate in INPUT_SAMPLE_RATE_FALLBACKS)}")
+    print("  channels: 1, then 2 with downmix to mono when available")
+    print("")
+    print("Raw PortAudio devices:")
+    print(sd.query_devices())
+
+
+def run_microphone_diagnostics(seconds: float = MICROPHONE_PROBE_SECONDS, print_fn=print) -> list[dict]:
+    labels, input_devices, _default_input = collect_input_device_groups()
+    print_fn(f"Microphone diagnostics: {seconds:.1f}s per grouped device")
+    print_fn(f"Working threshold: peak >= {MICROPHONE_WORKING_PEAK_PERCENT}%")
+    print_fn("")
+
+    if not labels:
+        print_fn("No input devices found.")
+        return []
+
+    results: list[dict] = []
+    selected: dict | None = None
+    selected_label: str | None = None
+    best_opened: dict | None = None
+    best_opened_label: str | None = None
+
+    for position, label in enumerate(labels, start=1):
+        print_fn(f"[{position}/{len(labels)}] {label}")
+        print_fn(f"  devices: {', '.join(describe_input_device(index) for index in input_devices[label])}")
+        result = probe_input_device_group(input_devices[label], seconds=seconds)
+        result["label"] = label
+        results.append(result)
+
+        if result.get("opened"):
+            print_fn(f"  opened: {input_stream_config_text(result.get('config'))}")
+            print_fn(f"  peak:   {result.get('peak', 0)}% ({result.get('status')})")
+            if result.get("stream_status"):
+                print_fn(f"  status: {result.get('stream_status')}")
+            if best_opened is None or int(result.get("peak", 0)) > int(best_opened.get("peak", 0)):
+                best_opened = result
+                best_opened_label = label
+        else:
+            print_fn("  failed:")
+            for line in str(result.get("error", "")).splitlines()[-12:]:
+                print_fn(f"    {line}")
+
+        if result.get("ok") and selected is None:
+            selected = result
+            selected_label = label
+        print_fn("")
+
+    if selected is not None:
+        print_fn(f"Selected working microphone: {selected_label}")
+        print_fn(f"  {input_stream_config_text(selected.get('config'))}")
+        print_fn(f"  peak: {selected.get('peak', 0)}%")
+    elif best_opened is not None:
+        print_fn(f"No microphone reached the working threshold. Best opened device: {best_opened_label}")
+        print_fn(f"  {input_stream_config_text(best_opened.get('config'))}")
+        print_fn(f"  peak: {best_opened.get('peak', 0)}%")
+    else:
+        print_fn("No microphone could be opened.")
+
+    return results
 
 
 def performance_profile_path() -> Path:
@@ -847,9 +1234,11 @@ class DictaApp:
         self.is_recording = False
         self.is_recognizing = False
         self.is_testing_microphone = False
+        self.is_finding_microphone = False
         self.is_benchmarking = False
         self.record_started_at: float | None = None
         self.record_sample_rate = SAMPLE_RATE
+        self.last_input_stream_config: dict | None = None
         self.mic_test_stream: sd.RawInputStream | None = None
         self.mic_test_peak = 0
         self.last_level_event_at = 0.0
@@ -861,6 +1250,7 @@ class DictaApp:
         self.hotkey_thread: threading.Thread | None = None
         self.hotkey_thread_id: int | None = None
         self.format_undo_snapshot: tuple[str, str] | None = None
+        self.settings_snapshot: dict[str, object] = {}
 
         self.status_var = tk.StringVar(value="Готово")
         self.record_time_var = tk.StringVar(value="Запись: 00:00")
@@ -875,6 +1265,8 @@ class DictaApp:
         self.input_device_var = tk.StringVar(value="")
         self.input_level_var = tk.DoubleVar(value=0)
         self.input_level_text_var = tk.StringVar(value="Уровень: -")
+        self.microphone_search_progress_var = tk.DoubleVar(value=0)
+        self.microphone_search_status_var = tk.StringVar(value="Поиск: -")
         self.spellcheck_status_var = tk.StringVar(value="Орфография: авто")
         self.hotkey_status_var = tk.StringVar(value=f"Горячая клавиша: {HOTKEY_LABEL}")
         self.auto_copy_var = tk.BooleanVar(value=self.settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"]))
@@ -886,6 +1278,7 @@ class DictaApp:
         self._build_ui()
         self._apply_profile_selection()
         self.refresh_input_devices()
+        self.settings_snapshot = self._capture_settings_state()
         self._check_local_files()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._process_ui_queue)
@@ -967,7 +1360,7 @@ class DictaApp:
         self.settings_window.withdraw()
 
         notebook = ttk.Notebook(self.settings_window)
-        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+        notebook.pack(fill="both", expand=True, padx=12, pady=(12, 6))
 
         recording_tab = ttk.Frame(notebook, padding=12)
         text_tab = ttk.Frame(notebook, padding=12)
@@ -986,33 +1379,47 @@ class DictaApp:
             state="readonly",
             width=52,
         )
-        self.input_device_box.grid(row=0, column=1, columnspan=3, sticky="ew", pady=(0, 8))
+        self.input_device_box.grid(row=0, column=1, columnspan=4, sticky="ew", pady=(0, 8))
         self.refresh_input_button = ttk.Button(recording_tab, text="Обновить", command=self.refresh_input_devices)
         self.refresh_input_button.grid(row=1, column=1, sticky="w", padx=(0, 8))
         self.test_input_button = ttk.Button(recording_tab, text="Проверить", command=self.start_microphone_test)
-        self.test_input_button.grid(row=1, column=2, sticky="w")
+        self.test_input_button.grid(row=1, column=2, sticky="w", padx=(0, 8))
+        self.find_input_button = ttk.Button(recording_tab, text="Найти микрофон", command=self.start_microphone_search)
+        self.find_input_button.grid(row=1, column=3, sticky="w")
         ttk.Label(recording_tab, textvariable=self.input_level_text_var).grid(row=2, column=1, sticky="w", pady=(14, 0))
-        ttk.Label(recording_tab, textvariable=self.hotkey_status_var).grid(row=3, column=1, sticky="w", pady=(8, 0))
+        self.microphone_search_progress = ttk.Progressbar(
+            recording_tab,
+            variable=self.input_level_var,
+            maximum=100,
+            mode="determinate",
+            length=180,
+        )
+        self.microphone_search_progress.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 0), padx=(0, 8))
+        ttk.Label(recording_tab, textvariable=self.microphone_search_status_var).grid(
+            row=3,
+            column=3,
+            columnspan=2,
+            sticky="w",
+            pady=(10, 0),
+        )
+        ttk.Label(recording_tab, textvariable=self.hotkey_status_var).grid(row=4, column=1, sticky="w", pady=(8, 0))
 
         self.auto_copy_check = ttk.Checkbutton(
             text_tab,
             text="Автокопия",
             variable=self.auto_copy_var,
-            command=self._save_current_settings,
         )
         self.auto_copy_check.grid(row=0, column=0, sticky="w", pady=(0, 8))
         self.format_text_check = ttk.Checkbutton(
             text_tab,
             text="Форматировать",
             variable=self.format_text_var,
-            command=self._save_current_settings,
         )
         self.format_text_check.grid(row=1, column=0, sticky="w", pady=(0, 8))
         self.voice_punctuation_check = ttk.Checkbutton(
             text_tab,
             text="Команды пунктуации",
             variable=self.voice_punctuation_var,
-            command=self._save_current_settings,
         )
         self.voice_punctuation_check.grid(row=2, column=0, sticky="w", pady=(0, 12))
         ttk.Label(text_tab, textvariable=self.spellcheck_status_var).grid(row=3, column=0, sticky="w")
@@ -1064,6 +1471,14 @@ class DictaApp:
         self.firewall_unblock_button = ttk.Button(security_tab, text="Разблокировать", command=self.disable_firewall_block)
         self.firewall_unblock_button.grid(row=0, column=1, sticky="w", pady=(0, 10))
         ttk.Label(security_tab, textvariable=self.firewall_status_var).grid(row=1, column=0, columnspan=2, sticky="w")
+
+        settings_buttons = ttk.Frame(self.settings_window)
+        settings_buttons.pack(fill="x", padx=12, pady=(0, 12))
+        settings_buttons.columnconfigure(0, weight=1)
+        self.cancel_settings_button = ttk.Button(settings_buttons, text="Отмена", command=self.cancel_settings_changes)
+        self.cancel_settings_button.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.save_settings_button = ttk.Button(settings_buttons, text="Сохранить", command=self.save_settings_changes)
+        self.save_settings_button.grid(row=0, column=2, sticky="e")
 
     def show_settings(self) -> None:
         self.settings_window.deiconify()
@@ -1161,7 +1576,7 @@ class DictaApp:
         if self.is_recording:
             self.stop_recording()
             return
-        if self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
+        if self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
             return
         if self.record_button.instate(["!disabled"]):
             self.start_recording()
@@ -1188,7 +1603,6 @@ class DictaApp:
         self._update_speed_status()
 
     def _on_backend_changed(self, event=None) -> None:
-        self._save_current_settings()
         self._update_speed_status()
 
     def _apply_profile_selection(self) -> None:
@@ -1239,7 +1653,7 @@ class DictaApp:
         return backends[0][0] if backends else "нет whisper-cli"
 
     def start_model_benchmark(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
             return
 
         self.is_benchmarking = True
@@ -1252,6 +1666,10 @@ class DictaApp:
         self.benchmark_button.configure(text="Идет тест...", state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
+        self.input_device_box.configure(state=tk.DISABLED)
+        self.refresh_input_button.configure(state=tk.DISABLED)
+        self.test_input_button.configure(state=tk.DISABLED)
+        self.find_input_button.configure(state=tk.DISABLED)
         threading.Thread(target=self._benchmark_models_worker, daemon=True).start()
 
     def _benchmark_models_worker(self) -> None:
@@ -1280,7 +1698,7 @@ class DictaApp:
             self.ui_queue.put(("benchmark_ready", None))
 
     def start_backend_benchmark(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
             return
 
         self.is_benchmarking = True
@@ -1293,6 +1711,10 @@ class DictaApp:
         self.benchmark_button.configure(state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(text="Идет тест...", state=tk.DISABLED)
+        self.input_device_box.configure(state=tk.DISABLED)
+        self.refresh_input_button.configure(state=tk.DISABLED)
+        self.test_input_button.configure(state=tk.DISABLED)
+        self.find_input_button.configure(state=tk.DISABLED)
         threading.Thread(target=self._benchmark_backends_worker, daemon=True).start()
 
     def _benchmark_backends_worker(self) -> None:
@@ -1323,73 +1745,26 @@ class DictaApp:
 
     def refresh_input_devices(self) -> None:
         previous_value = self.input_device_var.get()
-        self.input_devices = {}
-        grouped_devices: dict[str, list[int]] = {}
-        device_is_default: dict[str, bool] = {}
 
         try:
-            devices = sd.query_devices()
-            hostapis = sd.query_hostapis()
+            labels, input_devices, default_input = collect_input_device_groups()
         except Exception as exc:
+            self.input_devices = {}
             self.input_device_var.set("")
             self.input_device_box.configure(values=[], state=tk.DISABLED)
             self.test_input_button.configure(state=tk.DISABLED)
+            self.find_input_button.configure(state=tk.DISABLED)
             self._set_status("Не удалось прочитать микрофоны")
             return
 
-        default_input = None
-        try:
-            candidate = sd.default.device[0]
-            if isinstance(candidate, int) and candidate >= 0:
-                default_input = candidate
-        except Exception:
-            default_input = None
-
-        visible_candidates = []
-        fallback_candidates = []
-        for index, device in enumerate(devices):
-            if int(device.get("max_input_channels", 0)) <= 0:
-                continue
-            hostapi_name = ""
-            try:
-                hostapi_name = hostapis[int(device["hostapi"])]["name"]
-            except Exception:
-                pass
-            device_info = (index, str(device["name"]), hostapi_name)
-            if self._is_low_level_input_backend(hostapi_name):
-                fallback_candidates.append(device_info)
-            elif self._is_system_input_alias(str(device["name"])):
-                continue
-            else:
-                visible_candidates.append(device_info)
-
-        candidates = visible_candidates or fallback_candidates
-        for index, name, hostapi_name in candidates:
-            if self._is_system_input_alias(name):
-                continue
-            display_name = self._clean_input_device_name(name)
-            grouped_devices.setdefault(display_name, []).append(index)
-            if index == default_input:
-                device_is_default[display_name] = True
-
-        ordered_names = sorted(
-            grouped_devices,
-            key=lambda name: (not device_is_default.get(name, False), name.lower()),
-        )
-        labels: list[str] = []
-        for name in ordered_names:
-            grouped_devices[name].sort(key=self._input_device_priority)
-            marker = " (по умолчанию)" if device_is_default.get(name, False) else ""
-            label = f"{name}{marker}"
-            labels.append(label)
-            self.input_devices[label] = grouped_devices[name]
-
+        self.input_devices = input_devices
         self.input_device_box.configure(values=labels)
         if not labels:
             self.input_device_var.set("")
             self.input_device_box.configure(state=tk.DISABLED)
             self._set_record_button_busy("Нет микрофона")
             self.test_input_button.configure(state=tk.DISABLED)
+            self.find_input_button.configure(state=tk.DISABLED)
             self._set_status("Микрофоны не найдены")
             return
 
@@ -1404,43 +1779,28 @@ class DictaApp:
 
         self.input_device_var.set(selected)
         self.input_device_box.configure(state="readonly")
-        if not (self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking):
+        if not (
+            self.is_recording
+            or self.is_recognizing
+            or self.is_testing_microphone
+            or self.is_finding_microphone
+            or self.is_benchmarking
+        ):
             self._set_record_button_idle()
         self.test_input_button.configure(state=tk.NORMAL)
+        self.find_input_button.configure(state=tk.NORMAL)
 
     def _clean_input_device_name(self, name: str) -> str:
-        return " ".join(name.replace("  ", " ").strip().split())
+        return clean_input_device_name(name)
 
     def _is_system_input_alias(self, name: str) -> bool:
-        normalized = name.lower()
-        aliases = (
-            "microsoft sound mapper",
-            "primary sound capture",
-            "первичный драйвер записи",
-        )
-        return any(alias in normalized for alias in aliases)
+        return is_system_input_alias(name)
 
     def _is_low_level_input_backend(self, hostapi_name: str) -> bool:
-        normalized = hostapi_name.lower()
-        return "wdm-ks" in normalized
+        return is_low_level_input_backend(hostapi_name)
 
     def _input_device_priority(self, device_index: int) -> int:
-        try:
-            device = sd.query_devices(device_index, "input")
-            hostapi = sd.query_hostapis(int(device["hostapi"]))
-            hostapi_name = str(hostapi["name"]).lower()
-        except Exception:
-            return 99
-
-        if "wasapi" in hostapi_name:
-            return 0
-        if "directsound" in hostapi_name:
-            return 1
-        if "mme" in hostapi_name:
-            return 2
-        if "wdm-ks" in hostapi_name:
-            return 3
-        return 10
+        return input_device_priority(device_index)
 
     def _selected_input_device_indexes(self) -> list[int]:
         label = self.input_device_var.get()
@@ -1453,17 +1813,16 @@ class DictaApp:
         raise RuntimeError("Не найден доступный микрофон в списке Dicta.")
 
     def _input_device_default_sample_rate(self, device_index: int) -> int:
-        try:
-            device = sd.query_devices(device_index, "input")
-            return int(float(device.get("default_samplerate", SAMPLE_RATE)))
-        except Exception:
-            return SAMPLE_RATE
+        return input_device_default_sample_rate(device_index)
 
     def start_microphone_test(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
             return
 
         self.mic_test_peak = 0
+        self.last_input_stream_config = None
+        self.microphone_search_progress_var.set(0)
+        self.microphone_search_status_var.set("Проверка...")
         self._set_input_level(0)
 
         try:
@@ -1471,9 +1830,10 @@ class DictaApp:
                 self._selected_input_device_indexes(),
                 callback=self._microphone_test_callback,
             )
-            self.mic_test_stream.start()
         except Exception as exc:
             self.mic_test_stream = None
+            self.microphone_search_progress_var.set(0)
+            self.microphone_search_status_var.set("Проверка: ошибка")
             self._set_status("Ошибка микрофона")
             messagebox.showerror(
                 "Dicta",
@@ -1497,6 +1857,7 @@ class DictaApp:
         self.input_device_box.configure(state=tk.DISABLED)
         self.refresh_input_button.configure(state=tk.DISABLED)
         self.test_input_button.configure(state=tk.DISABLED)
+        self.find_input_button.configure(state=tk.DISABLED)
         self.root.after(3000, self.finish_microphone_test)
 
     def finish_microphone_test(self) -> None:
@@ -1521,12 +1882,18 @@ class DictaApp:
         self.input_device_box.configure(state="readonly")
         self.refresh_input_button.configure(state=tk.NORMAL)
         self.test_input_button.configure(state=tk.NORMAL)
+        self.find_input_button.configure(state=tk.NORMAL)
+        self.microphone_search_progress_var.set(0)
 
-        if self.mic_test_peak >= 3:
+        config_text = input_stream_config_text(self.last_input_stream_config)
+        if self.mic_test_peak >= MICROPHONE_WORKING_PEAK_PERCENT:
             self._set_status(f"Микрофон работает, пик {self.mic_test_peak}%")
+            self.input_level_var.set(self.mic_test_peak)
             self.input_level_text_var.set(f"Пик: {self.mic_test_peak}%")
+            self.microphone_search_status_var.set(f"Проверен: пик {self.mic_test_peak}%")
         else:
             self._set_status("Микрофон открыт, но звук не обнаружен")
+            self.input_level_var.set(0)
             self.input_level_text_var.set("Уровень: тишина")
             messagebox.showwarning(
                 "Dicta",
@@ -1536,22 +1903,97 @@ class DictaApp:
                         "Проверьте, что выбран именно рабочий микрофон, а не линейный вход или стерео микшер.",
                         "Проверьте уровень входа в настройках Windows.",
                         "Проверьте физическую кнопку mute на гарнитуре или микрофоне.",
-                        "Нажмите Обновить и повторите Проверить.",
+                        "Нажмите Найти микрофон или Обновить и повторите Проверить.",
                     ],
+                    details=f"Открытый режим: {config_text}",
                 ),
             )
 
+    def start_microphone_search(self) -> None:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
+            return
+
+        self.refresh_input_devices()
+        groups = list(self.input_devices.items())
+        if not groups:
+            self._set_status("Микрофоны не найдены")
+            self.microphone_search_status_var.set("Поиск: нет устройств")
+            return
+
+        self.is_finding_microphone = True
+        self.mic_test_peak = 0
+        self.microphone_search_progress_var.set(0)
+        self.microphone_search_status_var.set(f"Поиск: 0/{len(groups)}")
+        self._set_input_level(0)
+        self._set_status("Поиск микрофона: говорите обычной громкостью")
+        self._set_record_button_busy("Поиск")
+        self.stop_button.configure(state=tk.DISABLED)
+        self.model_box.configure(state=tk.DISABLED)
+        self.profile_box.configure(state=tk.DISABLED)
+        self.benchmark_button.configure(state=tk.DISABLED)
+        self.backend_box.configure(state=tk.DISABLED)
+        self.backend_benchmark_button.configure(state=tk.DISABLED)
+        self.input_device_box.configure(state=tk.DISABLED)
+        self.refresh_input_button.configure(state=tk.DISABLED)
+        self.test_input_button.configure(state=tk.DISABLED)
+        self.find_input_button.configure(state=tk.DISABLED)
+        threading.Thread(target=self._find_microphone_worker, args=(groups,), daemon=True).start()
+
+    def _find_microphone_worker(self, groups: list[tuple[str, list[int]]]) -> None:
+        results: list[dict] = []
+
+        try:
+            total = len(groups)
+            for position, (label, indexes) in enumerate(groups, start=1):
+                self.ui_queue.put(("microphone_search_progress", (position - 1, total, label, 0)))
+
+                def report_level(level: int) -> None:
+                    self.ui_queue.put(("input_level", level))
+
+                result = probe_input_device_group(
+                    indexes,
+                    seconds=MICROPHONE_PROBE_SECONDS,
+                    level_callback=report_level,
+                )
+                result["label"] = label
+                results.append(result)
+                self.ui_queue.put(("microphone_search_progress", (position, total, label, result.get("peak", 0))))
+
+                if result.get("ok"):
+                    self.ui_queue.put(("microphone_search_result", (label, result, results)))
+                    return
+
+            self.ui_queue.put(("microphone_search_result", (None, None, results)))
+        finally:
+            self.ui_queue.put(("microphone_search_ready", None))
+
+    def _format_microphone_search_results(self, results: list[dict]) -> str:
+        lines: list[str] = []
+        for result in results[:10]:
+            label = str(result.get("label", "Микрофон"))
+            if result.get("opened"):
+                lines.append(
+                    f"{label}: пик {result.get('peak', 0)}%, {input_stream_config_text(result.get('config'))}"
+                )
+            else:
+                error = str(result.get("error", "")).splitlines()
+                tail = error[-1] if error else "не открылся"
+                lines.append(f"{label}: не открылся ({tail})")
+        if len(results) > 10:
+            lines.append(f"... еще {len(results) - 10} устройств")
+        return "\n".join(lines)
+
     def start_recording(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
             return
 
         self.audio_chunks = []
         self.recognition_time_var.set("Распознавание: -")
+        self.last_input_stream_config = None
         self._set_input_level(0)
 
         try:
             self.stream = self._open_input_stream(self._selected_input_device_indexes())
-            self.stream.start()
         except Exception as exc:
             self.stream = None
             self._set_status("Ошибка микрофона")
@@ -1578,24 +2020,14 @@ class DictaApp:
         self.input_device_box.configure(state=tk.DISABLED)
         self.refresh_input_button.configure(state=tk.DISABLED)
         self.test_input_button.configure(state=tk.DISABLED)
+        self.find_input_button.configure(state=tk.DISABLED)
 
     def _open_input_stream(self, device_indexes: list[int], callback=None) -> sd.RawInputStream:
-        errors: list[str] = []
         stream_callback = callback or self._audio_callback
-        for device_index in device_indexes:
-            for sample_rate in (SAMPLE_RATE, self._input_device_default_sample_rate(device_index)):
-                try:
-                    self.record_sample_rate = sample_rate
-                    return sd.RawInputStream(
-                        device=device_index,
-                        samplerate=sample_rate,
-                        channels=CHANNELS,
-                        dtype="int16",
-                        callback=stream_callback,
-                    )
-                except Exception as exc:
-                    errors.append(f"device {device_index}, {sample_rate} Hz: {exc}")
-        raise RuntimeError("\n".join(errors[-6:]) or "Не удалось открыть выбранный микрофон.")
+        stream, config = open_dicta_input_stream(device_indexes, stream_callback, start=True)
+        self.record_sample_rate = int(config.get("sample_rate", SAMPLE_RATE))
+        self.last_input_stream_config = config
+        return stream
 
     def stop_recording(self) -> None:
         if not self.is_recording:
@@ -1625,15 +2057,17 @@ class DictaApp:
             self.input_device_box.configure(state="readonly")
             self.refresh_input_button.configure(state=tk.NORMAL)
             self.test_input_button.configure(state=tk.NORMAL)
+            self.find_input_button.configure(state=tk.NORMAL)
             messagebox.showwarning(
                 "Dicta",
                 self._format_problem_message(
                     "Запись пустая: Dicta не получил аудиоданные от микрофона.",
                     [
                         "Нажмите Проверить и скажите несколько слов.",
-                        "Если индикатор уровня не двигается, выберите другой микрофон или нажмите Обновить.",
+                        "Если индикатор уровня не двигается, нажмите Найти микрофон или выберите другой микрофон.",
                         "Если проблема повторяется, запустите scripts\\diagnose_dicta.cmd.",
                     ],
+                    details=f"Открытый режим: {input_stream_config_text(self.last_input_stream_config)}",
                 ),
             )
             return
@@ -1652,8 +2086,41 @@ class DictaApp:
         }
         try:
             save_user_settings(settings)
+            self.settings = load_user_settings()
+            self.settings_snapshot = self._capture_settings_state()
+            self._set_status("Настройки сохранены")
         except Exception as exc:
             self._set_status(f"Не удалось сохранить настройки: {exc}")
+
+    def _capture_settings_state(self) -> dict[str, object]:
+        return {
+            "input_device": self.input_device_var.get(),
+            "profile": self.profile_var.get(),
+            "model": self.model_var.get(),
+            "backend": self.backend_var.get(),
+            "auto_copy": self.auto_copy_var.get(),
+            "format_text": self.format_text_var.get(),
+            "voice_punctuation": self.voice_punctuation_var.get(),
+        }
+
+    def _restore_settings_state(self, state: dict[str, object]) -> None:
+        input_device = str(state.get("input_device", ""))
+        if input_device in self.input_devices:
+            self.input_device_var.set(input_device)
+        self.profile_var.set(str(state.get("profile", DEFAULT_PROFILE_LABEL)))
+        self.model_var.set(str(state.get("model", DEFAULT_MODEL_LABEL)))
+        self.backend_var.set(str(state.get("backend", DEFAULT_BACKEND_LABEL)))
+        self.auto_copy_var.set(bool(state.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"])))
+        self.format_text_var.set(bool(state.get("format_text", DEFAULT_USER_SETTINGS["format_text"])))
+        self.voice_punctuation_var.set(bool(state.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])))
+        self._update_speed_status()
+
+    def save_settings_changes(self) -> None:
+        self._save_current_settings()
+
+    def cancel_settings_changes(self) -> None:
+        self._restore_settings_state(self.settings_snapshot)
+        self._set_status("Изменения настроек отменены")
 
     def _copy_value_to_clipboard(self, value: str) -> None:
         self.root.clipboard_clear()
@@ -2069,14 +2536,7 @@ class DictaApp:
         self._queue_input_level(data, force=True)
 
     def _audio_peak_percent(self, audio: bytes) -> int:
-        if len(audio) < SAMPLE_WIDTH_BYTES:
-            return 0
-        try:
-            samples = memoryview(audio).cast("h")
-            peak = max(abs(sample) for sample in samples)
-        except Exception:
-            return 0
-        return min(100, int(round(peak * 100 / 32767)))
+        return audio_peak_percent(audio)
 
     def _queue_input_level(self, audio: bytes, force: bool = False) -> None:
         now = time.perf_counter()
@@ -2164,6 +2624,75 @@ class DictaApp:
                 self._set_status(str(value))
             elif event == "input_level":
                 self._set_input_level(int(value))
+            elif event == "microphone_search_progress":
+                checked, total, label, peak = value
+                total = max(1, int(total))
+                checked = max(0, min(total, int(checked)))
+                progress = checked * 100 / total
+                self.microphone_search_progress_var.set(progress)
+                if checked >= total:
+                    self.microphone_search_status_var.set(f"Поиск: {checked}/{total}, пик {peak}%")
+                else:
+                    self.microphone_search_status_var.set(f"Поиск: {checked}/{total}")
+                    self._set_status(f"Поиск микрофона: {label}")
+            elif event == "microphone_search_result":
+                label, result, results = value
+                if label and result:
+                    self.input_device_var.set(str(label))
+                    self.last_input_stream_config = result.get("config")
+                    self.mic_test_peak = int(result.get("peak", 0))
+                    self.input_level_var.set(self.mic_test_peak)
+                    self.input_level_text_var.set(f"Пик: {self.mic_test_peak}%")
+                    if result.get("ok"):
+                        self._set_status(f"Найден микрофон: {label}, пик {self.mic_test_peak}%")
+                        self.microphone_search_status_var.set(f"Найден: пик {self.mic_test_peak}%")
+                    else:
+                        self._set_status("Микрофон открылся, но звук не обнаружен")
+                        self.microphone_search_status_var.set("Открыт, но тишина")
+                        messagebox.showwarning(
+                            "Dicta",
+                            self._format_problem_message(
+                                "Dicta нашла микрофон, который открывается, но заметного звука не услышала.",
+                                [
+                                    "Говорите во время поиска или нажмите Проверить после выбора.",
+                                    "Проверьте уровень входа Windows и физическую кнопку mute на USB-гарнитуре.",
+                                    "Если индикатор не двигается, запустите scripts\\diagnose_dicta.cmd.",
+                                ],
+                                details=f"Выбран: {label}",
+                                technical=self._shorten_technical_text(self._format_microphone_search_results(results)),
+                            ),
+                        )
+                else:
+                    self._set_status("Рабочий микрофон не найден")
+                    self.input_level_var.set(0)
+                    self.microphone_search_status_var.set("Поиск: микрофон не найден")
+                    messagebox.showwarning(
+                        "Dicta",
+                        self._format_problem_message(
+                            "Dicta не смогла найти микрофон с заметным уровнем звука.",
+                            [
+                                "Проверьте, что USB-гарнитура подключена и не выключена кнопкой mute.",
+                                "Закройте программы, которые могут занимать микрофон: браузер, Teams, Zoom, диктофон.",
+                                "Запустите scripts\\diagnose_dicta.cmd и пришлите отчет из папки diagnostics.",
+                            ],
+                            details=f"Выбор не изменен: {self.input_device_var.get() or 'не выбран'}",
+                            technical=self._shorten_technical_text(self._format_microphone_search_results(results)),
+                        ),
+                    )
+            elif event == "microphone_search_ready":
+                self.is_finding_microphone = False
+                self.microphone_search_progress_var.set(0)
+                self._set_record_button_idle()
+                self.stop_button.configure(state=tk.DISABLED)
+                self.model_box.configure(state="readonly")
+                self.profile_box.configure(state="readonly")
+                self.benchmark_button.configure(state=tk.NORMAL)
+                self.backend_box.configure(state="readonly")
+                self.backend_benchmark_button.configure(state=tk.NORMAL)
+                self.input_device_box.configure(state="readonly" if self.input_devices else tk.DISABLED)
+                self.refresh_input_button.configure(state=tk.NORMAL)
+                self.test_input_button.configure(state=tk.NORMAL if self.input_devices else tk.DISABLED)
+                self.find_input_button.configure(state=tk.NORMAL if self.input_devices else tk.DISABLED)
             elif event == "hotkey":
                 self._handle_record_hotkey()
             elif event == "hotkey_status":
@@ -2206,6 +2735,7 @@ class DictaApp:
                 self.input_device_box.configure(state="readonly")
                 self.refresh_input_button.configure(state=tk.NORMAL)
                 self.test_input_button.configure(state=tk.NORMAL)
+                self.find_input_button.configure(state=tk.NORMAL)
             elif event == "benchmark_result":
                 profile = value
                 selected_model = profile.get("selected_model", FALLBACK_AUTO_MODEL_KEY)
@@ -2244,6 +2774,7 @@ class DictaApp:
                 self.input_device_box.configure(state="readonly")
                 self.refresh_input_button.configure(state=tk.NORMAL)
                 self.test_input_button.configure(state=tk.NORMAL)
+                self.find_input_button.configure(state=tk.NORMAL)
             elif event == "firewall_status":
                 if value is True:
                     self.firewall_status_var.set("Сеть: заблокирована")
@@ -2310,7 +2841,7 @@ class DictaApp:
         technical = str(exc).strip()
         steps = [
             "Проверьте, что микрофон подключен и выбран в строке Микрофон.",
-            "Нажмите Обновить, затем Проверить.",
+            "Нажмите Найти микрофон, затем Проверить.",
             "Закройте программы, которые могут занимать микрофон: браузер, Teams, Zoom, диктофон.",
             "Проверьте доступ к микрофону в настройках конфиденциальности Windows.",
         ]
@@ -2320,7 +2851,7 @@ class DictaApp:
         return self._format_problem_message(
             summary,
             steps,
-            details=f"Выбранный микрофон: {selected}",
+            details=f"Выбранный микрофон: {selected}\nПоследний открытый режим: {input_stream_config_text(self.last_input_stream_config)}",
             technical=self._shorten_technical_text(technical),
         )
 
@@ -2612,8 +3143,19 @@ del "%~f0" >nul 2>nul
 
 def main() -> None:
     if "--audio-devices" in sys.argv:
-        print(f"default={sd.default.device}")
-        print(sd.query_devices())
+        print_audio_devices()
+        raise SystemExit(0)
+
+    if "--microphone-diagnostics" in sys.argv:
+        seconds = MICROPHONE_PROBE_SECONDS
+        if "--seconds" in sys.argv:
+            index = sys.argv.index("--seconds")
+            if index + 1 < len(sys.argv):
+                try:
+                    seconds = max(0.2, min(5.0, float(sys.argv[index + 1].replace(",", "."))))
+                except Exception:
+                    seconds = MICROPHONE_PROBE_SECONDS
+        run_microphone_diagnostics(seconds=seconds, print_fn=print)
         raise SystemExit(0)
 
     if "--spell-test" in sys.argv:

@@ -61,7 +61,8 @@ function Invoke-ReportCommand {
         [string]$Title,
         [string]$FilePath,
         [string[]]$Arguments = @(),
-        [int[]]$BlockingExitCodes = @()
+        [int[]]$BlockingExitCodes = @(),
+        [switch]$UseStartProcess
     )
 
     Write-Section $Title
@@ -70,8 +71,30 @@ function Invoke-ReportCommand {
 
     $output = @()
     try {
-        $output = & $FilePath @Arguments 2>&1
-        $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+        if ($UseStartProcess) {
+            $safeTitle = ($Title -replace '[^A-Za-z0-9_-]', '_')
+            $stdoutPath = Join-Path $env:TEMP "dicta_diag_${safeTitle}_stdout_$PID.txt"
+            $stderrPath = Join-Path $env:TEMP "dicta_diag_${safeTitle}_stderr_$PID.txt"
+            Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+            $process = Start-Process `
+                -FilePath $FilePath `
+                -ArgumentList $Arguments `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $stdoutPath `
+                -RedirectStandardError $stderrPath `
+                -WindowStyle Hidden
+            $exitCode = $process.ExitCode
+            if (Test-Path -LiteralPath $stdoutPath) {
+                $output += Get-Content -LiteralPath $stdoutPath
+            }
+            if (Test-Path -LiteralPath $stderrPath) {
+                $output += Get-Content -LiteralPath $stderrPath
+            }
+        } else {
+            $output = & $FilePath @Arguments 2>&1
+            $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+        }
     } catch {
         $output = @($_.Exception.Message)
         $exitCode = 999
@@ -198,7 +221,8 @@ if (Test-Path -LiteralPath $program) {
         -Title "Dicta self-test" `
         -FilePath $program `
         -Arguments @("--self-test") `
-        -BlockingExitCodes @(1, 2, 3, 999)
+        -BlockingExitCodes @(1, 2, 3, 999) `
+        -UseStartProcess
 } else {
     Write-Section "Dicta self-test"
     Write-Check -Level "FAIL" -Message "Dicta.exe is missing, self-test skipped." -Blocking
@@ -215,6 +239,18 @@ Invoke-ReportCommand `
     -FilePath "powershell" `
     -Arguments ($powershellArgsPrefix + @((Join-Path $PSScriptRoot "list_audio_devices.ps1"))) `
     -BlockingExitCodes @(999)
+
+if (Test-Path -LiteralPath $program) {
+    Invoke-ReportCommand `
+        -Title "Microphone quick open test" `
+        -FilePath $program `
+        -Arguments @("--microphone-diagnostics", "--seconds", "1.0") `
+        -BlockingExitCodes @(999) `
+        -UseStartProcess
+} else {
+    Write-Section "Microphone quick open test"
+    Write-Check -Level "WARN" -Message "Dicta.exe is missing, microphone open test skipped."
+}
 
 Invoke-ReportCommand `
     -Title "Russian Windows spellchecker" `
