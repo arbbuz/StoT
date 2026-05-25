@@ -19,7 +19,76 @@ models\ggml-small-q5_1.bin
 
 ## Установка новой версии
 
-1. Распаковать новый ZIP целиком в отдельную папку `Dicta`.
+1. Скачать artifact `Dicta-windows-code-only` из GitHub Actions workflow `Build Dicta EXE`.
+2. Распаковать `Dicta-windows-code-only.zip` целиком в отдельную папку `Dicta`.
+3. Вручную скопировать модели в папку `models` рядом с новым `Dicta.exe`:
+
+```text
+models\ggml-tiny-q5_1.bin
+models\ggml-base-q5_1.bin
+models\ggml-small-q5_1.bin
+```
+
+4. Запустить проверку целостности code-only пакета:
+
+```text
+scripts\verify_dicta_package.cmd
+```
+
+5. Запустить:
+
+```text
+scripts\diagnose_dicta.cmd
+```
+
+6. Открыть `Dicta.exe` и проверить:
+   - главное окно открывается;
+   - нужный микрофон выбран в `Настройки` -> `Запись`;
+   - `Проверить` показывает уровень микрофона;
+   - короткая диктовка распознается;
+   - `Автоформат` применяет форматирование, повторное нажатие возвращает прежний текст;
+   - `Скопировать` помещает текст в буфер обмена.
+
+## Автоматическая сборка в GitHub Actions
+
+После каждого `push` в любую ветку запускается workflow:
+
+```text
+.github\workflows\build-dicta.yml
+```
+
+Workflow собирает Windows-пакет `dist\Dicta` без моделей и публикует artifact:
+
+```text
+Dicta-windows-code-only
+```
+
+Внутри artifact находится ZIP:
+
+```text
+Dicta-windows-code-only.zip
+```
+
+Модели Whisper не включаются в artifact намеренно. В папке `models` будет только `README_MODELS.txt` с напоминанием, какие файлы нужно скопировать вручную.
+
+## Локальная code-only сборка
+
+Для локальной сборки без моделей:
+
+```powershell
+.\scripts\prepare_dicta_assets.ps1 -SkipModels
+.\scripts\build_dicta_exe.ps1 -SkipModels -PackageVersion "1.1-pilot-code-only"
+```
+
+Результат появится в:
+
+```text
+dist\Dicta
+```
+
+## Ручная установка без GitHub artifact
+
+1. Распаковать или скопировать новую папку `Dicta` целиком.
 2. Запустить проверку целостности code-only пакета:
 
 ```text
