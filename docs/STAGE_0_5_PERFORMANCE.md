@@ -101,13 +101,11 @@ DICTA_FASTER_WHISPER_COMPUTE_TYPE=int8
 
 ## Поставка
 
-GitHub Actions artifact остается code-only и не включает модели `.bin`.
+GitHub Actions artifact остается code-only и не включает модель `.bin`.
 
-Модели Whisper по-прежнему нужно вручную скопировать рядом с `Dicta.exe`:
+Рабочую модель Whisper нужно вручную скопировать рядом с `Dicta.exe`:
 
 ```text
-models\ggml-tiny-q5_1.bin
-models\ggml-base-q5_1.bin
 models\ggml-small-q5_1.bin
 ```
 

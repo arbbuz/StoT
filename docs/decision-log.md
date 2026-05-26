@@ -1,6 +1,6 @@
 # Dicta Decision Log
 
-Last updated: 2026-05-24
+Last updated: 2026-05-26
 
 This file records Dicta-specific decisions. Global Codex rules belong in `C:\Users\Olga\.codex\AGENTS.md`.
 
@@ -100,3 +100,20 @@ Decision:
 Reason:
 
 - Users need a clear, visible result after pressing footer buttons; closing the settings window makes it obvious that save/cancel was applied.
+
+## 2026-05-26: Quiet Recordings Use Manual Software Gain
+
+Decision:
+
+- Keep Windows microphone level and driver settings outside Dicta's control.
+- Add manual software gain for PCM16 audio before VAD and Whisper recognition.
+- Keep gain at `0%` by default through the saved `audio_gain_percent` user setting.
+- Show a visible recognition status when gain is applied: selected percent, multiplier, and peak before/after.
+- Keep the gain bounded so quiet input can be lifted deliberately without changing good recordings by default.
+
+Reason:
+
+- A tester reported Windows input sensitivity at maximum while Dicta saw recording levels around 10%, causing likely recognition errors.
+- Some Windows/USB audio stacks deliver quiet PCM even when the system input level is high.
+- Automatic gain can make already-good recordings worse, so the user needs explicit manual control.
+- Applying gain inside the app is reproducible, package-local, and easier to diagnose than relying on driver-specific microphone boost controls.

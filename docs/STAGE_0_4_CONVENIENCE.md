@@ -65,12 +65,10 @@
 
 ## Поставка
 
-GitHub Actions artifact остается code-only и не включает модели `.bin`.
+GitHub Actions artifact остается code-only и не включает модель `.bin`.
 
-Для распознавания модели по-прежнему нужно вручную скопировать рядом с `Dicta.exe`:
+Для распознавания рабочую модель нужно вручную скопировать рядом с `Dicta.exe`:
 
 ```text
-models\ggml-tiny-q5_1.bin
-models\ggml-base-q5_1.bin
 models\ggml-small-q5_1.bin
 ```

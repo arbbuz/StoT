@@ -145,8 +145,6 @@ Write-Host "Prepared scalar compat whisper.cpp backend in $compatBinDir"
 
 if (-not $SkipModels) {
     $models = @(
-        "ggml-tiny-q5_1.bin",
-        "ggml-base-q5_1.bin",
         "ggml-small-q5_1.bin"
     )
 

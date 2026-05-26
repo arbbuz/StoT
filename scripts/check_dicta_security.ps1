@@ -14,8 +14,6 @@ $manifest = Join-Path $root "manifest.json"
 $shaSums = Join-Path $root "SHA256SUMS.txt"
 $verifyScript = Join-Path $root "scripts\verify_dicta_package.ps1"
 $models = @(
-    Join-Path $root "models\ggml-tiny-q5_1.bin"
-    Join-Path $root "models\ggml-base-q5_1.bin"
     Join-Path $root "models\ggml-small-q5_1.bin"
 )
 $tempPatterns = @(

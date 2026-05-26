@@ -1,4 +1,4 @@
-Write-Host "Dicta model benchmark"
+Write-Host "Dicta small-q5_1 model benchmark"
 Write-Host ""
 
 $packageRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")

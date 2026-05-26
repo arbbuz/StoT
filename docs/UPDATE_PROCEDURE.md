@@ -7,11 +7,9 @@ Dicta обновляется заменой всей папки приложен
 ## Перед обновлением
 
 1. Закрыть `Dicta.exe`.
-2. Если в старой папке есть вручную добавленные модели, сохранить их отдельно или оставить старую папку как источник:
+2. Если в старой папке есть вручную добавленная рабочая модель, сохранить ее отдельно или оставить старую папку как источник:
 
 ```text
-models\ggml-tiny-q5_1.bin
-models\ggml-base-q5_1.bin
 models\ggml-small-q5_1.bin
 ```
 
@@ -21,11 +19,9 @@ models\ggml-small-q5_1.bin
 
 1. Скачать artifact `Dicta-windows-code-only` из GitHub Actions workflow `Build Dicta EXE`.
 2. Распаковать `Dicta-windows-code-only.zip` целиком в отдельную папку `Dicta`.
-3. Вручную скопировать модели в папку `models` рядом с новым `Dicta.exe`:
+3. Вручную скопировать рабочую модель в папку `models` рядом с новым `Dicta.exe`:
 
 ```text
-models\ggml-tiny-q5_1.bin
-models\ggml-base-q5_1.bin
 models\ggml-small-q5_1.bin
 ```
 
@@ -57,7 +53,7 @@ scripts\diagnose_dicta.cmd
 .github\workflows\build-dicta.yml
 ```
 
-Workflow собирает Windows-пакет `dist\Dicta` без моделей и публикует artifact:
+Workflow собирает Windows-пакет `dist\Dicta` без модели и публикует artifact:
 
 ```text
 Dicta-windows-code-only
@@ -69,11 +65,11 @@ Dicta-windows-code-only
 Dicta-windows-code-only.zip
 ```
 
-Модели Whisper не включаются в artifact намеренно. В папке `models` будет только `README_MODELS.txt` с напоминанием, какие файлы нужно скопировать вручную.
+Модель Whisper не включается в artifact намеренно. В папке `models` будет только `README_MODELS.txt` с напоминанием, что `ggml-small-q5_1.bin` нужно скопировать вручную.
 
 ## Локальная code-only сборка
 
-Для локальной сборки без моделей:
+Для локальной сборки без модели:
 
 ```powershell
 .\scripts\prepare_dicta_assets.ps1 -SkipModels
@@ -95,7 +91,7 @@ dist\Dicta
 scripts\verify_dicta_package.cmd
 ```
 
-3. Вручную скопировать модели в папку `models` рядом с новым `Dicta.exe`.
+3. Вручную скопировать `ggml-small-q5_1.bin` в папку `models` рядом с новым `Dicta.exe`.
 4. Запустить:
 
 ```text

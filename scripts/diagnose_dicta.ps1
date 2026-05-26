@@ -192,8 +192,6 @@ Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-avx2\bin\whisper-cli.e
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-vulkan\bin\whisper-cli.exe"
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-cuda\bin\whisper-cli.exe"
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-openvino\bin\whisper-cli.exe"
-Test-RequiredFile -RelativePath "models\ggml-tiny-q5_1.bin" -Hash
-Test-RequiredFile -RelativePath "models\ggml-base-q5_1.bin" -Hash
 Test-RequiredFile -RelativePath "models\ggml-small-q5_1.bin" -Hash
 Test-RequiredFile -RelativePath "assets\app_icon.ico"
 Test-RequiredFile -RelativePath "docs\IB_PACKAGE_DESCRIPTION.md"

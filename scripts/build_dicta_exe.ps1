@@ -7,11 +7,29 @@ $ErrorActionPreference = "Stop"
 
 Set-Location -LiteralPath (Join-Path $PSScriptRoot "..")
 
-python -m pip install -r requirements.txt
-python -m pip install pyinstaller
-python -m pip install pillow
-python scripts\generate_app_icon.py
-python -m PyInstaller --noconfirm --clean --windowed --icon "assets\app_icon.ico" --name Dicta dicta.py
+function Invoke-NativeCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $FilePath @ArgumentList
+        if ($LASTEXITCODE -ne 0) {
+            throw "$FilePath $($ArgumentList -join ' ') failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "pip", "install", "-r", "requirements.txt")
+Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "pip", "install", "pyinstaller")
+Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "pip", "install", "pillow")
+Invoke-NativeCommand -FilePath "python" -ArgumentList @("scripts\generate_app_icon.py")
+Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "PyInstaller", "--noconfirm", "--clean", "--windowed", "--icon", "assets\app_icon.ico", "--name", "Dicta", "dicta.py")
 
 $dist = "dist\Dicta"
 New-Item -ItemType Directory -Force -Path "$dist\models", "$dist\.tools\whisper.cpp-build-compat\bin", "$dist\assets", "$dist\docs", "$dist\scripts" | Out-Null
@@ -21,8 +39,6 @@ if ($SkipModels) {
 Dicta models are not included in this package.
 
 Copy these files into this folder before using recognition:
-- ggml-tiny-q5_1.bin
-- ggml-base-q5_1.bin
 - ggml-small-q5_1.bin
 
 Local source folder:
@@ -33,8 +49,6 @@ https://huggingface.co/ggerganov/whisper.cpp
 "@ | Set-Content -LiteralPath "$dist\models\README_MODELS.txt" -Encoding UTF8
 } else {
     Copy-Item -LiteralPath `
-        "models\ggml-tiny-q5_1.bin", `
-        "models\ggml-base-q5_1.bin", `
         "models\ggml-small-q5_1.bin" `
         -Destination "$dist\models" `
         -Force
@@ -128,9 +142,9 @@ try {
 & "$dist\scripts\verify_dicta_package.ps1" -Root $dist
 
 if ($SkipModels) {
-    & "$dist\Dicta.exe" --self-test --allow-missing-models
+    Invoke-NativeCommand -FilePath "$dist\Dicta.exe" -ArgumentList @("--self-test", "--allow-missing-models")
 } else {
-    & "$dist\Dicta.exe" --self-test
+    Invoke-NativeCommand -FilePath "$dist\Dicta.exe" -ArgumentList @("--self-test")
 }
 
 Write-Host "Build ready: $((Resolve-Path $dist).Path)"

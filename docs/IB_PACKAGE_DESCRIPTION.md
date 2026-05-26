@@ -56,8 +56,6 @@ Dicta/
   _internal/
   models/
     README_MODELS.txt               code-only artifact
-    ggml-tiny-q5_1.bin              copied manually before recognition
-    ggml-base-q5_1.bin              copied manually before recognition
     ggml-small-q5_1.bin             copied manually before recognition
   .tools/
     whisper.cpp-build-compat/
@@ -85,7 +83,7 @@ Dicta/
 | `manifest.json` | Машинно-читаемый состав поставки: версия пакета, тип пакета, дата генерации, исходный commit и список файлов с SHA256. |
 | `SHA256SUMS.txt` | Контрольные SHA256-суммы файлов code-only поставки. Используется скриптом `verify_dicta_package.ps1`. |
 | `_internal/` | Runtime PyInstaller: Python, Tkinter, sounddevice, CFFI и служебные DLL. Нужен для запуска без установки Python на ПК. |
-| `models/*.bin` | Локальные модели Whisper в формате ggml. Это веса модели, не пользовательские данные и не журналы. В GitHub Actions code-only artifact не входят и копируются вручную рядом с `Dicta.exe`. |
+| `models/ggml-small-q5_1.bin` | Рабочая локальная модель Whisper в формате ggml. Это веса модели, не пользовательские данные и не журналы. В GitHub Actions code-only artifact не входит и копируется вручную рядом с `Dicta.exe`. |
 | `.tools/whisper.cpp-build-compat/bin/whisper-cli.exe` | Локальный scalar compat backend whisper.cpp без AVX/AVX2/FMA/F16C/SSE4.2/BMI2. Работает как fallback на старых CPU. |
 | `.tools/whisper.cpp-build-avx2/bin/whisper-cli.exe` | Optional optimized backend whisper.cpp для современных CPU. Если не запускается, приложение использует compat backend. |
 | `.tools/whisper.cpp-build-vulkan/bin/whisper-cli.exe` | Optional GPU backend whisper.cpp для проверки Vulkan на реальных ПК. |
@@ -98,7 +96,7 @@ Dicta/
 | `scripts/verify_dicta_package.ps1` | Проверяет `manifest.json` и SHA256-суммы файлов поставки без запуска GUI. |
 | `scripts/verify_dicta_package.cmd` | Запуск проверки целостности двойным кликом; окно остается открытым до нажатия клавиши. |
 | `scripts/generate_dicta_manifest.ps1` | Создает `manifest.json` и `SHA256SUMS.txt` во время сборки поставки. |
-| `scripts/benchmark_dicta_models.ps1` | Локальный бенчмарк моделей для выбора профиля скорости. |
+| `scripts/benchmark_dicta_models.ps1` | Локальная проверка скорости рабочей модели `small-q5_1`. |
 | `scripts/benchmark_dicta_models.cmd` | Запуск бенчмарка двойным кликом; окно остается открытым до нажатия клавиши. |
 | `scripts/compare_dicta_backends.ps1` | Локальное сравнение backend/thread-кандидатов `whisper.cpp`; если вручную подготовлен `faster-whisper`, показывает его как experimental result. |
 | `scripts/compare_dicta_backends.cmd` | Запуск сравнения backend двойным кликом; окно остается открытым до нажатия клавиши. |
@@ -106,7 +104,7 @@ Dicta/
 | `scripts/check_firewall_block.cmd` | Запуск проверки firewall двойным кликом; окно остается открытым до нажатия клавиши. |
 | `scripts/check_russian_spellcheck.ps1` | Проверяет доступность русского локального Windows Spell Checking API для `Dicta.exe`. |
 | `scripts/check_russian_spellcheck.cmd` | Запуск проверки русского словаря двойным кликом; окно остается открытым до нажатия клавиши. |
-| `scripts/check_dicta_security.ps1` | Проверяет наличие локальных файлов, моделей, правила firewall и временных хвостов в `%TEMP%`. |
+| `scripts/check_dicta_security.ps1` | Проверяет наличие локальных файлов, рабочей модели, правила firewall и временных хвостов в `%TEMP%`. |
 | `scripts/check_dicta_security.cmd` | Запуск общей проверки двойным кликом; окно остается открытым до нажатия клавиши. |
 | `scripts/list_audio_devices.ps1` | Выводит список устройств записи, которые видит Dicta через sounddevice/PortAudio. |
 | `scripts/list_audio_devices.cmd` | Запуск списка аудиоустройств двойным кликом; окно остается открытым до нажатия клавиши. |
@@ -136,7 +134,7 @@ Dicta/
 - текст, переданный локальному Windows Spell Checking API для проверки орфографии;
 - слово, добавленное пользователем в локальный пользовательский словарь Windows через пункт "Добавить в словарь";
 - текст в буфере обмена после нажатия "Скопировать" или после включенной опции "Автокопия";
-- технический файл `%LOCALAPPDATA%\Dicta\performance_profile.json` с результатами локального бенчмарка моделей.
+- технический файл `%LOCALAPPDATA%\Dicta\performance_profile.json` с результатами локального бенчмарка рабочей модели.
 - технический файл `%LOCALAPPDATA%\Dicta\backend_profile.json` с результатами локального бенчмарка backend и числа потоков.
 - технический файл `%LOCALAPPDATA%\Dicta\settings.json` с настройками галочек интерфейса.
 
@@ -152,11 +150,11 @@ Dicta/
 
 В штатном сценарии временные WAV/TXT-файлы удаляются после распознавания. Если процесс аварийно завершен во время распознавания, в `%TEMP%` теоретически могут остаться файлы вида `dicta_*.wav` или `dicta_*_out.txt`; это проверяется скриптом `scripts/check_dicta_security.ps1`.
 
-Файлы `performance_profile.json`, `backend_profile.json` и `settings.json` не содержат аудио, текста диктовок или истории распознаваний. В `performance_profile.json` хранятся только время локального benchmark-запуска по моделям и выбранная модель для профиля "Авто". В `backend_profile.json` хранятся только времена локального backend/thread-бенчмарка, выбранный backend и выбранное число потоков для режима "Авто". В `settings.json` хранятся только значения галочек "Автокопия", "Форматировать", "Команды пунктуации" и выбранный backend.
+Файлы `performance_profile.json`, `backend_profile.json` и `settings.json` не содержат аудио, текста диктовок или истории распознаваний. В `performance_profile.json` хранится только время локального benchmark-запуска рабочей модели. В `backend_profile.json` хранятся только времена локального backend/thread-бенчмарка, выбранный backend и выбранное число потоков для режима "Авто". В `settings.json` хранятся только значения галочек "Автокопия", "Форматировать", "Команды пунктуации" и выбранный backend.
 
 ## Сеть и firewall
 
-По функциональной логике приложение не использует облачные API и не делает сетевые запросы для распознавания или проверки орфографии. Распознавание выполняется локально: `Dicta.exe` вызывает локальный `whisper-cli.exe`, который использует локальные модели из папки `models`. Проверка орфографии выполняется локально через Windows Spell Checking API.
+По функциональной логике приложение не использует облачные API и не делает сетевые запросы для распознавания или проверки орфографии. Распознавание выполняется локально: `Dicta.exe` вызывает локальный `whisper-cli.exe`, который использует рабочую модель из папки `models`. Проверка орфографии выполняется локально через Windows Spell Checking API.
 
 Для дополнительного контроля в интерфейсе, во вкладке "Настройки" -> "Безопасность", есть кнопки:
 
