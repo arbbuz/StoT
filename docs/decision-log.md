@@ -40,11 +40,13 @@ Decision:
 - Try sample rates in this order: `16000`, device default samplerate, `48000`, `44100`, `32000`.
 - Try `1` input channel first.
 - If the device supports it, try `2` input channels and downmix PCM16 to mono before recording, level measurement, and recognition.
+- Try raw input formats in order: `int16`, `float32`, `int24`, `int32`; convert non-PCM16 samples to PCM16 mono inside Dicta.
 
 Reason:
 
 - Whisper recognition expects mono PCM, but some USB headsets reject direct mono or 16000 Hz opening.
 - Downmixing inside Dicta preserves the existing mono recording pipeline while accepting more devices.
+- Some Windows USB PnP/WASAPI stacks reject one sample format while accepting another common capture format.
 
 ## 2026-05-24: "Найти микрофон" Runs In Background
 

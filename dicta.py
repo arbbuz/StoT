@@ -68,6 +68,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
 INPUT_SAMPLE_RATE_FALLBACKS = (48000, 44100, 32000)
+INPUT_SAMPLE_DTYPES = ("int16", "float32", "int24", "int32")
 MICROPHONE_PROBE_SECONDS = 1.5
 MICROPHONE_WORKING_PEAK_PERCENT = 1
 SILENCE_WINDOW_MS = 30
@@ -287,6 +288,73 @@ def downmix_pcm16_to_mono(audio: bytes, source_channels: int) -> bytes:
     return mono.tobytes()
 
 
+def float32_pcm_to_pcm16_mono(audio: bytes, source_channels: int) -> bytes:
+    frame_width = 4 * max(1, source_channels)
+    usable_length = len(audio) - (len(audio) % frame_width)
+    if usable_length < frame_width:
+        return b""
+
+    try:
+        samples = memoryview(audio[:usable_length]).cast("f")
+    except Exception:
+        return b""
+
+    mono = array("h")
+    for start in range(0, len(samples), source_channels):
+        total = 0.0
+        for offset in range(source_channels):
+            total += float(samples[start + offset])
+        value = total / source_channels
+        if value >= 1.0:
+            mono.append(32767)
+        elif value <= -1.0:
+            mono.append(-32768)
+        else:
+            mono.append(int(round(value * 32767)))
+    return mono.tobytes()
+
+
+def int24_pcm_to_pcm16_mono(audio: bytes, source_channels: int) -> bytes:
+    source_channels = max(1, int(source_channels))
+    frame_width = 3 * source_channels
+    usable_length = len(audio) - (len(audio) % frame_width)
+    if usable_length < frame_width:
+        return b""
+
+    mono = array("h")
+    for frame_start in range(0, usable_length, frame_width):
+        total = 0
+        for channel in range(source_channels):
+            offset = frame_start + channel * 3
+            value = int.from_bytes(audio[offset : offset + 3], byteorder="little", signed=False)
+            if value & 0x800000:
+                value -= 0x1000000
+            total += value
+        mono.append(max(-32768, min(32767, int(round((total / source_channels) / 256)))))
+    return mono.tobytes()
+
+
+def int32_pcm_to_pcm16_mono(audio: bytes, source_channels: int) -> bytes:
+    source_channels = max(1, int(source_channels))
+    frame_width = 4 * source_channels
+    usable_length = len(audio) - (len(audio) % frame_width)
+    if usable_length < frame_width:
+        return b""
+
+    try:
+        samples = memoryview(audio[:usable_length]).cast("i")
+    except Exception:
+        return b""
+
+    mono = array("h")
+    for start in range(0, len(samples), source_channels):
+        total = 0
+        for offset in range(source_channels):
+            total += int(samples[start + offset])
+        mono.append(max(-32768, min(32767, int(round((total / source_channels) / 65536)))))
+    return mono.tobytes()
+
+
 def audio_peak_percent(audio: bytes) -> int:
     usable_length = len(audio) - (len(audio) % SAMPLE_WIDTH_BYTES)
     if usable_length < SAMPLE_WIDTH_BYTES:
@@ -372,10 +440,12 @@ def input_stream_config_text(config: dict | None) -> str:
         return "режим неизвестен"
     source_channels = int(config.get("source_channels", CHANNELS))
     channel_text = "1 канал" if source_channels == 1 else f"{source_channels}->1 канал"
-    return f"{config.get('description', 'device')}, {config.get('sample_rate', SAMPLE_RATE)} Hz, {channel_text}"
+    dtype = str(config.get("dtype", "int16"))
+    dtype_text = "" if dtype == "int16" else f", {dtype}->PCM16"
+    return f"{config.get('description', 'device')}, {config.get('sample_rate', SAMPLE_RATE)} Hz, {channel_text}{dtype_text}"
 
 
-def input_stream_config_key(config: dict | None) -> tuple[int, int, int] | None:
+def input_stream_config_key(config: dict | None) -> tuple[int, int, int, str] | None:
     if not config:
         return None
     try:
@@ -383,6 +453,7 @@ def input_stream_config_key(config: dict | None) -> tuple[int, int, int] | None:
             int(config["device_index"]),
             int(config["sample_rate"]),
             int(config["source_channels"]),
+            str(config.get("dtype", "int16")),
         )
     except Exception:
         return None
@@ -394,15 +465,17 @@ def input_stream_candidates(device_indexes: list[int]) -> list[dict]:
         description = describe_input_device(device_index)
         for sample_rate in input_device_sample_rates(device_index):
             for source_channels in input_device_channel_counts(device_index):
-                candidates.append(
-                    {
-                        "device_index": device_index,
-                        "description": description,
-                        "sample_rate": sample_rate,
-                        "source_channels": source_channels,
-                        "channels": CHANNELS,
-                    }
-                )
+                for dtype in INPUT_SAMPLE_DTYPES:
+                    candidates.append(
+                        {
+                            "device_index": device_index,
+                            "description": description,
+                            "sample_rate": sample_rate,
+                            "source_channels": source_channels,
+                            "channels": CHANNELS,
+                            "dtype": dtype,
+                        }
+                    )
     return candidates
 
 
@@ -422,10 +495,16 @@ def ordered_input_stream_candidates(device_indexes: list[int], preferred_config:
     return preferred + other
 
 
-def _mono_input_callback(callback, source_channels: int):
+def _mono_input_callback(callback, source_channels: int, dtype: str = "int16"):
     def wrapper(indata, frames, time_info, status) -> None:
         data = bytes(indata)
-        if source_channels > CHANNELS:
+        if dtype == "float32":
+            data = float32_pcm_to_pcm16_mono(data, source_channels)
+        elif dtype == "int24":
+            data = int24_pcm_to_pcm16_mono(data, source_channels)
+        elif dtype == "int32":
+            data = int32_pcm_to_pcm16_mono(data, source_channels)
+        elif source_channels > CHANNELS:
             data = downmix_pcm16_to_mono(data, source_channels)
         callback(data, frames, time_info, status)
 
@@ -434,12 +513,13 @@ def _mono_input_callback(callback, source_channels: int):
 
 def open_input_stream_candidate(config: dict, callback, start: bool = False) -> sd.RawInputStream:
     source_channels = int(config.get("source_channels", CHANNELS))
+    dtype = str(config.get("dtype", "int16"))
     stream = sd.RawInputStream(
         device=int(config["device_index"]),
         samplerate=int(config["sample_rate"]),
         channels=source_channels,
-        dtype="int16",
-        callback=_mono_input_callback(callback, source_channels),
+        dtype=dtype,
+        callback=_mono_input_callback(callback, source_channels, dtype),
     )
     if start:
         stream.start()
@@ -539,7 +619,8 @@ def probe_input_device_group(
                 progress_callback(position, len(candidates), config, peak)
 
     if best_opened is not None:
-        best_opened["error"] = "\n".join(errors[-12:])
+        best_opened["errors"] = errors
+        best_opened["error"] = "\n".join(errors)
         return best_opened
 
     return {
@@ -547,7 +628,8 @@ def probe_input_device_group(
         "opened": False,
         "status": "failed",
         "peak": 0,
-        "error": "\n".join(errors[-12:]) or "Не удалось открыть выбранный микрофон.",
+        "errors": errors,
+        "error": "\n".join(errors) or "Не удалось открыть выбранный микрофон.",
         "seconds": seconds,
     }
 
@@ -566,6 +648,7 @@ def print_audio_devices() -> None:
     print("Open modes tried for each device:")
     print(f"  sample rates: {SAMPLE_RATE}, default, {', '.join(str(rate) for rate in INPUT_SAMPLE_RATE_FALLBACKS)}")
     print("  channels: 1, then 2 with downmix to mono when available")
+    print(f"  sample formats: {', '.join(INPUT_SAMPLE_DTYPES)}")
     print("")
     print("Raw PortAudio devices:")
     print(sd.query_devices())
@@ -604,7 +687,9 @@ def run_microphone_diagnostics(seconds: float = MICROPHONE_PROBE_SECONDS, print_
                 best_opened_label = label
         else:
             print_fn("  failed:")
-            for line in str(result.get("error", "")).splitlines()[-12:]:
+            errors = result.get("errors")
+            lines = errors if isinstance(errors, list) else str(result.get("error", "")).splitlines()
+            for line in lines:
                 print_fn(f"    {line}")
 
         if result.get("ok") and selected is None:
