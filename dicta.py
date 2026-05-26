@@ -1704,12 +1704,30 @@ class DictaApp:
         self.save_settings_button.grid(row=0, column=2, sticky="e")
 
     def show_settings(self) -> None:
+        self._center_settings_window()
         self.settings_window.deiconify()
         self.settings_window.lift()
         self.settings_window.focus_force()
 
     def hide_settings(self) -> None:
         self.settings_window.withdraw()
+
+    def _center_settings_window(self) -> None:
+        self.root.update_idletasks()
+        self.settings_window.update_idletasks()
+
+        width = max(self.settings_window.winfo_width(), self.settings_window.winfo_reqwidth(), 720)
+        height = max(self.settings_window.winfo_height(), self.settings_window.winfo_reqheight(), 430)
+        root_width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
+        root_height = max(self.root.winfo_height(), self.root.winfo_reqheight())
+
+        x = self.root.winfo_rootx() + max(0, (root_width - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (root_height - height) // 2)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = max(0, min(x, max(0, screen_width - width)))
+        y = max(0, min(y, max(0, screen_height - height)))
+        self.settings_window.geometry(f"{width}x{height}+{x}+{y}")
 
     def _on_audio_gain_changed(self, value: object | None = None) -> None:
         percent = clamp_audio_gain_percent(self.audio_gain_percent_var.get() if value is None else value)

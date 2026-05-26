@@ -22,7 +22,7 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
    - Success signal: at `0%` Dicta does not alter good recordings; after choosing a manual percent, recognition still works and the status shows `усиление +N% (xM), пик A->B%`.
 
 4. Package readiness
-   - Status: `scripts\build_dicta_exe.ps1` builds `dist\Dicta` successfully; latest fresh EXE is dated 2026-05-26 20:35:35.
+   - Status: `scripts\build_dicta_exe.ps1` builds `dist\Dicta` successfully; latest fresh EXE is dated 2026-05-26 20:48:26.
    - Remaining: repeat package verification after manual headset testing if any code changes are made.
    - Success signal: `verify_dicta_package.ps1`, `Dicta.exe --self-test`, and the microphone diagnostic pass with no blocking failures.
 

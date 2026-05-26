@@ -14,7 +14,7 @@ Packaged app: `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`
 - Last pushed commit known before the current uncommitted work: `bb26547 Make app icon corners transparent`.
 - Do not commit or push without explicit user permission.
 - Global Codex rules are stored in `C:\Users\Olga\.codex\AGENTS.md`; this project should keep only Dicta-specific rules in `AGENTS.md`.
-- Fresh packaged EXE for manual verification was rebuilt on 2026-05-26 20:35:35 at `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`.
+- Fresh packaged EXE for manual verification was rebuilt on 2026-05-26 20:48:26 at `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`.
 
 ## Current Uncommitted Work
 
@@ -26,6 +26,7 @@ Packaged app: `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`
 - Follow-up UI fix: the search progressbar is cleared when "Проверить" starts/finishes and when microphone search completes, so it does not look like a stuck level meter.
 - Follow-up UI fix: the settings-tab bar is now bound to the actual microphone level, not to internal search progress.
 - Follow-up UI fix: recording settings controls no longer shift when microphone test status or manual gain text changes; microphone action buttons are grouped in a stable row and dynamic labels use fixed widths.
+- Follow-up UI fix: the settings window is centered over the main Dicta window each time it opens.
 - Follow-up settings UI: added "Сохранить" and "Отмена" buttons in the settings window; they save or restore settings, then close the window.
 - `docs\STAGE_0_2_1_MICROPHONE.md`: updated for selected-device mode probing and manual audio gain status.
 - `scripts\diagnose_dicta.ps1`: added "Microphone quick open test" and redirected windowed `Dicta.exe` stdout/stderr through `Start-Process`.
@@ -47,12 +48,12 @@ Packaged app: `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`
 - Direct function check for `apply_pcm16_gain`
 - `python dicta.py --format-test`
 - `git diff --check -- dicta.py docs/STAGE_0_2_1_MICROPHONE.md` with CRLF warnings only
-- `scripts\build_dicta_exe.ps1` on 2026-05-26 with build output captured in `artifacts\build_dicta_exe_20260526_203500.log`
+- `scripts\build_dicta_exe.ps1` on 2026-05-26 with build output captured in `artifacts\build_dicta_exe_20260526_204800.log`
 - `dist\Dicta\Dicta.exe --self-test --allow-missing-models`
 
 Latest successful build log:
 
-- `artifacts\build_dicta_exe_20260526_203500.log`
+- `artifacts\build_dicta_exe_20260526_204800.log`
 
 Latest successful dist diagnostic log:
 
