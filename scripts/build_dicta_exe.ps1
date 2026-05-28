@@ -32,7 +32,7 @@ Invoke-NativeCommand -FilePath "python" -ArgumentList @("scripts\generate_app_ic
 Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "PyInstaller", "--noconfirm", "--clean", "--windowed", "--icon", "assets\app_icon.ico", "--name", "Dicta", "dicta.py")
 
 $dist = "dist\Dicta"
-New-Item -ItemType Directory -Force -Path "$dist\models", "$dist\.tools\whisper.cpp-build-compat\bin", "$dist\assets", "$dist\docs", "$dist\scripts" | Out-Null
+New-Item -ItemType Directory -Force -Path "$dist\models", "$dist\.tools\whisper.cpp-build-compat\bin", "$dist\assets", "$dist\docs", "$dist\scripts", "$dist\translation" | Out-Null
 
 if ($SkipModels) {
     @"
@@ -87,6 +87,11 @@ Copy-Item -LiteralPath `
     -Force
 
 Copy-Item -LiteralPath `
+    "translation\glossary_en_ru.json" `
+    -Destination "$dist\translation" `
+    -Force
+
+Copy-Item -LiteralPath `
     "docs\IB_PACKAGE_DESCRIPTION.md", `
     "docs\PROGRAM_LOGIC.md", `
     "docs\ROADMAP.md", `
@@ -122,7 +127,9 @@ Copy-Item -LiteralPath `
     "scripts\list_audio_devices.ps1", `
     "scripts\list_audio_devices.cmd", `
     "scripts\audit_dicta_network.ps1", `
-    "scripts\audit_dicta_network.cmd" `
+    "scripts\audit_dicta_network.cmd", `
+    "scripts\argos_translate_worker.py", `
+    "scripts\prepare_argos_translation_pack.ps1" `
     -Destination "$dist\scripts" `
     -Force
 

@@ -37,10 +37,12 @@ function Get-PackageCategory {
 
     if ($RelativePath -eq "Dicta.exe") { return "application" }
     if ($RelativePath -like "_internal/*") { return "runtime" }
+    if ($RelativePath -like ".tools/argos-translate/*") { return "translation-runtime" }
     if ($RelativePath -like ".tools/*") { return "speech-backend" }
     if ($RelativePath -like "models/*.bin") { return "model" }
     if ($RelativePath -like "models/*") { return "model-placeholder" }
     if ($RelativePath -like "assets/*") { return "asset" }
+    if ($RelativePath -like "translation/*") { return "translation-config" }
     if ($RelativePath -like "docs/*") { return "documentation" }
     if ($RelativePath -like "scripts/*") { return "support-script" }
     return "package-file"

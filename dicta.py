@@ -64,25 +64,40 @@ PROFILE_MODEL_KEYS = {
 }
 DEFAULT_PROFILE_LABEL = "Стандарт"
 FALLBACK_AUTO_MODEL_KEY = "small-q5_1"
+TRANSLATION_PACK_DIR = APP_DIR / ".tools" / "argos-translate"
+ARGOS_PACKAGES_DIR = TRANSLATION_PACK_DIR / "packages"
+ARGOS_DATA_DIR = TRANSLATION_PACK_DIR / "data"
+ARGOS_CONFIG_DIR = TRANSLATION_PACK_DIR / "config"
+ARGOS_CACHE_DIR = TRANSLATION_PACK_DIR / "cache"
+ARGOS_WORKER_EXE = TRANSLATION_PACK_DIR / "argos-worker.exe"
+ARGOS_WORKER_SCRIPT_CANDIDATES = (
+    APP_DIR / "scripts" / "argos_translate_worker.py",
+    TRANSLATION_PACK_DIR / "argos_translate_worker.py",
+)
+ARGOS_PYTHON_CANDIDATES = (
+    TRANSLATION_PACK_DIR / "python" / "python.exe",
+    TRANSLATION_PACK_DIR / ".venv" / "Scripts" / "python.exe",
+    TRANSLATION_PACK_DIR / "Scripts" / "python.exe",
+)
+TRANSLATION_DIR = APP_DIR / "translation"
+EN_RU_GLOSSARY_PATH = TRANSLATION_DIR / "glossary_en_ru.json"
+ARGOS_TRANSLATION_TIMEOUT_SECONDS = 45
 RECOGNITION_MODE_LABELS = {
     "ru": "Русский текст",
     "en": "English text",
-    "ru_to_en": "Русский -> English",
 }
 RECOGNITION_MODE_KEY_BY_LABEL = {label: key for key, label in RECOGNITION_MODE_LABELS.items()}
 RUSSIAN_RECOGNITION_MODE_KEY = "ru"
-RU_TO_EN_RECOGNITION_MODE_KEY = "ru_to_en"
+ENGLISH_RECOGNITION_MODE_KEY = "en"
 DEFAULT_RECOGNITION_MODE_KEY = RUSSIAN_RECOGNITION_MODE_KEY
 DEFAULT_RECOGNITION_MODE_LABEL = RECOGNITION_MODE_LABELS[DEFAULT_RECOGNITION_MODE_KEY]
 RECOGNITION_MODE_LANGUAGES = {
     "ru": "ru",
     "en": "en",
-    "ru_to_en": "ru",
 }
 RECOGNITION_MODE_SPELLCHECK_TAGS = {
     "ru": "ru-RU",
     "en": "en-US",
-    "ru_to_en": "en-US",
 }
 SPELLCHECK_LANGUAGE_LABELS = {
     "ru-RU": "RU",
@@ -92,11 +107,6 @@ SPELLCHECK_AVAILABILITY_TESTS = (
     ("ru-RU", "Русский", "тест"),
     ("en-US", "Английский", "test"),
 )
-RECOGNITION_MODE_TRANSLATE_TO_ENGLISH = {
-    "ru": False,
-    "en": False,
-    "ru_to_en": True,
-}
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
@@ -811,6 +821,8 @@ def sanitize_whisper_threads(value: object | None, default: int = DEFAULT_WHISPE
 def sanitize_recognition_mode_key(value: object | None) -> str:
     if isinstance(value, str) and value in RECOGNITION_MODE_LABELS:
         return value
+    if value in {"en_to_ru", "ru_to_en"}:
+        return ENGLISH_RECOGNITION_MODE_KEY if value == "en_to_ru" else RUSSIAN_RECOGNITION_MODE_KEY
     return DEFAULT_RECOGNITION_MODE_KEY
 
 
@@ -822,10 +834,6 @@ def recognition_mode_spellcheck_tag(mode_key: object | None) -> str:
     return RECOGNITION_MODE_SPELLCHECK_TAGS[sanitize_recognition_mode_key(mode_key)]
 
 
-def recognition_mode_translate_to_english(mode_key: object | None) -> bool:
-    return RECOGNITION_MODE_TRANSLATE_TO_ENGLISH[sanitize_recognition_mode_key(mode_key)]
-
-
 def spellcheck_language_label(language_tag: str) -> str:
     return SPELLCHECK_LANGUAGE_LABELS.get(language_tag, language_tag)
 
@@ -835,6 +843,268 @@ def spellcheck_availability_label(language_tag: str) -> str:
         if tag == language_tag:
             return label
     return language_tag
+
+
+def find_argos_worker_script() -> Path | None:
+    for path in ARGOS_WORKER_SCRIPT_CANDIDATES:
+        if path.exists():
+            return path
+    return None
+
+
+def find_argos_runtime() -> tuple[str | None, Path | None, Path | None]:
+    if ARGOS_WORKER_EXE.exists():
+        return "exe", ARGOS_WORKER_EXE, None
+
+    worker_script = find_argos_worker_script()
+    if worker_script is None:
+        return None, None, None
+
+    for python_path in ARGOS_PYTHON_CANDIDATES:
+        if python_path.exists():
+            return "python", python_path, worker_script
+    return None, None, worker_script
+
+
+def translation_direction_key(from_code: str, to_code: str) -> str:
+    return f"{from_code}_{to_code}"
+
+
+def find_argos_model(from_code: str, to_code: str, packages_dir: Path = ARGOS_PACKAGES_DIR) -> Path | None:
+    if not packages_dir.exists():
+        return None
+
+    for metadata_path in sorted(packages_dir.glob("*/metadata.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        package_type = str(metadata.get("type", "translate"))
+        if (
+            package_type == "translate"
+            and metadata.get("from_code") == from_code
+            and metadata.get("to_code") == to_code
+        ):
+            return metadata_path.parent
+    return None
+
+
+def _load_string_replacements(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    replacements: dict[str, str] = {}
+    for source, target in value.items():
+        if isinstance(source, str) and isinstance(target, str) and source:
+            replacements[source] = target
+    return replacements
+
+
+def load_translation_glossary(path: Path = EN_RU_GLOSSARY_PATH) -> tuple[dict[str, str], str | None]:
+    if not path.exists():
+        return {}, None
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {}, str(exc)
+
+    replacements: dict[str, str] = {}
+    if isinstance(data, dict):
+        replacements.update(_load_string_replacements(data.get("postprocess")))
+        replacements.update(_load_string_replacements(data.get("replacements")))
+        if not replacements:
+            replacements.update(_load_string_replacements(data))
+    else:
+        return {}, "glossary root must be a JSON object"
+
+    return replacements, None
+
+
+def apply_translation_glossary(text: str, path: Path = EN_RU_GLOSSARY_PATH) -> str:
+    replacements, error = load_translation_glossary(path)
+    if error:
+        return text
+
+    result = text
+    for source, target in replacements.items():
+        result = result.replace(source, target)
+    return result
+
+
+def apply_translation_postprocess(text: str, from_code: str, to_code: str) -> str:
+    if from_code == "en" and to_code == "ru":
+        return apply_translation_glossary(text)
+    return text
+
+
+def detect_translation_pack() -> dict[str, object]:
+    runtime_kind, runtime_path, worker_script = find_argos_runtime()
+    models = {
+        "en_ru": find_argos_model("en", "ru"),
+        "ru_en": find_argos_model("ru", "en"),
+    }
+    _replacements, glossary_error = load_translation_glossary()
+    runtime_available = bool(runtime_kind and runtime_path)
+    available_directions = {key: bool(runtime_available and path) for key, path in models.items()}
+    return {
+        "available": bool(runtime_available and all(available_directions.values())),
+        "available_directions": available_directions,
+        "runtime_kind": runtime_kind,
+        "runtime_path": runtime_path,
+        "worker_script": worker_script,
+        "packages_dir": ARGOS_PACKAGES_DIR,
+        "model_paths": models,
+        "model_path": models["en_ru"],
+        "glossary_path": EN_RU_GLOSSARY_PATH,
+        "glossary_error": glossary_error,
+    }
+
+
+def translation_model_path(status: dict[str, object], from_code: str, to_code: str) -> Path | None:
+    model_paths = status.get("model_paths")
+    if isinstance(model_paths, dict):
+        model_path = model_paths.get(translation_direction_key(from_code, to_code))
+        if isinstance(model_path, Path):
+            return model_path
+        if model_path:
+            return Path(str(model_path))
+    if from_code == "en" and to_code == "ru":
+        model_path = status.get("model_path")
+        if isinstance(model_path, Path):
+            return model_path
+        if model_path:
+            return Path(str(model_path))
+    return None
+
+
+def is_translation_direction_available(status: dict[str, object], from_code: str, to_code: str) -> bool:
+    return bool(status.get("runtime_path") and translation_model_path(status, from_code, to_code))
+
+
+def translation_pack_missing_details(
+    status: dict[str, object],
+    from_code: str | None = None,
+    to_code: str | None = None,
+) -> str:
+    missing: list[str] = []
+    if not status.get("runtime_path"):
+        missing.append(f"runtime: {TRANSLATION_PACK_DIR}")
+    if not status.get("worker_script") and status.get("runtime_kind") != "exe":
+        missing.append(f"worker: {ARGOS_WORKER_SCRIPT_CANDIDATES[0]}")
+    directions = [(from_code, to_code)] if from_code and to_code else [("en", "ru"), ("ru", "en")]
+    for source_code, target_code in directions:
+        if not translation_model_path(status, source_code, target_code):
+            missing.append(f"model {source_code}->{target_code}: {ARGOS_PACKAGES_DIR}")
+    return "; ".join(missing) if missing else str(TRANSLATION_PACK_DIR)
+
+
+def translation_pack_status_label(status: dict[str, object]) -> str:
+    glossary_error = status.get("glossary_error")
+    glossary_note = "glossary: ошибка" if glossary_error else "glossary: ok"
+    runtime_kind = status.get("runtime_kind") or "runtime"
+
+    def direction_label(from_code: str, to_code: str) -> str:
+        model_path = translation_model_path(status, from_code, to_code)
+        state = "доступен" if is_translation_direction_available(status, from_code, to_code) else "недоступен"
+        model_name = Path(model_path).name if model_path else f"{from_code}->{to_code}"
+        return f"{from_code.upper()}->{to_code.upper()}: {state} ({model_name})"
+
+    details = f"{direction_label('en', 'ru')}; {direction_label('ru', 'en')}"
+    if not status.get("runtime_path"):
+        return f"Перевод: недоступен ({translation_pack_missing_details(status)}; {glossary_note})"
+    return f"Перевод: {details}; runtime {runtime_kind}; {glossary_note}"
+
+
+def _parse_worker_json_response(output: str) -> dict | None:
+    try:
+        payload = json.loads(output)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        pass
+
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            continue
+    return None
+
+
+def run_argos_translation(
+    text: str,
+    status: dict[str, object] | None = None,
+    from_code: str = "en",
+    to_code: str = "ru",
+) -> str:
+    if not text.strip():
+        return text
+
+    status = status or detect_translation_pack()
+    if not is_translation_direction_available(status, from_code, to_code):
+        raise RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(status, from_code, to_code)}")
+
+    runtime_kind = status.get("runtime_kind")
+    runtime_path = status.get("runtime_path")
+    worker_script = status.get("worker_script")
+    packages_dir = Path(status.get("packages_dir") or ARGOS_PACKAGES_DIR)
+    if runtime_kind == "exe" and runtime_path:
+        args = [str(runtime_path)]
+    elif runtime_kind == "python" and runtime_path and worker_script:
+        args = [str(runtime_path), "-u", str(worker_script)]
+    else:
+        raise RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(status)}")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARGOS_DEBUG": "0",
+            "ARGOS_DEVICE_TYPE": "cpu",
+            "ARGOS_PACKAGES_DIR": str(packages_dir),
+            "XDG_DATA_HOME": str(ARGOS_DATA_DIR.parent),
+            "XDG_CONFIG_HOME": str(ARGOS_CONFIG_DIR.parent),
+            "XDG_CACHE_HOME": str(ARGOS_CACHE_DIR.parent),
+        }
+    )
+    request = {
+        "text": text,
+        "from_code": from_code,
+        "to_code": to_code,
+        "packages_dir": str(packages_dir),
+    }
+
+    try:
+        completed = subprocess.run(
+            args,
+            input=json.dumps(request, ensure_ascii=False).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=ARGOS_TRANSLATION_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"translation-timeout::{ARGOS_TRANSLATION_TIMEOUT_SECONDS}") from exc
+
+    stdout = completed.stdout.decode("utf-8", errors="replace").strip()
+    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+    payload = _parse_worker_json_response(stdout)
+    if payload is not None:
+        if not payload.get("ok"):
+            raise RuntimeError(f"translation-failed::worker::{payload.get('error', 'unknown error')}")
+        translated = str(payload.get("text", "")).strip()
+        return apply_translation_postprocess(translated, from_code, to_code)
+
+    technical = "\n".join(part for part in (stderr, stdout) if part)
+    if completed.returncode != 0:
+        raise RuntimeError(f"translation-failed::{completed.returncode}::{technical}")
+    raise RuntimeError(f"translation-failed::invalid-response::{technical}")
 
 
 def backend_thread_candidates(backend_name: str) -> list[int]:
@@ -1531,6 +1801,7 @@ class DictaApp:
         self.is_testing_microphone = False
         self.is_finding_microphone = False
         self.is_benchmarking = False
+        self.is_translating = False
         self.record_started_at: float | None = None
         self.record_sample_rate = SAMPLE_RATE
         self.last_input_stream_config: dict | None = None
@@ -1539,14 +1810,22 @@ class DictaApp:
         self.last_level_event_at = 0.0
         self.input_devices: dict[str, list[int]] = {}
         self.preferred_input_configs: dict[str, dict] = {}
+        self.last_recognition_audio_bytes: bytes | None = None
+        self.last_recognition_sample_rate: int | None = None
+        self.last_recognition_model_path: Path | None = None
+        self.last_recognition_backend_preference: str | None = None
+        self.last_recognition_mode_key: str | None = None
+        self.last_recognition_text: str = ""
         self.spellcheck_after_id: str | None = None
         self.spellcheck_generation = 0
         self.spelling_issues: dict[str, SpellingIssue] = {}
         self.current_text_spellcheck_language_tag = recognition_mode_spellcheck_tag(DEFAULT_RECOGNITION_MODE_KEY)
         self.is_checking_spellcheck_languages = False
         self.settings = load_user_settings()
+        self.translation_pack_status = detect_translation_pack()
         self.hotkey_thread: threading.Thread | None = None
         self.hotkey_thread_id: int | None = None
+        self.translation_worker: threading.Thread | None = None
         self.format_undo_snapshot: tuple[str, str] | None = None
         self.settings_snapshot: dict[str, object] = {}
 
@@ -1568,11 +1847,15 @@ class DictaApp:
         self.spellcheck_status_var = tk.StringVar(value="Орфография: авто")
         self.spellcheck_ru_availability_var = tk.StringVar(value="Русский: не проверено")
         self.spellcheck_en_availability_var = tk.StringVar(value="Английский: не проверено")
+        self.translation_pack_status_var = tk.StringVar(
+            value=translation_pack_status_label(self.translation_pack_status)
+        )
         self.hotkey_status_var = tk.StringVar(value=f"Горячая клавиша: {HOTKEY_LABEL}")
+        initial_recognition_mode = sanitize_recognition_mode_key(
+            self.settings.get("recognition_mode", DEFAULT_RECOGNITION_MODE_KEY)
+        )
         self.recognition_mode_var = tk.StringVar(
-            value=RECOGNITION_MODE_LABELS[
-                sanitize_recognition_mode_key(self.settings.get("recognition_mode", DEFAULT_RECOGNITION_MODE_KEY))
-            ]
+            value=RECOGNITION_MODE_LABELS[initial_recognition_mode]
         )
         self.current_text_spellcheck_language_tag = recognition_mode_spellcheck_tag(self._selected_recognition_mode_key())
         self.auto_copy_var = tk.BooleanVar(value=self.settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"]))
@@ -1604,7 +1887,7 @@ class DictaApp:
 
         toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(6, weight=1)
+        toolbar.columnconfigure(8, weight=1)
 
         self.record_button = ttk.Button(toolbar, text="Записать", command=self.toggle_recording)
         self.record_button.grid(row=0, column=0, padx=(0, 8))
@@ -1614,20 +1897,26 @@ class DictaApp:
         self.copy_button = ttk.Button(toolbar, text="Скопировать", command=self.copy_text)
         self.copy_button.grid(row=0, column=1, padx=(0, 8))
 
+        self.translate_to_ru_button = ttk.Button(toolbar, text="В русский", command=self.translate_current_text_to_russian)
+        self.translate_to_ru_button.grid(row=0, column=2, padx=(0, 8))
+
+        self.translate_to_en_button = ttk.Button(toolbar, text="В English", command=self.translate_last_recording_to_english)
+        self.translate_to_en_button.grid(row=0, column=3, padx=(0, 8))
+
         self.format_button = ttk.Button(toolbar, text="Автоформат", command=self.format_current_text)
 
         self.toolbar_recognition_mode_box = ttk.Combobox(
             toolbar,
             textvariable=self.recognition_mode_var,
-            values=list(RECOGNITION_MODE_LABELS.values()),
+            values=self._recognition_mode_labels(),
             state="readonly",
             width=18,
         )
-        self.toolbar_recognition_mode_box.grid(row=0, column=2, padx=(0, 8))
+        self.toolbar_recognition_mode_box.grid(row=0, column=4, padx=(0, 8))
         self.toolbar_recognition_mode_box.bind("<<ComboboxSelected>>", self._on_toolbar_recognition_mode_changed)
 
         self.clear_button = ttk.Button(toolbar, text="Очистить", command=self.clear_text)
-        self.clear_button.grid(row=0, column=3, padx=(0, 16))
+        self.clear_button.grid(row=0, column=5, padx=(0, 16))
 
         self.input_level_bar = ttk.Progressbar(
             toolbar,
@@ -1636,11 +1925,11 @@ class DictaApp:
             mode="determinate",
             length=120,
         )
-        self.input_level_bar.grid(row=0, column=4, sticky="w", padx=(0, 6))
-        ttk.Label(toolbar, textvariable=self.input_level_text_var).grid(row=0, column=5, sticky="w", padx=(0, 18))
+        self.input_level_bar.grid(row=0, column=6, sticky="w", padx=(0, 6))
+        ttk.Label(toolbar, textvariable=self.input_level_text_var).grid(row=0, column=7, sticky="w", padx=(0, 18))
 
         self.settings_button = ttk.Button(toolbar, text="Настройки", command=self.show_settings)
-        self.settings_button.grid(row=0, column=7, sticky="e")
+        self.settings_button.grid(row=0, column=9, sticky="e")
 
         text_frame = ttk.Frame(self.root, padding=(12, 6, 12, 6))
         text_frame.grid(row=1, column=0, sticky="nsew")
@@ -1671,6 +1960,7 @@ class DictaApp:
         ttk.Label(status_bar, textvariable=self.spellcheck_status_var).grid(row=0, column=4, sticky="e")
 
         self._build_settings_window()
+        self._update_translation_button_state()
 
     def _build_settings_window(self) -> None:
         self.settings_window = tk.Toplevel(self.root)
@@ -1748,7 +2038,7 @@ class DictaApp:
         self.recognition_mode_box = ttk.Combobox(
             text_tab,
             textvariable=self.recognition_mode_var,
-            values=list(RECOGNITION_MODE_LABELS.values()),
+            values=self._recognition_mode_labels(),
             state="readonly",
             width=18,
         )
@@ -1797,6 +2087,26 @@ class DictaApp:
         )
         ttk.Label(text_tab, textvariable=self.spellcheck_en_availability_var).grid(
             row=8,
+            column=0,
+            columnspan=2,
+            sticky="w",
+        )
+        ttk.Separator(text_tab, orient="horizontal").grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 10))
+        ttk.Label(text_tab, text="Перевод EN->RU:").grid(
+            row=10,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+            pady=(0, 8),
+        )
+        self.translation_check_button = ttk.Button(
+            text_tab,
+            text="Проверить",
+            command=self.start_translation_availability_check,
+        )
+        self.translation_check_button.grid(row=10, column=1, sticky="w", pady=(0, 8))
+        ttk.Label(text_tab, textvariable=self.translation_pack_status_var, wraplength=560).grid(
+            row=11,
             column=0,
             columnspan=2,
             sticky="w",
@@ -1861,6 +2171,7 @@ class DictaApp:
         self.settings_window.lift()
         self.settings_window.focus_force()
         self.start_spellcheck_availability_check()
+        self.start_translation_availability_check()
 
     def hide_settings(self) -> None:
         self.settings_window.withdraw()
@@ -1974,7 +2285,7 @@ class DictaApp:
         if self.is_recording:
             self.stop_recording()
             return
-        if self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
+        if self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
             return
         if self.record_button.instate(["!disabled"]):
             self.start_recording()
@@ -1988,20 +2299,49 @@ class DictaApp:
     def _set_record_button_idle(self) -> None:
         self.record_button.configure(text="Записать", command=self.toggle_recording, state=tk.NORMAL)
         self._set_recognition_mode_controls_state("readonly")
+        self._update_translation_button_state()
 
     def _set_record_button_recording(self) -> None:
         self.record_button.configure(text="Стоп", command=self.stop_recording, state=tk.NORMAL)
         self._set_recognition_mode_controls_state(tk.DISABLED)
+        self._set_translation_buttons_state(tk.DISABLED)
 
     def _set_record_button_busy(self, text: str) -> None:
         self.record_button.configure(text=text, state=tk.DISABLED)
         self._set_recognition_mode_controls_state(tk.DISABLED)
+        self._set_translation_buttons_state(tk.DISABLED)
 
     def _set_recognition_mode_controls_state(self, state: str) -> None:
         for control_name in ("toolbar_recognition_mode_box", "recognition_mode_box"):
             control = getattr(self, control_name, None)
             if control is not None:
                 control.configure(state=state)
+
+    def _is_recognition_mode_available(self, mode_key: str) -> bool:
+        return mode_key in RECOGNITION_MODE_LABELS
+
+    def _recognition_mode_labels(self) -> list[str]:
+        return [
+            label
+            for key, label in RECOGNITION_MODE_LABELS.items()
+            if self._is_recognition_mode_available(key)
+        ]
+
+    def _refresh_recognition_mode_options(self) -> None:
+        labels = self._recognition_mode_labels()
+        for control_name in ("toolbar_recognition_mode_box", "recognition_mode_box"):
+            control = getattr(self, control_name, None)
+            if control is not None:
+                control.configure(values=labels)
+
+        selected_key = self._selected_recognition_mode_key()
+        if not self._is_recognition_mode_available(selected_key):
+            fallback_key = ENGLISH_RECOGNITION_MODE_KEY
+            self._select_recognition_mode_key(fallback_key)
+            self._set_text_spellcheck_language_from_mode(fallback_key)
+            self.spellcheck_generation += 1
+            self._clear_spelling_marks()
+            self._schedule_spellcheck(delay_ms=100)
 
     def _on_profile_changed(self, event=None) -> None:
         self._apply_profile_selection()
@@ -2013,7 +2353,11 @@ class DictaApp:
         self._update_speed_status()
 
     def _on_recognition_mode_changed(self, event=None) -> None:
-        self._set_text_spellcheck_language_from_mode(self._selected_recognition_mode_key())
+        selected_key = self._selected_recognition_mode_key()
+        if not self._is_recognition_mode_available(selected_key):
+            selected_key = ENGLISH_RECOGNITION_MODE_KEY
+            self._select_recognition_mode_key(selected_key)
+        self._set_text_spellcheck_language_from_mode(selected_key)
         self.spellcheck_generation += 1
         self._clear_spelling_marks()
         self._schedule_spellcheck(delay_ms=100)
@@ -2090,6 +2434,54 @@ class DictaApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def start_translation_availability_check(self) -> None:
+        self.translation_pack_status = detect_translation_pack()
+        self.translation_pack_status_var.set(translation_pack_status_label(self.translation_pack_status))
+        self._refresh_recognition_mode_options()
+        self._update_translation_button_state()
+
+    def _set_translation_buttons_state(self, state: str) -> None:
+        for button_name in ("translate_to_ru_button", "translate_to_en_button"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.configure(state=state)
+
+    def _clear_last_recognition_audio(self) -> None:
+        self.last_recognition_audio_bytes = None
+        self.last_recognition_sample_rate = None
+        self.last_recognition_model_path = None
+        self.last_recognition_backend_preference = None
+        self.last_recognition_mode_key = None
+        self.last_recognition_text = ""
+        self._update_translation_button_state()
+
+    def _update_translation_button_state(self) -> None:
+        busy = (
+            self.is_recording
+            or self.is_recognizing
+            or self.is_testing_microphone
+            or self.is_finding_microphone
+            or self.is_benchmarking
+            or self.is_translating
+        )
+        text_has_value = bool(getattr(self, "text", None) and self.text.get("1.0", tk.END).strip())
+        to_ru_state = (
+            tk.NORMAL
+            if is_translation_direction_available(self.translation_pack_status, "en", "ru") and text_has_value and not busy
+            else tk.DISABLED
+        )
+        to_en_state = (
+            tk.NORMAL
+            if is_translation_direction_available(self.translation_pack_status, "ru", "en") and text_has_value and not busy
+            else tk.DISABLED
+        )
+        to_ru_button = getattr(self, "translate_to_ru_button", None)
+        if to_ru_button is not None:
+            to_ru_button.configure(state=to_ru_state)
+        to_en_button = getattr(self, "translate_to_en_button", None)
+        if to_en_button is not None:
+            to_en_button.configure(state=to_en_state)
+
     def _selected_backend_preference(self) -> str | None:
         backend_key = self._selected_backend_key()
         return None if backend_key == "auto" else backend_key
@@ -2123,7 +2515,7 @@ class DictaApp:
         return backends[0][0] if backends else "нет whisper-cli"
 
     def start_model_benchmark(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
             return
 
         self.is_benchmarking = True
@@ -2168,7 +2560,7 @@ class DictaApp:
             self.ui_queue.put(("benchmark_ready", None))
 
     def start_backend_benchmark(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
             return
 
         self.is_benchmarking = True
@@ -2258,6 +2650,7 @@ class DictaApp:
             or self.is_testing_microphone
             or self.is_finding_microphone
             or self.is_benchmarking
+            or self.is_translating
         ):
             self._set_record_button_idle()
         self.test_input_button.configure(state=tk.NORMAL)
@@ -2289,7 +2682,7 @@ class DictaApp:
         return input_device_default_sample_rate(device_index)
 
     def start_microphone_test(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
             return
 
         self.mic_test_peak = 0
@@ -2444,7 +2837,7 @@ class DictaApp:
         )
 
     def start_microphone_search(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
             return
 
         self.refresh_input_devices()
@@ -2519,12 +2912,13 @@ class DictaApp:
         return "\n".join(lines)
 
     def start_recording(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking:
+        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
             return
 
         self.audio_chunks = []
         self.recognition_time_var.set("Распознавание: -")
         self.last_input_stream_config = None
+        self._clear_last_recognition_audio()
         self._set_input_level(0)
 
         try:
@@ -2688,6 +3082,104 @@ class DictaApp:
         self._copy_value_to_clipboard(value)
         self._set_status("Скопировано")
 
+    def translate_current_text_to_russian(self) -> None:
+        if (
+            self.is_recording
+            or self.is_recognizing
+            or self.is_testing_microphone
+            or self.is_finding_microphone
+            or self.is_benchmarking
+            or self.is_translating
+        ):
+            return
+
+        value = self.text.get("1.0", tk.END).strip()
+        if not value:
+            self._set_status("Нет текста для перевода")
+            self._update_translation_button_state()
+            return
+
+        self.translation_pack_status = detect_translation_pack()
+        self.translation_pack_status_var.set(translation_pack_status_label(self.translation_pack_status))
+        if not is_translation_direction_available(self.translation_pack_status, "en", "ru"):
+            self._update_translation_button_state()
+            messagebox.showwarning(
+                "Dicta",
+                self._format_translation_error(
+                    RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(self.translation_pack_status, 'en', 'ru')}")
+                ),
+            )
+            return
+
+        self.is_translating = True
+        self._set_status("Перевод EN->RU")
+        self._set_record_button_busy("Перевод")
+        self.translation_worker = threading.Thread(
+            target=self._translate_text_to_russian_worker,
+            args=(value, dict(self.translation_pack_status)),
+            daemon=True,
+        )
+        self.translation_worker.start()
+
+    def _translate_text_to_russian_worker(self, source: str, translation_status: dict[str, object]) -> None:
+        started_at = time.perf_counter()
+        try:
+            translated = run_argos_translation(source, translation_status, from_code="en", to_code="ru")
+            elapsed = time.perf_counter() - started_at
+            self.ui_queue.put(("translation_to_ru_result", (source, translated, elapsed)))
+        except Exception as exc:
+            self.ui_queue.put(("translation_error", self._format_translation_error(exc)))
+        finally:
+            self.ui_queue.put(("translation_ready", None))
+
+    def translate_last_recording_to_english(self) -> None:
+        if (
+            self.is_recording
+            or self.is_recognizing
+            or self.is_testing_microphone
+            or self.is_finding_microphone
+            or self.is_benchmarking
+            or self.is_translating
+        ):
+            return
+
+        if not self.text.get("1.0", tk.END).strip():
+            self._set_status("Нет текста для перевода")
+            self._update_translation_button_state()
+            return
+        self.translation_pack_status = detect_translation_pack()
+        self.translation_pack_status_var.set(translation_pack_status_label(self.translation_pack_status))
+        if not is_translation_direction_available(self.translation_pack_status, "ru", "en"):
+            messagebox.showwarning(
+                "Dicta",
+                self._format_translation_error(
+                    RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(self.translation_pack_status, 'ru', 'en')}")
+                ),
+            )
+            self._update_translation_button_state()
+            return
+
+        self.is_translating = True
+        self._set_status("Перевод RU->EN")
+        self._set_record_button_busy("Перевод")
+        self.translation_worker = threading.Thread(
+            target=self._translate_text_to_english_worker,
+            args=(self.text.get("1.0", tk.END).strip(), dict(self.translation_pack_status)),
+            daemon=True,
+        )
+        self.translation_worker.start()
+
+    def _translate_text_to_english_worker(self, source: str, translation_status: dict[str, object]) -> None:
+        started_at = time.perf_counter()
+        try:
+            translated = run_argos_translation(source, translation_status, from_code="ru", to_code="en")
+            elapsed = time.perf_counter() - started_at
+            self.ui_queue.put(("translation_to_en_result", (source, translated, elapsed)))
+        except Exception as exc:
+            self.ui_queue.put(("translation_error", self._format_translation_error(exc)))
+        finally:
+            self.ui_queue.put(("translation_ready", None))
+
     def _has_text_selection(self) -> bool:
         try:
             self.text.index(tk.SEL_FIRST)
@@ -2796,6 +3288,7 @@ class DictaApp:
         self.text.delete("1.0", tk.END)
         self.format_undo_snapshot = None
         self.format_button.configure(text="Автоформат")
+        self._clear_last_recognition_audio()
         self._set_text_spellcheck_language_from_mode(self._selected_recognition_mode_key())
         self._clear_spelling_marks()
         self._set_status("Готово")
@@ -2805,6 +3298,7 @@ class DictaApp:
             return
         self.text.edit_modified(False)
         self._schedule_spellcheck()
+        self._update_translation_button_state()
 
     def _cancel_pending_spellcheck(self) -> None:
         if self.spellcheck_after_id is not None:
@@ -3130,7 +3624,6 @@ class DictaApp:
 
             recognition_mode_key = self._selected_recognition_mode_key()
             recognition_language = recognition_mode_language(recognition_mode_key)
-            translate_to_english = recognition_mode_translate_to_english(recognition_mode_key)
             sample_rate = self.record_sample_rate or SAMPLE_RATE
             raw_audio = b"".join(self.audio_chunks)
             normalized_audio, audio_stats = apply_pcm16_gain(raw_audio, self.audio_gain_percent_var.get())
@@ -3156,7 +3649,7 @@ class DictaApp:
                 out_base,
                 preferred_backend_key=self._selected_backend_preference(),
                 language=recognition_language,
-                translate_to_english=translate_to_english,
+                translate_to_english=False,
             )
 
             elapsed = time.perf_counter() - started_at
@@ -3165,6 +3658,12 @@ class DictaApp:
                 raise RuntimeError("missing-recognition-output")
 
             recognized = txt_path.read_text(encoding="utf-8").strip()
+            self.last_recognition_audio_bytes = bytes(audio_bytes)
+            self.last_recognition_sample_rate = sample_rate
+            self.last_recognition_model_path = selected_model
+            self.last_recognition_backend_preference = self._selected_backend_preference()
+            self.last_recognition_mode_key = recognition_mode_key
+            self.last_recognition_text = recognized
             self.ui_queue.put(
                 (
                     "recognized",
@@ -3289,7 +3788,7 @@ class DictaApp:
             elif event == "hotkey_status":
                 self.hotkey_status_var.set(str(value))
             elif event == "recognized":
-                recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key = value
+                recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key = value[:7]
                 self._set_text_spellcheck_language_from_mode(recognition_mode_key)
                 prepared = prepare_recognized_text(
                     str(recognized),
@@ -3318,6 +3817,58 @@ class DictaApp:
                     status = f"{status}; {gain_text}"
                 self._set_status(status)
                 self._schedule_spellcheck(delay_ms=100)
+                self._update_translation_button_state()
+            elif event == "translation_to_ru_result":
+                source, translated, translation_elapsed = value
+                current = self.text.get("1.0", tk.END).strip()
+                if current != str(source).strip():
+                    self._set_status("Текст изменен, перевод не применен")
+                    continue
+                prepared = prepare_recognized_text(
+                    str(translated),
+                    use_formatting=self.format_text_var.get(),
+                    use_voice_punctuation=False,
+                )
+                self.current_text_spellcheck_language_tag = "ru-RU"
+                self.text.delete("1.0", tk.END)
+                self.text.insert("1.0", prepared)
+                self.format_undo_snapshot = None
+                self.format_button.configure(text="Автоформат")
+                if self.auto_copy_var.get() and prepared:
+                    self._copy_value_to_clipboard(prepared)
+                    status = f"Переведено и скопировано: {translation_elapsed:.1f} с"
+                else:
+                    status = f"Переведено: {translation_elapsed:.1f} с"
+                self._set_status(status)
+                self._schedule_spellcheck(delay_ms=100)
+                self._update_translation_button_state()
+            elif event == "translation_to_en_result":
+                _source, translated, translation_elapsed = value
+                prepared = prepare_recognized_text(
+                    str(translated),
+                    use_formatting=self.format_text_var.get(),
+                    use_voice_punctuation=False,
+                )
+                self.current_text_spellcheck_language_tag = "en-US"
+                self.text.delete("1.0", tk.END)
+                self.text.insert("1.0", prepared)
+                self.format_undo_snapshot = None
+                self.format_button.configure(text="Автоформат")
+                if self.auto_copy_var.get() and prepared:
+                    self._copy_value_to_clipboard(prepared)
+                    status = f"Переведено в English и скопировано: {translation_elapsed:.1f} с"
+                else:
+                    status = f"Переведено в English: {translation_elapsed:.1f} с"
+                self._set_status(status)
+                self._schedule_spellcheck(delay_ms=100)
+                self._update_translation_button_state()
+            elif event == "translation_error":
+                self._set_status("Ошибка перевода")
+                messagebox.showwarning("Dicta", str(value))
+            elif event == "translation_ready":
+                self.is_translating = False
+                self.translation_worker = None
+                self._set_record_button_idle()
             elif event == "error":
                 self._set_status("Ошибка распознавания")
                 messagebox.showerror("Dicta", str(value))
@@ -3538,6 +4089,55 @@ class DictaApp:
             [
                 "Повторите запись короткой фразой.",
                 "Если ошибка повторяется, запустите scripts\\diagnose_dicta.cmd.",
+            ],
+            technical=self._shorten_technical_text(raw),
+        )
+
+    def _format_translation_error(self, exc: Exception) -> str:
+        raw = str(exc).strip()
+
+        if raw.startswith("missing-translation-pack::"):
+            details = raw.split("::", 1)[1]
+            return self._format_problem_message(
+                "Перевод EN->RU недоступен: не найден optional translation pack.",
+                [
+                    "Проверьте в настройках статус перевода EN->RU.",
+                    "Папка .tools\\argos-translate должна лежать рядом с Dicta.exe.",
+                    "Внутри pack должны быть runtime Argos и модель packages\\translate-en_ru-1_9.",
+                ],
+                technical=details,
+            )
+
+        if raw.startswith("translation-timeout::"):
+            seconds = raw.split("::", 1)[1]
+            return self._format_problem_message(
+                "Перевод EN->RU не завершился за отведенное время.",
+                [
+                    "Повторите запись более короткой фразой.",
+                    "Если ошибка повторяется, проверьте optional translation pack в настройках.",
+                ],
+                details=f"Таймаут: {seconds} с",
+            )
+
+        if raw.startswith("translation-failed::"):
+            parts = raw.split("::", 2)
+            code = parts[1] if len(parts) > 1 else "worker"
+            technical = parts[2] if len(parts) > 2 else raw
+            return self._format_problem_message(
+                "Локальный перевод EN->RU завершился с ошибкой.",
+                [
+                    "Проверьте в настройках наличие runtime и модели EN->RU.",
+                    "Если pack недавно заменяли, перезапустите Dicta и повторите запись.",
+                ],
+                details=f"Код перевода: {code}",
+                technical=self._shorten_technical_text(technical),
+            )
+
+        return self._format_problem_message(
+            "Не удалось выполнить локальный перевод EN->RU.",
+            [
+                "Проверьте optional translation pack в настройках.",
+                "Если ошибка повторяется, используйте режим English text до замены pack.",
             ],
             technical=self._shorten_technical_text(raw),
         )
@@ -3787,6 +4387,29 @@ def main() -> None:
         print("Dicta format-test passed.")
         raise SystemExit(0)
 
+    if "--translation-test" in sys.argv:
+        en_sample = "The recognized text is ready."
+        ru_sample = "Я лежу дома на диване."
+        if "--text" in sys.argv:
+            index = sys.argv.index("--text")
+            if index + 1 < len(sys.argv):
+                en_sample = sys.argv[index + 1]
+        status = detect_translation_pack()
+        print(translation_pack_status_label(status))
+        if not is_translation_direction_available(status, "en", "ru"):
+            print("Dicta translation-test failed. Missing EN->RU translation pack.")
+            raise SystemExit(1)
+        if not is_translation_direction_available(status, "ru", "en"):
+            print("Dicta translation-test failed. Missing RU->EN translation pack.")
+            raise SystemExit(1)
+        translated_ru = run_argos_translation(en_sample, status, from_code="en", to_code="ru")
+        translated_en = run_argos_translation(ru_sample, status, from_code="ru", to_code="en")
+        print(f"en_source={en_sample}")
+        print(f"ru_translated={translated_ru}")
+        print(f"ru_source={ru_sample}")
+        print(f"en_translated={translated_en}")
+        raise SystemExit(0)
+
     if "--benchmark-models" in sys.argv:
         allow_missing_models = "--allow-missing-models" in sys.argv
         profile = run_model_benchmark(allow_missing_models=allow_missing_models, print_fn=print)
@@ -3823,6 +4446,11 @@ def main() -> None:
     if "--self-test" in sys.argv:
         allow_missing_models = "--allow-missing-models" in sys.argv
         run_text_cleanup_self_test()
+        _glossary_replacements, glossary_error = load_translation_glossary()
+        if glossary_error:
+            print("Dicta self-test failed. Translation glossary is invalid:")
+            print(glossary_error)
+            raise SystemExit(1)
         required = [WHISPER_EXE] if allow_missing_models else [WHISPER_EXE, *MODEL_OPTIONS.values()]
         missing = [path for path in required if not path.exists()]
         if missing:
@@ -3844,6 +4472,7 @@ def main() -> None:
         print(f"PERFORMANCE_PROFILE={PERFORMANCE_PROFILE_PATH}")
         print(f"BACKEND_PROFILE={BACKEND_PROFILE_PATH}")
         print(f"USER_SETTINGS={USER_SETTINGS_PATH}")
+        print(f"TRANSLATION_PACK={translation_pack_status_label(detect_translation_pack())}")
         raise SystemExit(0)
 
     root = tk.Tk()

@@ -41,6 +41,36 @@ GitHub artifact является code-only пакетом. Перед испол
 models\ggml-small-q5_1.bin
 ```
 
+Опциональный локальный перевод English -> Русский включается только при наличии отдельного translation pack рядом с `Dicta.exe`. Основной code-only пакет не включает Argos runtime и модель перевода.
+
+```text
+.tools\argos-translate\
+  python\python.exe
+  packages\translate-en_ru-1_9\
+  packages\translate-ru_en-1_9\
+translation\glossary_en_ru.json
+scripts\argos_translate_worker.py
+```
+
+В настройках Dicta показывает статус runtime, моделей EN->RU/RU->EN и glossary. Перевод выполняется вручную:
+
+- `В русский` переводит текущий английский текст через optional Argos pack.
+- `В English` переводит текущий русский текст через optional Argos pack.
+
+Список режимов отвечает только за язык распознавания: `Русский текст` или `English text`.
+
+Локально pack можно подготовить из Argos spike:
+
+```powershell
+.\scripts\prepare_argos_translation_pack.ps1
+```
+
+Проверка полного пути перевода:
+
+```powershell
+python dicta.py --translation-test
+```
+
 В поставке 1.1 дополнительно создаются:
 
 ```text

@@ -110,6 +110,7 @@ $extraFiles = Get-ChildItem -LiteralPath $root -Recurse -File |
         $relative = Convert-ToPackagePath -FullName $_.FullName
         $relative -ne "SHA256SUMS.txt" -and
         $relative -notlike "diagnostics/*" -and
+        $relative -notlike ".tools/argos-translate/*" -and
         -not $listed.Contains($relative)
     } |
     Sort-Object @{ Expression = { Convert-ToPackagePath -FullName $_.FullName } }
