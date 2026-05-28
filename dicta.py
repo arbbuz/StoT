@@ -67,18 +67,35 @@ FALLBACK_AUTO_MODEL_KEY = "small-q5_1"
 RECOGNITION_MODE_LABELS = {
     "ru": "Русский текст",
     "en": "English text",
+    "ru_to_en": "Русский -> English",
 }
 RECOGNITION_MODE_KEY_BY_LABEL = {label: key for key, label in RECOGNITION_MODE_LABELS.items()}
 RUSSIAN_RECOGNITION_MODE_KEY = "ru"
+RU_TO_EN_RECOGNITION_MODE_KEY = "ru_to_en"
 DEFAULT_RECOGNITION_MODE_KEY = RUSSIAN_RECOGNITION_MODE_KEY
 DEFAULT_RECOGNITION_MODE_LABEL = RECOGNITION_MODE_LABELS[DEFAULT_RECOGNITION_MODE_KEY]
 RECOGNITION_MODE_LANGUAGES = {
     "ru": "ru",
     "en": "en",
+    "ru_to_en": "ru",
 }
 RECOGNITION_MODE_SPELLCHECK_TAGS = {
     "ru": "ru-RU",
     "en": "en-US",
+    "ru_to_en": "en-US",
+}
+SPELLCHECK_LANGUAGE_LABELS = {
+    "ru-RU": "RU",
+    "en-US": "EN",
+}
+SPELLCHECK_AVAILABILITY_TESTS = (
+    ("ru-RU", "Русский", "тест"),
+    ("en-US", "Английский", "test"),
+)
+RECOGNITION_MODE_TRANSLATE_TO_ENGLISH = {
+    "ru": False,
+    "en": False,
+    "ru_to_en": True,
 }
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -805,6 +822,21 @@ def recognition_mode_spellcheck_tag(mode_key: object | None) -> str:
     return RECOGNITION_MODE_SPELLCHECK_TAGS[sanitize_recognition_mode_key(mode_key)]
 
 
+def recognition_mode_translate_to_english(mode_key: object | None) -> bool:
+    return RECOGNITION_MODE_TRANSLATE_TO_ENGLISH[sanitize_recognition_mode_key(mode_key)]
+
+
+def spellcheck_language_label(language_tag: str) -> str:
+    return SPELLCHECK_LANGUAGE_LABELS.get(language_tag, language_tag)
+
+
+def spellcheck_availability_label(language_tag: str) -> str:
+    for tag, label, _sample in SPELLCHECK_AVAILABILITY_TESTS:
+        if tag == language_tag:
+            return label
+    return language_tag
+
+
 def backend_thread_candidates(backend_name: str) -> list[int]:
     cpu_count = max(1, os.cpu_count() or DEFAULT_WHISPER_THREADS)
     profile = "gpu" if backend_name in GPU_BACKEND_KEYS else "cpu"
@@ -923,10 +955,11 @@ def build_whisper_command(
     out_base: Path,
     threads: int = DEFAULT_WHISPER_THREADS,
     language: str = "ru",
+    translate_to_english: bool = False,
 ) -> list[str]:
     threads = sanitize_whisper_threads(threads)
     language = language if language in RECOGNITION_MODE_LANGUAGES.values() else "ru"
-    return [
+    command = [
         str(exe_path),
         "-m",
         str(model_path),
@@ -934,15 +967,22 @@ def build_whisper_command(
         str(wav_path),
         "-l",
         language,
-        "-t",
-        str(threads),
-        "-nt",
-        "-np",
-        "-nf",
-        "-otxt",
-        "-of",
-        str(out_base),
     ]
+    if translate_to_english:
+        command.append("-tr")
+    command.extend(
+        [
+            "-t",
+            str(threads),
+            "-nt",
+            "-np",
+            "-nf",
+            "-otxt",
+            "-of",
+            str(out_base),
+        ]
+    )
+    return command
 
 
 def decode_process_output(data: bytes) -> str:
@@ -958,9 +998,18 @@ def run_whisper_backend(
     timeout_seconds: int | None = None,
     threads: int = DEFAULT_WHISPER_THREADS,
     language: str = "ru",
+    translate_to_english: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     threads = sanitize_whisper_threads(threads)
-    command = build_whisper_command(exe_path, model_path, wav_path, out_base, threads=threads, language=language)
+    command = build_whisper_command(
+        exe_path,
+        model_path,
+        wav_path,
+        out_base,
+        threads=threads,
+        language=language,
+        translate_to_english=translate_to_english,
+    )
     try:
         completed = subprocess.run(
             command,
@@ -998,6 +1047,7 @@ def run_whisper_with_fallback(
     timeout_seconds: int | None = None,
     preferred_backend_key: str | None = None,
     language: str = "ru",
+    translate_to_english: bool = False,
 ) -> tuple[str, int, subprocess.CompletedProcess[bytes]]:
     backends = available_whisper_backends(preferred_backend_key)
     if not backends:
@@ -1026,6 +1076,7 @@ def run_whisper_with_fallback(
                 timeout_seconds,
                 threads=threads,
                 language=language,
+                translate_to_english=translate_to_english,
             )
             return backend_name, threads, completed
         except RuntimeError as exc:
@@ -1491,6 +1542,8 @@ class DictaApp:
         self.spellcheck_after_id: str | None = None
         self.spellcheck_generation = 0
         self.spelling_issues: dict[str, SpellingIssue] = {}
+        self.current_text_spellcheck_language_tag = recognition_mode_spellcheck_tag(DEFAULT_RECOGNITION_MODE_KEY)
+        self.is_checking_spellcheck_languages = False
         self.settings = load_user_settings()
         self.hotkey_thread: threading.Thread | None = None
         self.hotkey_thread_id: int | None = None
@@ -1513,12 +1566,15 @@ class DictaApp:
         self.microphone_search_progress_var = tk.DoubleVar(value=0)
         self.microphone_search_status_var = tk.StringVar(value="Поиск: -")
         self.spellcheck_status_var = tk.StringVar(value="Орфография: авто")
+        self.spellcheck_ru_availability_var = tk.StringVar(value="Русский: не проверено")
+        self.spellcheck_en_availability_var = tk.StringVar(value="Английский: не проверено")
         self.hotkey_status_var = tk.StringVar(value=f"Горячая клавиша: {HOTKEY_LABEL}")
         self.recognition_mode_var = tk.StringVar(
             value=RECOGNITION_MODE_LABELS[
                 sanitize_recognition_mode_key(self.settings.get("recognition_mode", DEFAULT_RECOGNITION_MODE_KEY))
             ]
         )
+        self.current_text_spellcheck_language_tag = recognition_mode_spellcheck_tag(self._selected_recognition_mode_key())
         self.auto_copy_var = tk.BooleanVar(value=self.settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"]))
         self.format_text_var = tk.BooleanVar(value=self.settings.get("format_text", DEFAULT_USER_SETTINGS["format_text"]))
         self.voice_punctuation_var = tk.BooleanVar(
@@ -1619,7 +1675,7 @@ class DictaApp:
     def _build_settings_window(self) -> None:
         self.settings_window = tk.Toplevel(self.root)
         self.settings_window.title("Dicta: настройки")
-        self.settings_window.geometry("720x450")
+        self.settings_window.geometry("720x500")
         self.settings_window.minsize(620, 360)
         self.settings_window.transient(self.root)
         self.settings_window.protocol("WM_DELETE_WINDOW", self.hide_settings)
@@ -1717,7 +1773,34 @@ class DictaApp:
             variable=self.voice_punctuation_var,
         )
         self.voice_punctuation_check.grid(row=3, column=0, sticky="w", pady=(0, 12))
-        ttk.Label(text_tab, textvariable=self.spellcheck_status_var).grid(row=4, column=0, sticky="w")
+        ttk.Label(text_tab, textvariable=self.spellcheck_status_var).grid(row=4, column=0, sticky="w", pady=(0, 12))
+        ttk.Separator(text_tab, orient="horizontal").grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        ttk.Label(text_tab, text="Проверка орфографии:").grid(
+            row=6,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+            pady=(0, 8),
+        )
+        self.spellcheck_check_button = ttk.Button(
+            text_tab,
+            text="Проверить",
+            command=self.start_spellcheck_availability_check,
+        )
+        self.spellcheck_check_button.grid(row=6, column=1, sticky="w", pady=(0, 8))
+        ttk.Label(text_tab, textvariable=self.spellcheck_ru_availability_var).grid(
+            row=7,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 4),
+        )
+        ttk.Label(text_tab, textvariable=self.spellcheck_en_availability_var).grid(
+            row=8,
+            column=0,
+            columnspan=2,
+            sticky="w",
+        )
 
         performance_tab.columnconfigure(1, weight=1)
         ttk.Label(performance_tab, text="Модель:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
@@ -1777,6 +1860,7 @@ class DictaApp:
         self.settings_window.deiconify()
         self.settings_window.lift()
         self.settings_window.focus_force()
+        self.start_spellcheck_availability_check()
 
     def hide_settings(self) -> None:
         self.settings_window.withdraw()
@@ -1929,6 +2013,7 @@ class DictaApp:
         self._update_speed_status()
 
     def _on_recognition_mode_changed(self, event=None) -> None:
+        self._set_text_spellcheck_language_from_mode(self._selected_recognition_mode_key())
         self.spellcheck_generation += 1
         self._clear_spelling_marks()
         self._schedule_spellcheck(delay_ms=100)
@@ -1968,6 +2053,42 @@ class DictaApp:
 
     def _select_recognition_mode_key(self, mode_key: object | None) -> None:
         self.recognition_mode_var.set(RECOGNITION_MODE_LABELS[sanitize_recognition_mode_key(mode_key)])
+
+    def _active_spellcheck_language_tag(self) -> str:
+        language_tag = getattr(self, "current_text_spellcheck_language_tag", "")
+        if language_tag in SPELLCHECK_LANGUAGE_LABELS:
+            return language_tag
+        return recognition_mode_spellcheck_tag(self._selected_recognition_mode_key())
+
+    def _set_text_spellcheck_language_from_mode(self, mode_key: object | None) -> None:
+        self.current_text_spellcheck_language_tag = recognition_mode_spellcheck_tag(mode_key)
+
+    def _set_spellcheck_status(self, message: str, language_tag: str | None = None) -> None:
+        tag = language_tag or self._active_spellcheck_language_tag()
+        self.spellcheck_status_var.set(f"Орфография {spellcheck_language_label(tag)}: {message}")
+
+    def start_spellcheck_availability_check(self) -> None:
+        if self.is_checking_spellcheck_languages:
+            return
+
+        self.is_checking_spellcheck_languages = True
+        self.spellcheck_ru_availability_var.set("Русский: проверка...")
+        self.spellcheck_en_availability_var.set("Английский: проверка...")
+        button = getattr(self, "spellcheck_check_button", None)
+        if button is not None:
+            button.configure(state=tk.DISABLED)
+
+        def worker() -> None:
+            results: dict[str, tuple[bool, str | None]] = {}
+            for language_tag, _label, sample in SPELLCHECK_AVAILABILITY_TESTS:
+                try:
+                    check_text(sample, language_tag=language_tag)
+                    results[language_tag] = (True, None)
+                except Exception as exc:
+                    results[language_tag] = (False, str(exc))
+            self.ui_queue.put(("spellcheck_availability_result", results))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _selected_backend_preference(self) -> str | None:
         backend_key = self._selected_backend_key()
@@ -2675,6 +2796,7 @@ class DictaApp:
         self.text.delete("1.0", tk.END)
         self.format_undo_snapshot = None
         self.format_button.configure(text="Автоформат")
+        self._set_text_spellcheck_language_from_mode(self._selected_recognition_mode_key())
         self._clear_spelling_marks()
         self._set_status("Готово")
 
@@ -2701,20 +2823,20 @@ class DictaApp:
         text_value = self.text.get("1.0", tk.END).rstrip()
         if not text_value:
             self._clear_spelling_marks()
-            self.spellcheck_status_var.set("Орфография: авто")
+            self._set_spellcheck_status("авто")
             return
 
-        language_tag = recognition_mode_spellcheck_tag(self._selected_recognition_mode_key())
+        language_tag = self._active_spellcheck_language_tag()
         self.spellcheck_generation += 1
         generation = self.spellcheck_generation
-        self.spellcheck_status_var.set("Орфография: проверка...")
+        self._set_spellcheck_status("проверка...", language_tag)
 
         def worker() -> None:
             try:
                 issues = check_text(text_value, language_tag=language_tag)
-                self.ui_queue.put(("spelling_result", (generation, issues, None)))
+                self.ui_queue.put(("spelling_result", (generation, language_tag, issues, None)))
             except Exception as exc:
-                self.ui_queue.put(("spelling_result", (generation, [], str(exc))))
+                self.ui_queue.put(("spelling_result", (generation, language_tag, [], str(exc))))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2818,7 +2940,7 @@ class DictaApp:
             pass
         self.spelling_issues.pop(tag_name, None)
         count = len(self.spelling_issues)
-        self.spellcheck_status_var.set(f"Орфография: {count} ошибок" if count else "Орфография: ошибок нет")
+        self._set_spellcheck_status(f"{count} ошибок" if count else "ошибок нет")
 
     def _add_spelling_word(self, tag_name: str) -> None:
         issue = self.spelling_issues.get(tag_name)
@@ -2827,8 +2949,8 @@ class DictaApp:
 
         word = issue.word
         self._ignore_spelling_issue(tag_name)
-        self.spellcheck_status_var.set("Орфография: добавление...")
-        language_tag = recognition_mode_spellcheck_tag(self._selected_recognition_mode_key())
+        language_tag = self._active_spellcheck_language_tag()
+        self._set_spellcheck_status("добавление...", language_tag)
 
         def worker() -> None:
             try:
@@ -3008,6 +3130,7 @@ class DictaApp:
 
             recognition_mode_key = self._selected_recognition_mode_key()
             recognition_language = recognition_mode_language(recognition_mode_key)
+            translate_to_english = recognition_mode_translate_to_english(recognition_mode_key)
             sample_rate = self.record_sample_rate or SAMPLE_RATE
             raw_audio = b"".join(self.audio_chunks)
             normalized_audio, audio_stats = apply_pcm16_gain(raw_audio, self.audio_gain_percent_var.get())
@@ -3033,6 +3156,7 @@ class DictaApp:
                 out_base,
                 preferred_backend_key=self._selected_backend_preference(),
                 language=recognition_language,
+                translate_to_english=translate_to_english,
             )
 
             elapsed = time.perf_counter() - started_at
@@ -3166,6 +3290,7 @@ class DictaApp:
                 self.hotkey_status_var.set(str(value))
             elif event == "recognized":
                 recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key = value
+                self._set_text_spellcheck_language_from_mode(recognition_mode_key)
                 prepared = prepare_recognized_text(
                     str(recognized),
                     use_formatting=self.format_text_var.get(),
@@ -3262,21 +3387,39 @@ class DictaApp:
                     self.firewall_button.configure(state=tk.NORMAL)
                     self.firewall_unblock_button.configure(state=tk.NORMAL)
             elif event == "spelling_result":
-                generation, issues, error = value
+                if len(value) == 4:
+                    generation, language_tag, issues, error = value
+                else:
+                    generation, issues, error = value
+                    language_tag = self._active_spellcheck_language_tag()
                 if generation != self.spellcheck_generation:
                     continue
                 if error:
                     self._clear_spelling_marks()
-                    self.spellcheck_status_var.set("Орфография: недоступна")
+                    self._set_spellcheck_status("недоступна", language_tag)
                 else:
                     self._apply_spelling_issues(issues)
                     count = len(issues)
-                    self.spellcheck_status_var.set(f"Орфография: {count} ошибок" if count else "Орфография: ошибок нет")
+                    self._set_spellcheck_status(f"{count} ошибок" if count else "ошибок нет", language_tag)
             elif event == "spelling_word_added":
-                self.spellcheck_status_var.set(f"Орфография: слово добавлено")
+                self._set_spellcheck_status("слово добавлено")
                 self._schedule_spellcheck(delay_ms=150)
             elif event == "spelling_add_error":
-                self.spellcheck_status_var.set("Орфография: не удалось добавить")
+                self._set_spellcheck_status("не удалось добавить")
+            elif event == "spellcheck_availability_result":
+                self.is_checking_spellcheck_languages = False
+                button = getattr(self, "spellcheck_check_button", None)
+                if button is not None:
+                    button.configure(state=tk.NORMAL)
+                results = value if isinstance(value, dict) else {}
+                status_vars = {
+                    "ru-RU": self.spellcheck_ru_availability_var,
+                    "en-US": self.spellcheck_en_availability_var,
+                }
+                for language_tag, status_var in status_vars.items():
+                    ok, _error = results.get(language_tag, (False, None))
+                    label = spellcheck_availability_label(language_tag)
+                    status_var.set(f"{label}: {'доступна' if ok else 'недоступна'}")
 
         self.root.after(100, self._process_ui_queue)
 
