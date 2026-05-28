@@ -64,6 +64,22 @@ PROFILE_MODEL_KEYS = {
 }
 DEFAULT_PROFILE_LABEL = "Стандарт"
 FALLBACK_AUTO_MODEL_KEY = "small-q5_1"
+RECOGNITION_MODE_LABELS = {
+    "ru": "Русский текст",
+    "en": "English text",
+}
+RECOGNITION_MODE_KEY_BY_LABEL = {label: key for key, label in RECOGNITION_MODE_LABELS.items()}
+RUSSIAN_RECOGNITION_MODE_KEY = "ru"
+DEFAULT_RECOGNITION_MODE_KEY = RUSSIAN_RECOGNITION_MODE_KEY
+DEFAULT_RECOGNITION_MODE_LABEL = RECOGNITION_MODE_LABELS[DEFAULT_RECOGNITION_MODE_KEY]
+RECOGNITION_MODE_LANGUAGES = {
+    "ru": "ru",
+    "en": "en",
+}
+RECOGNITION_MODE_SPELLCHECK_TAGS = {
+    "ru": "ru-RU",
+    "en": "en-US",
+}
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
@@ -101,6 +117,7 @@ DEFAULT_USER_SETTINGS = {
     "auto_copy": False,
     "format_text": True,
     "voice_punctuation": True,
+    "recognition_mode": DEFAULT_RECOGNITION_MODE_KEY,
     "backend": "auto",
     "audio_gain_percent": 0,
 }
@@ -774,6 +791,20 @@ def sanitize_whisper_threads(value: object | None, default: int = DEFAULT_WHISPE
     return parse_positive_int(value) or default
 
 
+def sanitize_recognition_mode_key(value: object | None) -> str:
+    if isinstance(value, str) and value in RECOGNITION_MODE_LABELS:
+        return value
+    return DEFAULT_RECOGNITION_MODE_KEY
+
+
+def recognition_mode_language(mode_key: object | None) -> str:
+    return RECOGNITION_MODE_LANGUAGES[sanitize_recognition_mode_key(mode_key)]
+
+
+def recognition_mode_spellcheck_tag(mode_key: object | None) -> str:
+    return RECOGNITION_MODE_SPELLCHECK_TAGS[sanitize_recognition_mode_key(mode_key)]
+
+
 def backend_thread_candidates(backend_name: str) -> list[int]:
     cpu_count = max(1, os.cpu_count() or DEFAULT_WHISPER_THREADS)
     profile = "gpu" if backend_name in GPU_BACKEND_KEYS else "cpu"
@@ -891,8 +922,10 @@ def build_whisper_command(
     wav_path: Path,
     out_base: Path,
     threads: int = DEFAULT_WHISPER_THREADS,
+    language: str = "ru",
 ) -> list[str]:
     threads = sanitize_whisper_threads(threads)
+    language = language if language in RECOGNITION_MODE_LANGUAGES.values() else "ru"
     return [
         str(exe_path),
         "-m",
@@ -900,7 +933,7 @@ def build_whisper_command(
         "-f",
         str(wav_path),
         "-l",
-        "ru",
+        language,
         "-t",
         str(threads),
         "-nt",
@@ -924,9 +957,10 @@ def run_whisper_backend(
     out_base: Path,
     timeout_seconds: int | None = None,
     threads: int = DEFAULT_WHISPER_THREADS,
+    language: str = "ru",
 ) -> subprocess.CompletedProcess[bytes]:
     threads = sanitize_whisper_threads(threads)
-    command = build_whisper_command(exe_path, model_path, wav_path, out_base, threads=threads)
+    command = build_whisper_command(exe_path, model_path, wav_path, out_base, threads=threads, language=language)
     try:
         completed = subprocess.run(
             command,
@@ -963,6 +997,7 @@ def run_whisper_with_fallback(
     out_base: Path,
     timeout_seconds: int | None = None,
     preferred_backend_key: str | None = None,
+    language: str = "ru",
 ) -> tuple[str, int, subprocess.CompletedProcess[bytes]]:
     backends = available_whisper_backends(preferred_backend_key)
     if not backends:
@@ -990,6 +1025,7 @@ def run_whisper_with_fallback(
                 out_base,
                 timeout_seconds,
                 threads=threads,
+                language=language,
             )
             return backend_name, threads, completed
         except RuntimeError as exc:
@@ -1028,6 +1064,9 @@ def load_user_settings() -> dict:
                 backend = stored.get("backend", DEFAULT_USER_SETTINGS["backend"])
                 if backend in BACKEND_LABELS:
                     settings["backend"] = backend
+                settings["recognition_mode"] = sanitize_recognition_mode_key(
+                    stored.get("recognition_mode", DEFAULT_USER_SETTINGS["recognition_mode"])
+                )
     except Exception:
         return dict(DEFAULT_USER_SETTINGS)
     return settings
@@ -1038,6 +1077,9 @@ def save_user_settings(settings: dict) -> None:
         "auto_copy": bool(settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"])),
         "format_text": bool(settings.get("format_text", DEFAULT_USER_SETTINGS["format_text"])),
         "voice_punctuation": bool(settings.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])),
+        "recognition_mode": sanitize_recognition_mode_key(
+            settings.get("recognition_mode", DEFAULT_USER_SETTINGS["recognition_mode"])
+        ),
         "audio_gain_percent": clamp_audio_gain_percent(
             settings.get("audio_gain_percent", DEFAULT_USER_SETTINGS["audio_gain_percent"])
         ),
@@ -1472,6 +1514,11 @@ class DictaApp:
         self.microphone_search_status_var = tk.StringVar(value="Поиск: -")
         self.spellcheck_status_var = tk.StringVar(value="Орфография: авто")
         self.hotkey_status_var = tk.StringVar(value=f"Горячая клавиша: {HOTKEY_LABEL}")
+        self.recognition_mode_var = tk.StringVar(
+            value=RECOGNITION_MODE_LABELS[
+                sanitize_recognition_mode_key(self.settings.get("recognition_mode", DEFAULT_RECOGNITION_MODE_KEY))
+            ]
+        )
         self.auto_copy_var = tk.BooleanVar(value=self.settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"]))
         self.format_text_var = tk.BooleanVar(value=self.settings.get("format_text", DEFAULT_USER_SETTINGS["format_text"]))
         self.voice_punctuation_var = tk.BooleanVar(
@@ -1497,7 +1544,7 @@ class DictaApp:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
@@ -1512,7 +1559,16 @@ class DictaApp:
         self.copy_button.grid(row=0, column=1, padx=(0, 8))
 
         self.format_button = ttk.Button(toolbar, text="Автоформат", command=self.format_current_text)
-        self.format_button.grid(row=0, column=2, padx=(0, 8))
+
+        self.toolbar_recognition_mode_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.recognition_mode_var,
+            values=list(RECOGNITION_MODE_LABELS.values()),
+            state="readonly",
+            width=18,
+        )
+        self.toolbar_recognition_mode_box.grid(row=0, column=2, padx=(0, 8))
+        self.toolbar_recognition_mode_box.bind("<<ComboboxSelected>>", self._on_toolbar_recognition_mode_changed)
 
         self.clear_button = ttk.Button(toolbar, text="Очистить", command=self.clear_text)
         self.clear_button.grid(row=0, column=3, padx=(0, 16))
@@ -1530,18 +1586,8 @@ class DictaApp:
         self.settings_button = ttk.Button(toolbar, text="Настройки", command=self.show_settings)
         self.settings_button.grid(row=0, column=7, sticky="e")
 
-        info = ttk.Frame(self.root, padding=(12, 0, 12, 6))
-        info.grid(row=1, column=0, sticky="ew")
-        info.columnconfigure(3, weight=1)
-
-        ttk.Label(info, text="Статус:").grid(row=0, column=0, padx=(0, 4))
-        ttk.Label(info, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(0, 18))
-        ttk.Label(info, textvariable=self.record_time_var).grid(row=0, column=2, sticky="w", padx=(0, 18))
-        ttk.Label(info, textvariable=self.recognition_time_var).grid(row=0, column=3, sticky="w", padx=(0, 18))
-        ttk.Label(info, textvariable=self.spellcheck_status_var).grid(row=0, column=4, sticky="w", padx=(18, 0))
-
-        text_frame = ttk.Frame(self.root, padding=(12, 6, 12, 12))
-        text_frame.grid(row=2, column=0, sticky="nsew")
+        text_frame = ttk.Frame(self.root, padding=(12, 6, 12, 6))
+        text_frame.grid(row=1, column=0, sticky="nsew")
         text_frame.columnconfigure(0, weight=1)
         text_frame.rowconfigure(0, weight=1)
 
@@ -1557,12 +1603,23 @@ class DictaApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.text.configure(yscrollcommand=scrollbar.set)
 
+        ttk.Separator(self.root, orient="horizontal").grid(row=2, column=0, sticky="ew")
+        status_bar = ttk.Frame(self.root, padding=(12, 4, 12, 6))
+        status_bar.grid(row=3, column=0, sticky="ew")
+        status_bar.columnconfigure(1, weight=1)
+
+        ttk.Label(status_bar, text="Статус:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ttk.Label(status_bar, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.record_time_var).grid(row=0, column=2, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.recognition_time_var).grid(row=0, column=3, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.spellcheck_status_var).grid(row=0, column=4, sticky="e")
+
         self._build_settings_window()
 
     def _build_settings_window(self) -> None:
         self.settings_window = tk.Toplevel(self.root)
         self.settings_window.title("Dicta: настройки")
-        self.settings_window.geometry("720x430")
+        self.settings_window.geometry("720x450")
         self.settings_window.minsize(620, 360)
         self.settings_window.transient(self.root)
         self.settings_window.protocol("WM_DELETE_WINDOW", self.hide_settings)
@@ -1580,6 +1637,7 @@ class DictaApp:
         notebook.add(performance_tab, text="Производительность")
         notebook.add(security_tab, text="Безопасность")
 
+        text_tab.columnconfigure(1, weight=1)
         recording_tab.columnconfigure(1, weight=1)
         ttk.Label(recording_tab, text="Микрофон:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
         self.input_device_box = ttk.Combobox(
@@ -1630,25 +1688,36 @@ class DictaApp:
         )
         ttk.Label(recording_tab, textvariable=self.hotkey_status_var).grid(row=5, column=1, sticky="w", pady=(8, 0))
 
+        ttk.Label(text_tab, text="Режим:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self.recognition_mode_box = ttk.Combobox(
+            text_tab,
+            textvariable=self.recognition_mode_var,
+            values=list(RECOGNITION_MODE_LABELS.values()),
+            state="readonly",
+            width=18,
+        )
+        self.recognition_mode_box.grid(row=0, column=1, sticky="w", pady=(0, 8))
+        self.recognition_mode_box.bind("<<ComboboxSelected>>", self._on_recognition_mode_changed)
+
         self.auto_copy_check = ttk.Checkbutton(
             text_tab,
             text="Автокопия",
             variable=self.auto_copy_var,
         )
-        self.auto_copy_check.grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.auto_copy_check.grid(row=1, column=0, sticky="w", pady=(0, 8))
         self.format_text_check = ttk.Checkbutton(
             text_tab,
             text="Форматировать",
             variable=self.format_text_var,
         )
-        self.format_text_check.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        self.format_text_check.grid(row=2, column=0, sticky="w", pady=(0, 8))
         self.voice_punctuation_check = ttk.Checkbutton(
             text_tab,
             text="Команды пунктуации",
             variable=self.voice_punctuation_var,
         )
-        self.voice_punctuation_check.grid(row=2, column=0, sticky="w", pady=(0, 12))
-        ttk.Label(text_tab, textvariable=self.spellcheck_status_var).grid(row=3, column=0, sticky="w")
+        self.voice_punctuation_check.grid(row=3, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(text_tab, textvariable=self.spellcheck_status_var).grid(row=4, column=0, sticky="w")
 
         performance_tab.columnconfigure(1, weight=1)
         ttk.Label(performance_tab, text="Модель:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
@@ -1834,12 +1903,21 @@ class DictaApp:
 
     def _set_record_button_idle(self) -> None:
         self.record_button.configure(text="Записать", command=self.toggle_recording, state=tk.NORMAL)
+        self._set_recognition_mode_controls_state("readonly")
 
     def _set_record_button_recording(self) -> None:
         self.record_button.configure(text="Стоп", command=self.stop_recording, state=tk.NORMAL)
+        self._set_recognition_mode_controls_state(tk.DISABLED)
 
     def _set_record_button_busy(self, text: str) -> None:
         self.record_button.configure(text=text, state=tk.DISABLED)
+        self._set_recognition_mode_controls_state(tk.DISABLED)
+
+    def _set_recognition_mode_controls_state(self, state: str) -> None:
+        for control_name in ("toolbar_recognition_mode_box", "recognition_mode_box"):
+            control = getattr(self, control_name, None)
+            if control is not None:
+                control.configure(state=state)
 
     def _on_profile_changed(self, event=None) -> None:
         self._apply_profile_selection()
@@ -1849,6 +1927,23 @@ class DictaApp:
 
     def _on_backend_changed(self, event=None) -> None:
         self._update_speed_status()
+
+    def _on_recognition_mode_changed(self, event=None) -> None:
+        self.spellcheck_generation += 1
+        self._clear_spelling_marks()
+        self._schedule_spellcheck(delay_ms=100)
+
+    def _on_toolbar_recognition_mode_changed(self, event=None) -> None:
+        self._on_recognition_mode_changed(event)
+        settings = dict(self.settings)
+        settings["recognition_mode"] = self._selected_recognition_mode_key()
+        try:
+            save_user_settings(settings)
+            self.settings = load_user_settings()
+            self.settings_snapshot["recognition_mode"] = settings["recognition_mode"]
+            self._set_status("Режим распознавания сохранен")
+        except Exception as exc:
+            self._set_status(f"Не удалось сохранить режим: {exc}")
 
     def _apply_profile_selection(self) -> None:
         profile = self.profile_var.get()
@@ -1867,6 +1962,12 @@ class DictaApp:
 
     def _selected_backend_key(self) -> str:
         return BACKEND_KEY_BY_LABEL.get(self.backend_var.get(), "auto")
+
+    def _selected_recognition_mode_key(self) -> str:
+        return RECOGNITION_MODE_KEY_BY_LABEL.get(self.recognition_mode_var.get(), DEFAULT_RECOGNITION_MODE_KEY)
+
+    def _select_recognition_mode_key(self, mode_key: object | None) -> None:
+        self.recognition_mode_var.set(RECOGNITION_MODE_LABELS[sanitize_recognition_mode_key(mode_key)])
 
     def _selected_backend_preference(self) -> str | None:
         backend_key = self._selected_backend_key()
@@ -2401,6 +2502,7 @@ class DictaApp:
             "auto_copy": self.auto_copy_var.get(),
             "format_text": self.format_text_var.get(),
             "voice_punctuation": self.voice_punctuation_var.get(),
+            "recognition_mode": self._selected_recognition_mode_key(),
             "audio_gain_percent": clamp_audio_gain_percent(self.audio_gain_percent_var.get()),
             "backend": self._selected_backend_key(),
         }
@@ -2420,6 +2522,7 @@ class DictaApp:
             "profile": self.profile_var.get(),
             "model": self.model_var.get(),
             "backend": self.backend_var.get(),
+            "recognition_mode": self._selected_recognition_mode_key(),
             "auto_copy": self.auto_copy_var.get(),
             "format_text": self.format_text_var.get(),
             "voice_punctuation": self.voice_punctuation_var.get(),
@@ -2433,6 +2536,7 @@ class DictaApp:
         self.profile_var.set(DEFAULT_PROFILE_LABEL)
         self.model_var.set(DEFAULT_MODEL_LABEL)
         self.backend_var.set(str(state.get("backend", DEFAULT_BACKEND_LABEL)))
+        self._select_recognition_mode_key(state.get("recognition_mode", DEFAULT_RECOGNITION_MODE_KEY))
         self.auto_copy_var.set(bool(state.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"])))
         self.format_text_var.set(bool(state.get("format_text", DEFAULT_USER_SETTINGS["format_text"])))
         self.voice_punctuation_var.set(bool(state.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])))
@@ -2552,7 +2656,8 @@ class DictaApp:
         formatted = prepare_recognized_text(
             value,
             use_formatting=True,
-            use_voice_punctuation=self.voice_punctuation_var.get(),
+            use_voice_punctuation=self.voice_punctuation_var.get()
+            and self._selected_recognition_mode_key() == RUSSIAN_RECOGNITION_MODE_KEY,
         )
         if formatted == value:
             self.format_undo_snapshot = None
@@ -2599,13 +2704,14 @@ class DictaApp:
             self.spellcheck_status_var.set("Орфография: авто")
             return
 
+        language_tag = recognition_mode_spellcheck_tag(self._selected_recognition_mode_key())
         self.spellcheck_generation += 1
         generation = self.spellcheck_generation
         self.spellcheck_status_var.set("Орфография: проверка...")
 
         def worker() -> None:
             try:
-                issues = check_text(text_value, language_tag="ru-RU")
+                issues = check_text(text_value, language_tag=language_tag)
                 self.ui_queue.put(("spelling_result", (generation, issues, None)))
             except Exception as exc:
                 self.ui_queue.put(("spelling_result", (generation, [], str(exc))))
@@ -2722,10 +2828,11 @@ class DictaApp:
         word = issue.word
         self._ignore_spelling_issue(tag_name)
         self.spellcheck_status_var.set("Орфография: добавление...")
+        language_tag = recognition_mode_spellcheck_tag(self._selected_recognition_mode_key())
 
         def worker() -> None:
             try:
-                add_word(word, language_tag="ru-RU")
+                add_word(word, language_tag=language_tag)
                 self.ui_queue.put(("spelling_word_added", word))
             except Exception as exc:
                 self.ui_queue.put(("spelling_add_error", str(exc)))
@@ -2899,6 +3006,8 @@ class DictaApp:
             if not selected_model.exists():
                 raise RuntimeError(f"missing-model::{selected_model}")
 
+            recognition_mode_key = self._selected_recognition_mode_key()
+            recognition_language = recognition_mode_language(recognition_mode_key)
             sample_rate = self.record_sample_rate or SAMPLE_RATE
             raw_audio = b"".join(self.audio_chunks)
             normalized_audio, audio_stats = apply_pcm16_gain(raw_audio, self.audio_gain_percent_var.get())
@@ -2923,6 +3032,7 @@ class DictaApp:
                 wav_path,
                 out_base,
                 preferred_backend_key=self._selected_backend_preference(),
+                language=recognition_language,
             )
 
             elapsed = time.perf_counter() - started_at
@@ -2931,7 +3041,12 @@ class DictaApp:
                 raise RuntimeError("missing-recognition-output")
 
             recognized = txt_path.read_text(encoding="utf-8").strip()
-            self.ui_queue.put(("recognized", (recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats)))
+            self.ui_queue.put(
+                (
+                    "recognized",
+                    (recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key),
+                )
+            )
         except Exception as exc:
             self.ui_queue.put(("error", self._format_recognition_error(exc)))
         finally:
@@ -3050,11 +3165,12 @@ class DictaApp:
             elif event == "hotkey_status":
                 self.hotkey_status_var.set(str(value))
             elif event == "recognized":
-                recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats = value
+                recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key = value
                 prepared = prepare_recognized_text(
                     str(recognized),
                     use_formatting=self.format_text_var.get(),
-                    use_voice_punctuation=self.voice_punctuation_var.get(),
+                    use_voice_punctuation=self.voice_punctuation_var.get()
+                    and recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY,
                 )
                 self.text.delete("1.0", tk.END)
                 self.text.insert("1.0", prepared)
