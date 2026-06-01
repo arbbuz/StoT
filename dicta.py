@@ -1672,6 +1672,7 @@ def normalize_punctuation_spacing(text: str) -> str:
     result = re.sub(r"([.!?])\s*,", r"\1", result)
     result = re.sub(r"([,.;:!?])(?=[^\s\n,.;:!?])", r"\1 ", result)
     result = re.sub(r'"\s*([^"\n]*?)\s*"', lambda match: f'"{match.group(1).strip()}"', result)
+    result = re.sub(r'([0-9A-Za-zА-Яа-яЁё])\s*[,;]\s*(")(?=\s*(?:$|[.!?…]))', r'\1\2', result)
     result = re.sub(r'(^|[\s(\[{])"\s+', r'\1"', result)
     result = re.sub(r'\s+"(?=$|[\s,.;:!?()\]}])', '"', result)
     result = re.sub(r"\(\s+", "(", result)
@@ -1682,10 +1683,14 @@ def normalize_punctuation_spacing(text: str) -> str:
 
 def capitalize_text(text: str) -> str:
     return re.sub(
-        r"(?iu)(^|[.!?]\s+|\n+)([a-zа-яё])",
-        lambda match: match.group(1) + match.group(2).upper(),
+        r'(?iu)(^|[.!?]\s+|\n+)(["«„“]?)([a-zа-яё])',
+        lambda match: match.group(1) + match.group(2) + match.group(3).upper(),
         text,
     )
+
+
+def _is_standalone_quoted_text(text: str) -> bool:
+    return bool(re.fullmatch(r'"[^"\n]+"', text.strip()))
 
 
 def ensure_final_period(text: str) -> str:
@@ -1694,6 +1699,15 @@ def ensure_final_period(text: str) -> str:
         return result
     if result[-1] in ".!?…":
         return result
+    if _is_standalone_quoted_text(result):
+        return result
+    if result[-1] == '"':
+        inner = result[:-1].rstrip()
+        if inner and inner[-1] in ".!?…":
+            return result
+        if inner and inner[-1] in ",;:":
+            result = inner[:-1].rstrip() + '"'
+        return result + "."
     if result[-1] in ",;:":
         return result[:-1].rstrip() + "."
     return result + "."
@@ -2250,6 +2264,18 @@ def run_text_cleanup_self_test() -> None:
             'Он сказал "привет".',
         ),
         (
+            "кавычки привет кавычки",
+            '"Привет"',
+        ),
+        (
+            "кавычки привет, кавычки",
+            '"Привет"',
+        ),
+        (
+            "он сказал кавычки привет, кавычки",
+            'Он сказал "привет".',
+        ),
+        (
             "термин кавычки договор кавычки скобка открывается важно скобка закрывается точка",
             'Термин "договор" (важно).',
         ),
@@ -2703,7 +2729,7 @@ class DictaApp:
 
         toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(9, weight=1)
+        toolbar.columnconfigure(5, weight=1)
 
         self.record_button = ttk.Button(toolbar, text="Записать", command=self.toggle_recording)
         self.record_button.grid(row=0, column=0, padx=(0, 8))
@@ -2713,47 +2739,37 @@ class DictaApp:
         self.copy_button = ttk.Button(toolbar, text="Скопировать", command=self.copy_text)
         self.copy_button.grid(row=0, column=1, padx=(0, 8))
 
-        self.translate_to_ru_button = ttk.Button(toolbar, text="В русский", command=self.translate_current_text_to_russian)
-        self.translate_to_ru_button.grid(row=0, column=2, padx=(0, 8))
+        self.translate_menu = tk.Menu(toolbar, tearoff=False)
+        self.translate_to_ru_menu_index = 0
+        self.translate_to_en_menu_index = 1
+        self.translate_menu.add_command(label="В русский", command=self.translate_current_text_to_russian)
+        self.translate_menu.add_command(label="В English", command=self.translate_last_recording_to_english)
+        self.translate_button = ttk.Menubutton(toolbar, text="Перевести", menu=self.translate_menu)
+        self.translate_button.grid(row=0, column=3, padx=(0, 8))
 
-        self.translate_to_en_button = ttk.Button(toolbar, text="В English", command=self.translate_last_recording_to_english)
-        self.translate_to_en_button.grid(row=0, column=3, padx=(0, 8))
-
-        self.format_button = ttk.Button(toolbar, text="Автоформат", command=self.format_current_text)
+        self.more_menu = tk.Menu(toolbar, tearoff=False)
+        self.format_menu_index = 0
+        self.undo_postprocess_menu_index = 1
+        self.more_menu.add_command(label="Автоформат", command=self.format_current_text)
+        self.more_menu.add_command(label="Откатить автоисправления", command=self.undo_last_postprocess, state=tk.DISABLED)
+        self.more_menu.add_separator()
+        self.more_menu.add_command(label="Очистить", command=self.clear_text)
+        self.more_button = ttk.Menubutton(toolbar, text="Еще", menu=self.more_menu)
 
         self.toolbar_recognition_mode_box = ttk.Combobox(
             toolbar,
             textvariable=self.recognition_mode_var,
             values=self._recognition_mode_labels(),
             state="readonly",
-            width=18,
+            width=16,
         )
-        self.toolbar_recognition_mode_box.grid(row=0, column=4, padx=(0, 8))
+        self.toolbar_recognition_mode_box.grid(row=0, column=2, padx=(0, 8))
         self.toolbar_recognition_mode_box.bind("<<ComboboxSelected>>", self._on_toolbar_recognition_mode_changed)
 
-        self.clear_button = ttk.Button(toolbar, text="Очистить", command=self.clear_text)
-        self.clear_button.grid(row=0, column=5, padx=(0, 8))
-
-        self.postprocess_undo_button = ttk.Button(
-            toolbar,
-            text="Откатить",
-            command=self.undo_last_postprocess,
-            state=tk.DISABLED,
-        )
-        self.postprocess_undo_button.grid(row=0, column=6, padx=(0, 16))
-
-        self.input_level_bar = ttk.Progressbar(
-            toolbar,
-            variable=self.input_level_var,
-            maximum=100,
-            mode="determinate",
-            length=120,
-        )
-        self.input_level_bar.grid(row=0, column=7, sticky="w", padx=(0, 6))
-        ttk.Label(toolbar, textvariable=self.input_level_text_var).grid(row=0, column=8, sticky="w", padx=(0, 18))
+        self.more_button.grid(row=0, column=4, padx=(0, 8))
 
         self.settings_button = ttk.Button(toolbar, text="Настройки", command=self.show_settings)
-        self.settings_button.grid(row=0, column=10, sticky="e")
+        self.settings_button.grid(row=0, column=6, sticky="e")
 
         text_frame = ttk.Frame(self.root, padding=(12, 6, 12, 6))
         text_frame.grid(row=1, column=0, sticky="nsew")
@@ -2779,9 +2795,18 @@ class DictaApp:
 
         ttk.Label(status_bar, text="Статус:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         ttk.Label(status_bar, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.record_time_var).grid(row=0, column=2, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.recognition_time_var).grid(row=0, column=3, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.spellcheck_status_var).grid(row=0, column=4, sticky="e")
+        self.input_level_bar = ttk.Progressbar(
+            status_bar,
+            variable=self.input_level_var,
+            maximum=100,
+            mode="determinate",
+            length=90,
+        )
+        self.input_level_bar.grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Label(status_bar, textvariable=self.input_level_text_var).grid(row=0, column=3, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.record_time_var).grid(row=0, column=4, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.recognition_time_var).grid(row=0, column=5, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.spellcheck_status_var).grid(row=0, column=6, sticky="e")
 
         self._build_settings_window()
         self._update_translation_button_state()
@@ -3256,10 +3281,13 @@ class DictaApp:
         self._update_translation_button_state()
 
     def _set_translation_buttons_state(self, state: str) -> None:
-        for button_name in ("translate_to_ru_button", "translate_to_en_button"):
-            button = getattr(self, button_name, None)
-            if button is not None:
-                button.configure(state=state)
+        translate_button = getattr(self, "translate_button", None)
+        if translate_button is not None:
+            translate_button.configure(state=state)
+        translate_menu = getattr(self, "translate_menu", None)
+        if translate_menu is not None:
+            translate_menu.entryconfigure(self.translate_to_ru_menu_index, state=state)
+            translate_menu.entryconfigure(self.translate_to_en_menu_index, state=state)
 
     def _clear_last_recognition_audio(self) -> None:
         self.last_recognition_audio_bytes = None
@@ -3290,12 +3318,14 @@ class DictaApp:
             if is_translation_direction_available(self.translation_pack_status, "ru", "en") and text_has_value and not busy
             else tk.DISABLED
         )
-        to_ru_button = getattr(self, "translate_to_ru_button", None)
-        if to_ru_button is not None:
-            to_ru_button.configure(state=to_ru_state)
-        to_en_button = getattr(self, "translate_to_en_button", None)
-        if to_en_button is not None:
-            to_en_button.configure(state=to_en_state)
+        translate_menu = getattr(self, "translate_menu", None)
+        if translate_menu is not None:
+            translate_menu.entryconfigure(self.translate_to_ru_menu_index, state=to_ru_state)
+            translate_menu.entryconfigure(self.translate_to_en_menu_index, state=to_en_state)
+
+        translate_button = getattr(self, "translate_button", None)
+        if translate_button is not None:
+            translate_button.configure(state=tk.NORMAL if to_ru_state == tk.NORMAL or to_en_state == tk.NORMAL else tk.DISABLED)
 
     def _selected_backend_preference(self) -> str | None:
         backend_key = self._selected_backend_key()
@@ -4012,11 +4042,21 @@ class DictaApp:
 
     def _reset_format_undo(self) -> None:
         self.format_undo_snapshot = None
-        self.format_button.configure(text="Автоформат")
+        self._set_format_action_label("Автоформат")
+
+    def _set_format_action_label(self, label: str) -> None:
+        more_menu = getattr(self, "more_menu", None)
+        if more_menu is not None:
+            more_menu.entryconfigure(self.format_menu_index, label=label)
 
     def _reset_postprocess_undo(self) -> None:
         self.postprocess_undo_snapshot = None
-        self.postprocess_undo_button.configure(state=tk.DISABLED)
+        self._set_postprocess_undo_state(tk.DISABLED)
+
+    def _set_postprocess_undo_state(self, state: str) -> None:
+        more_menu = getattr(self, "more_menu", None)
+        if more_menu is not None:
+            more_menu.entryconfigure(self.undo_postprocess_menu_index, state=state)
 
     def _set_postprocess_undo(
         self,
@@ -4025,7 +4065,7 @@ class DictaApp:
         corrections: tuple[RecognitionCorrection, ...],
     ) -> None:
         self.postprocess_undo_snapshot = (original, corrected, corrections)
-        self.postprocess_undo_button.configure(state=tk.NORMAL)
+        self._set_postprocess_undo_state(tk.NORMAL)
 
     def undo_last_postprocess(self) -> None:
         if self.postprocess_undo_snapshot is None:
@@ -4098,7 +4138,7 @@ class DictaApp:
         value = self.text.get("1.0", tk.END).strip()
         if not value:
             self.format_undo_snapshot = None
-            self.format_button.configure(text="Автоформат")
+            self._set_format_action_label("Автоформат")
             self._set_status("Нет текста для форматирования")
             return
         if self.format_undo_snapshot is not None:
@@ -4107,7 +4147,7 @@ class DictaApp:
                 self.text.delete("1.0", tk.END)
                 self.text.insert("1.0", original)
                 self.format_undo_snapshot = None
-                self.format_button.configure(text="Автоформат")
+                self._set_format_action_label("Автоформат")
                 self._reset_postprocess_undo()
                 self._set_status("Форматирование отменено")
                 self._schedule_spellcheck(delay_ms=100)
@@ -4121,21 +4161,21 @@ class DictaApp:
         )
         if formatted == value:
             self.format_undo_snapshot = None
-            self.format_button.configure(text="Автоформат")
+            self._set_format_action_label("Автоформат")
             self._set_status("Текст уже отформатирован")
             return
         self.format_undo_snapshot = (value, formatted)
         self._reset_postprocess_undo()
         self.text.delete("1.0", tk.END)
         self.text.insert("1.0", formatted)
-        self.format_button.configure(text="Вернуть")
+        self._set_format_action_label("Вернуть форматирование")
         self._set_status("Текст отформатирован")
         self._schedule_spellcheck(delay_ms=100)
 
     def clear_text(self) -> None:
         self.text.delete("1.0", tk.END)
         self.format_undo_snapshot = None
-        self.format_button.configure(text="Автоформат")
+        self._set_format_action_label("Автоформат")
         self._reset_postprocess_undo()
         self._clear_last_recognition_audio()
         self._set_text_spellcheck_language_from_mode(self._selected_recognition_mode_key())
@@ -4708,7 +4748,7 @@ class DictaApp:
                 self.text.delete("1.0", tk.END)
                 self.text.insert("1.0", prepared)
                 self.format_undo_snapshot = None
-                self.format_button.configure(text="Автоформат")
+                self._set_format_action_label("Автоформат")
                 if postprocess_corrections:
                     self._set_postprocess_undo(prepared_before_postprocess, prepared, postprocess_corrections)
                 else:
@@ -4748,7 +4788,7 @@ class DictaApp:
                 self.text.delete("1.0", tk.END)
                 self.text.insert("1.0", prepared)
                 self.format_undo_snapshot = None
-                self.format_button.configure(text="Автоформат")
+                self._set_format_action_label("Автоформат")
                 self._reset_postprocess_undo()
                 if self.auto_copy_var.get() and prepared:
                     self._copy_value_to_clipboard(prepared)
@@ -4769,7 +4809,7 @@ class DictaApp:
                 self.text.delete("1.0", tk.END)
                 self.text.insert("1.0", prepared)
                 self.format_undo_snapshot = None
-                self.format_button.configure(text="Автоформат")
+                self._set_format_action_label("Автоформат")
                 self._reset_postprocess_undo()
                 if self.auto_copy_var.get() and prepared:
                     self._copy_value_to_clipboard(prepared)
