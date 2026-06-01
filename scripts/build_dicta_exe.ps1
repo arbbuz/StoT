@@ -41,6 +41,13 @@ Dicta models are not included in this package.
 Copy these files into this folder before using recognition:
 - ggml-small-q5_1.bin
 
+Optional higher-quality models:
+- ggml-small.bin
+- ggml-medium-q5_0.bin
+- ggml-medium.bin
+- ggml-large-v3-turbo-q5_0.bin
+- ggml-large-v3-turbo.bin
+
 Local source folder:
 models\
 
@@ -48,10 +55,25 @@ Official upstream model source:
 https://huggingface.co/ggerganov/whisper.cpp
 "@ | Set-Content -LiteralPath "$dist\models\README_MODELS.txt" -Encoding UTF8
 } else {
-    Copy-Item -LiteralPath `
-        "models\ggml-small-q5_1.bin" `
-        -Destination "$dist\models" `
-        -Force
+    $requiredModels = @("ggml-small-q5_1.bin")
+    $optionalModels = @(
+        "ggml-small.bin",
+        "ggml-medium-q5_0.bin",
+        "ggml-medium.bin",
+        "ggml-large-v3-turbo-q5_0.bin",
+        "ggml-large-v3-turbo.bin"
+    )
+
+    foreach ($modelName in $requiredModels) {
+        Copy-Item -LiteralPath (Join-Path "models" $modelName) -Destination "$dist\models" -Force
+    }
+
+    foreach ($modelName in $optionalModels) {
+        $modelPath = Join-Path "models" $modelName
+        if (Test-Path -LiteralPath $modelPath -PathType Leaf) {
+            Copy-Item -LiteralPath $modelPath -Destination "$dist\models" -Force
+        }
+    }
 }
 
 Copy-Item `
@@ -69,6 +91,13 @@ if (Test-Path -LiteralPath (Join-Path $avx2Source "whisper-cli.exe")) {
             Copy-Item -LiteralPath $source -Destination "$dist\.tools\whisper.cpp-build-avx2\bin" -Force
         }
     }
+}
+
+$sse42Source = ".tools\whisper.cpp-build-sse42\bin"
+if (Test-Path -LiteralPath (Join-Path $sse42Source "whisper-cli.exe")) {
+    $sse42Destination = "$dist\.tools\whisper.cpp-build-sse42\bin"
+    New-Item -ItemType Directory -Force -Path $sse42Destination | Out-Null
+    Copy-Item -Path (Join-Path $sse42Source "*") -Destination $sse42Destination -Recurse -Force
 }
 
 foreach ($backend in @("vulkan", "cuda", "openvino")) {
@@ -89,6 +118,11 @@ Copy-Item -LiteralPath `
 Copy-Item -LiteralPath `
     "translation\glossary_en_ru.json" `
     -Destination "$dist\translation" `
+    -Force
+
+Copy-Item -LiteralPath `
+    "dicta_dictionary_ru.json" `
+    -Destination $dist `
     -Force
 
 Copy-Item -LiteralPath `

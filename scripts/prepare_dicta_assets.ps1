@@ -1,6 +1,9 @@
 param(
     [string]$WhisperCppVersion = "v1.8.4",
-    [switch]$SkipModels
+    [switch]$SkipModels,
+    [switch]$IncludeQualityModels,
+    [switch]$SkipVulkan,
+    [switch]$RequireVulkan
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,8 +12,10 @@ Set-Location -LiteralPath (Join-Path $PSScriptRoot "..")
 
 $compatBinDir = ".tools\whisper.cpp-build-compat\bin"
 $avx2BinDir = ".tools\whisper.cpp-build-avx2\bin"
+$sse42BinDir = ".tools\whisper.cpp-build-sse42\bin"
+$vulkanBinDir = ".tools\whisper.cpp-build-vulkan\bin"
 $modelsDir = "models"
-New-Item -ItemType Directory -Force -Path $compatBinDir, $avx2BinDir, $modelsDir | Out-Null
+New-Item -ItemType Directory -Force -Path $compatBinDir, $avx2BinDir, $sse42BinDir, $modelsDir | Out-Null
 
 function Download-File {
     param(
@@ -31,6 +36,63 @@ function Download-File {
     Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
     Invoke-WebRequest -Uri $Url -OutFile $tempPath -UseBasicParsing
     Move-Item -LiteralPath $tempPath -Destination $Destination -Force
+}
+
+function Invoke-NativeCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $FilePath @ArgumentList
+        if ($LASTEXITCODE -ne 0) {
+            throw "$FilePath $($ArgumentList -join ' ') failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+function Add-LocalGeneratorArgs {
+    param(
+        [string[]]$ConfigureArgs
+    )
+
+    $localW64DevKit = Join-Path (Get-Location) ".tools\w64devkit\bin"
+    if (Test-Path -LiteralPath (Join-Path $localW64DevKit "gcc.exe")) {
+        $env:PATH = "$localW64DevKit;$env:PATH"
+        return $ConfigureArgs + @("-G", "MinGW Makefiles", "-DCMAKE_BUILD_TYPE=Release")
+    }
+    if ($env:GITHUB_ACTIONS -eq "true") {
+        return $ConfigureArgs + @("-G", "Visual Studio 17 2022", "-A", "x64")
+    }
+    return $ConfigureArgs
+}
+
+function Copy-BuiltWhisperBackend {
+    param(
+        [string]$BuildDir,
+        [string]$Destination,
+        [string]$Label
+    )
+
+    $builtCli = Get-ChildItem -LiteralPath $BuildDir -Recurse -Filter "whisper-cli.exe" | Select-Object -First 1
+    if ($null -eq $builtCli) {
+        throw "Built whisper-cli.exe was not found in $Label build output."
+    }
+
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    Remove-Item -Path (Join-Path $Destination "*") -Recurse -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $builtCli.FullName -Destination $Destination -Force
+
+    Get-ChildItem -LiteralPath $BuildDir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -ieq ".dll" } |
+        ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $Destination -Force
+        }
 }
 
 $whisperZip = Join-Path $env:TEMP "whisper-bin-x64-$WhisperCppVersion.zip"
@@ -110,43 +172,83 @@ $configureArgs = @(
     "-DWHISPER_CURL=OFF"
 )
 
-$localW64DevKit = Join-Path (Get-Location) ".tools\w64devkit\bin"
-if (Test-Path -LiteralPath (Join-Path $localW64DevKit "gcc.exe")) {
-    $env:PATH = "$localW64DevKit;$env:PATH"
-    $configureArgs += @("-G", "MinGW Makefiles", "-DCMAKE_BUILD_TYPE=Release")
-} elseif ($env:GITHUB_ACTIONS -eq "true") {
-    $configureArgs += @("-G", "Visual Studio 17 2022", "-A", "x64")
-}
+$configureArgs = Add-LocalGeneratorArgs -ConfigureArgs $configureArgs
 
-& $cmakeExe @configureArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to configure whisper.cpp compat build."
-}
+Invoke-NativeCommand -FilePath $cmakeExe -ArgumentList $configureArgs
 
-& $cmakeExe --build $buildDir --config Release --target whisper-cli --parallel 2
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to build whisper.cpp compat backend."
-}
+Invoke-NativeCommand -FilePath $cmakeExe -ArgumentList @("--build", $buildDir, "--config", "Release", "--target", "whisper-cli", "--parallel", "2")
 
-$builtCli = Get-ChildItem -LiteralPath $buildDir -Recurse -Filter "whisper-cli.exe" | Select-Object -First 1
-if ($null -eq $builtCli) {
-    throw "Built whisper-cli.exe was not found in compat build output."
-}
-
-Remove-Item -Path (Join-Path $compatBinDir "*") -Recurse -Force -ErrorAction SilentlyContinue
-Copy-Item -LiteralPath $builtCli.FullName -Destination $compatBinDir -Force
-
-$runtimeDllNames = @("whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
-$runtimeDlls = Get-ChildItem -LiteralPath $buildDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $runtimeDllNames -contains $_.Name }
-foreach ($dll in $runtimeDlls) {
-    Copy-Item -LiteralPath $dll.FullName -Destination $compatBinDir -Force
-}
+Copy-BuiltWhisperBackend -BuildDir $buildDir -Destination $compatBinDir -Label "compat"
 Write-Host "Prepared scalar compat whisper.cpp backend in $compatBinDir"
+
+$sse42BuildDir = ".tools\whisper.cpp-build-sse42-cmake"
+Remove-Item -LiteralPath $sse42BuildDir -Recurse -Force -ErrorAction SilentlyContinue
+
+$sse42ConfigureArgs = @(
+    "-S", $sourceDir.FullName,
+    "-B", $sse42BuildDir,
+    "-DGGML_NATIVE=OFF",
+    "-DGGML_SSE42=ON",
+    "-DGGML_AVX=OFF",
+    "-DGGML_AVX2=OFF",
+    "-DGGML_BMI2=OFF",
+    "-DGGML_FMA=OFF",
+    "-DGGML_F16C=OFF",
+    "-DGGML_OPENMP=OFF",
+    "-DWHISPER_BUILD_TESTS=OFF",
+    "-DWHISPER_BUILD_SERVER=OFF",
+    "-DWHISPER_SDL2=OFF",
+    "-DWHISPER_CURL=OFF"
+)
+$sse42ConfigureArgs = Add-LocalGeneratorArgs -ConfigureArgs $sse42ConfigureArgs
+
+Invoke-NativeCommand -FilePath $cmakeExe -ArgumentList $sse42ConfigureArgs
+
+Invoke-NativeCommand -FilePath $cmakeExe -ArgumentList @("--build", $sse42BuildDir, "--config", "Release", "--target", "whisper-cli", "--parallel", "2")
+
+Copy-BuiltWhisperBackend -BuildDir $sse42BuildDir -Destination $sse42BinDir -Label "SSE4.2"
+Write-Host "Prepared SSE4.2 whisper.cpp backend in $sse42BinDir"
+
+if (-not $SkipVulkan) {
+    $vulkanTool = Get-Command glslc -ErrorAction SilentlyContinue
+    if ($env:VULKAN_SDK -or $vulkanTool) {
+        $vulkanBuildDir = ".tools\whisper.cpp-build-vulkan-cmake"
+        Remove-Item -LiteralPath $vulkanBuildDir -Recurse -Force -ErrorAction SilentlyContinue
+
+        $vulkanConfigureArgs = @(
+            "-S", $sourceDir.FullName,
+            "-B", $vulkanBuildDir,
+            "-DGGML_NATIVE=OFF",
+            "-DGGML_VULKAN=ON",
+            "-DWHISPER_BUILD_TESTS=OFF",
+            "-DWHISPER_BUILD_SERVER=OFF",
+            "-DWHISPER_SDL2=OFF",
+            "-DWHISPER_CURL=OFF"
+        )
+        $vulkanConfigureArgs = Add-LocalGeneratorArgs -ConfigureArgs $vulkanConfigureArgs
+
+        Invoke-NativeCommand -FilePath $cmakeExe -ArgumentList $vulkanConfigureArgs
+
+        Invoke-NativeCommand -FilePath $cmakeExe -ArgumentList @("--build", $vulkanBuildDir, "--config", "Release", "--target", "whisper-cli", "--parallel", "2")
+
+        Copy-BuiltWhisperBackend -BuildDir $vulkanBuildDir -Destination $vulkanBinDir -Label "Vulkan"
+        Write-Host "Prepared Vulkan whisper.cpp backend in $vulkanBinDir"
+    } elseif ($RequireVulkan) {
+        throw "Vulkan build requested but Vulkan SDK/glslc was not found."
+    } else {
+        Write-Host "Skipping Vulkan backend build: Vulkan SDK/glslc was not found."
+    }
+}
 
 if (-not $SkipModels) {
     $models = @(
         "ggml-small-q5_1.bin"
     )
+    if ($IncludeQualityModels) {
+        $models += @(
+            "ggml-small.bin"
+        )
+    }
 
     foreach ($model in $models) {
         $url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$model"

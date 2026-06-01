@@ -1,4 +1,4 @@
-import queue
+﻿import queue
 import atexit
 import ctypes
 import ctypes.wintypes
@@ -13,6 +13,7 @@ import threading
 import time
 import wave
 from array import array
+from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -35,6 +36,7 @@ WHISPER_BACKENDS = {
     "cuda": APP_DIR / ".tools" / "whisper.cpp-build-cuda" / "bin" / "whisper-cli.exe",
     "openvino": APP_DIR / ".tools" / "whisper.cpp-build-openvino" / "bin" / "whisper-cli.exe",
     "avx2": APP_DIR / ".tools" / "whisper.cpp-build-avx2" / "bin" / "whisper-cli.exe",
+    "sse42": APP_DIR / ".tools" / "whisper.cpp-build-sse42" / "bin" / "whisper-cli.exe",
     "compat": APP_DIR / ".tools" / "whisper.cpp-build-compat" / "bin" / "whisper-cli.exe",
 }
 DISABLED_WHISPER_BACKENDS: set[str] = set()
@@ -45,6 +47,7 @@ BACKEND_LABELS = {
     "cuda": "CUDA",
     "openvino": "OpenVINO",
     "avx2": "AVX2",
+    "sse42": "SSE4.2",
     "compat": "Compat",
 }
 BACKEND_KEY_BY_LABEL = {label: key for key, label in BACKEND_LABELS.items()}
@@ -52,18 +55,41 @@ DEFAULT_BACKEND_LABEL = BACKEND_LABELS["auto"]
 FALLBACK_AUTO_BACKEND_KEY = "compat"
 MODELS_DIR = APP_DIR / "models"
 MODEL_LABELS = {
-    "small-q5_1": "small-q5_1: рабочая модель",
+    "small-q5_1": "small-q5_1: стандарт",
+    "small": "small: качество выше",
+    "medium-q5_0": "medium-q5_0: качество, опция",
+    "medium": "medium: качество, опция",
+    "large-v3-turbo-q5_0": "large-v3-turbo-q5_0: максимум, опция",
+    "large-v3-turbo": "large-v3-turbo: максимум, опция",
 }
 MODEL_FILES = {
     "small-q5_1": MODELS_DIR / "ggml-small-q5_1.bin",
+    "small": MODELS_DIR / "ggml-small.bin",
+    "medium-q5_0": MODELS_DIR / "ggml-medium-q5_0.bin",
+    "medium": MODELS_DIR / "ggml-medium.bin",
+    "large-v3-turbo-q5_0": MODELS_DIR / "ggml-large-v3-turbo-q5_0.bin",
+    "large-v3-turbo": MODELS_DIR / "ggml-large-v3-turbo.bin",
 }
 MODEL_OPTIONS = {MODEL_LABELS[key]: MODEL_FILES[key] for key in MODEL_LABELS}
 MODEL_KEY_BY_LABEL = {label: key for key, label in MODEL_LABELS.items()}
 DEFAULT_MODEL_LABEL = MODEL_LABELS["small-q5_1"]
-PROFILE_MODEL_KEYS = {
-    "Стандарт": "small-q5_1",
-}
-DEFAULT_PROFILE_LABEL = "Стандарт"
+REQUIRED_MODEL_KEYS = ("small-q5_1",)
+PACKAGE_MODEL_KEYS = (
+    "small-q5_1",
+    "small",
+    "medium-q5_0",
+    "medium",
+    "large-v3-turbo-q5_0",
+    "large-v3-turbo",
+)
+QUALITY_MODEL_PREFERENCE = (
+    "large-v3-turbo",
+    "large-v3-turbo-q5_0",
+    "medium",
+    "medium-q5_0",
+    "small",
+    "small-q5_1",
+)
 FALLBACK_AUTO_MODEL_KEY = "small-q5_1"
 TRANSLATION_PACK_DIR = APP_DIR / ".tools" / "argos-translate"
 ARGOS_PACKAGES_DIR = TRANSLATION_PACK_DIR / "packages"
@@ -86,6 +112,7 @@ ARGOS_PYTHON_CANDIDATES = (
 )
 TRANSLATION_DIR = APP_DIR / "translation"
 EN_RU_GLOSSARY_PATH = TRANSLATION_DIR / "glossary_en_ru.json"
+RU_RECOGNITION_DICTIONARY_PATH = APP_DIR / "dicta_dictionary_ru.json"
 ARGOS_TRANSLATION_TIMEOUT_SECONDS = 45
 ARGOS_WORKER_FIRST_TRANSLATION_TIMEOUT_SECONDS = 120
 ARGOS_WORKER_STOP_TIMEOUT_SECONDS = 3
@@ -132,6 +159,9 @@ VAD_MIN_RMS = 80.0
 VAD_MIN_PEAK = 350
 VAD_NOISE_MULTIPLIER = 3.0
 AUDIO_GAIN_MAX_PERCENT = 1000
+RU_POSTPROCESS_MIN_WORD_LENGTH = 5
+RU_POSTPROCESS_MAX_EDIT_DISTANCE = 2
+RU_POSTPROCESS_LOG_LIMIT = 200
 BENCHMARK_AUDIO_SECONDS = 2.0
 DEFAULT_WHISPER_THREADS = 4
 GPU_BACKEND_KEYS = {"vulkan", "cuda", "openvino"}
@@ -153,6 +183,7 @@ DEFAULT_USER_SETTINGS = {
     "voice_punctuation": True,
     "recognition_mode": DEFAULT_RECOGNITION_MODE_KEY,
     "backend": "auto",
+    "model_key": FALLBACK_AUTO_MODEL_KEY,
     "audio_gain_percent": 0,
 }
 
@@ -790,6 +821,16 @@ def user_settings_path() -> Path:
 
 
 USER_SETTINGS_PATH = user_settings_path()
+
+
+def ru_postprocess_log_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "Dicta" / "postprocess_corrections.log"
+    return APP_DIR / "postprocess_corrections.log"
+
+
+RU_POSTPROCESS_LOG_PATH = ru_postprocess_log_path()
 
 
 def is_whisper_backend_available(backend_name: str) -> bool:
@@ -1549,6 +1590,9 @@ def load_user_settings() -> dict:
                 settings["recognition_mode"] = sanitize_recognition_mode_key(
                     stored.get("recognition_mode", DEFAULT_USER_SETTINGS["recognition_mode"])
                 )
+                settings["model_key"] = sanitize_model_key(
+                    stored.get("model_key", DEFAULT_USER_SETTINGS["model_key"])
+                )
     except Exception:
         return dict(DEFAULT_USER_SETTINGS)
     return settings
@@ -1566,6 +1610,7 @@ def save_user_settings(settings: dict) -> None:
             settings.get("audio_gain_percent", DEFAULT_USER_SETTINGS["audio_gain_percent"])
         ),
         "backend": str(settings.get("backend", DEFAULT_USER_SETTINGS["backend"])),
+        "model_key": sanitize_model_key(settings.get("model_key", DEFAULT_USER_SETTINGS["model_key"])),
     }
     if payload["backend"] not in BACKEND_LABELS:
         payload["backend"] = DEFAULT_USER_SETTINGS["backend"]
@@ -1576,6 +1621,36 @@ def save_user_settings(settings: dict) -> None:
 def apply_voice_punctuation_commands(text: str) -> str:
     replacements = [
         (r"(?iu)(?<!\w)новый\s+абзац[.,!?;:]*(?!\w)", "\n\n"),
+        (r"(?iu)(?<!\w)новая\s+строка[.,!?;:]*(?!\w)", "\n"),
+        (
+            r"(?iu)(?<!\w)(?:точка[.,!?;:]*\s+(?:с\s+)?(?:запятой|запитой|запетой|запятая|запитая|запетая)|точку[.,!?;:]*\s+(?:с\s+)?(?:запятой|запитой|запетой))[.,!?;:]*(?!\w)",
+            ";",
+        ),
+        (
+            r"(?iu)(?<!\w)(?:двоеточие|двоеточия|двоиточие|двоиточия|дваиточие|дво[её]\s+точие|двои\s+точие|двой\s+точие|твои\s+точ[яие]|твой\s+точ[яие]|две\s+точки|два\s+точки)[.,!?;:]*(?!\w)",
+            ":",
+        ),
+        (r"(?iu)(?<!\w)(?:многоточие|многоточия)[.,!?;:]*(?!\w)", "..."),
+        (r"(?iu)(?<!\w)(?:вопросительный\s+знак|знак\s+вопроса)[.,!?;:]*(?!\w)", "?"),
+        (r"(?iu)(?<!\w)(?:восклицательный\s+знак|знак\s+восклицания)[.,!?;:]*(?!\w)", "!"),
+        (
+            r"(?iu)(?<!\w)(?:кавычки\s+открываются|открывающиеся\s+кавычки|открывающая\s+кавычка|открыть\s+кавычки|открыть\s+кавычку)[.,!?;:]*(?!\w)",
+            '"',
+        ),
+        (
+            r"(?iu)(?<!\w)(?:кавычки\s+закрываются|закрывающиеся\s+кавычки|закрывающая\s+кавычка|закрыть\s+кавычки|закрыть\s+кавычку)[.,!?;:]*(?!\w)",
+            '"',
+        ),
+        (r"(?iu)(?<!\w)(?:кавычки|кавычка)[.,!?;:]*(?!\w)", '"'),
+        (
+            r"(?iu)(?<!\w)(?:скобка\s+открывается|скобки\s+открываются|открывающая\s+скобка|открыть\s+скобку)[.,!?;:]*(?!\w)",
+            "(",
+        ),
+        (
+            r"(?iu)(?<!\w)(?:скобка\s+закрывается|скобки\s+закрываются|закрывающая\s+скобка|закрыть\s+скобку)[.,!?;:]*(?!\w)",
+            ")",
+        ),
+        (r"(?iu)(?<!\w)тире[.,!?;:]*(?!\w)", " - "),
         (r"(?iu)(?<!\w)(?:запятая|запитая|запетая|запятую|запитую|запятой|запитой)[.,!?;:]*(?!\w)", ","),
         (r"(?iu)(?<!\w)(?:точка|точку)[.,!?;:]*(?!\w)", "."),
     ]
@@ -1591,10 +1666,16 @@ def normalize_punctuation_spacing(text: str) -> str:
     result = re.sub(r" *\n *", "\n", result)
     result = re.sub(r"\n{3,}", "\n\n", result)
     result = re.sub(r"\s+([,.;:!?])", r"\1", result)
-    result = re.sub(r"([,.;:!?])(?:\s*\1)+", r"\1", result)
+    result = re.sub(r"\.(?:\s*\.){2,}", "...", result)
+    result = re.sub(r"([,;:!?])(?:\s*\1)+", r"\1", result)
     result = re.sub(r",\s*([.!?])", r"\1", result)
     result = re.sub(r"([.!?])\s*,", r"\1", result)
     result = re.sub(r"([,.;:!?])(?=[^\s\n,.;:!?])", r"\1 ", result)
+    result = re.sub(r'"\s*([^"\n]*?)\s*"', lambda match: f'"{match.group(1).strip()}"', result)
+    result = re.sub(r'(^|[\s(\[{])"\s+', r'\1"', result)
+    result = re.sub(r'\s+"(?=$|[\s,.;:!?()\]}])', '"', result)
+    result = re.sub(r"\(\s+", "(", result)
+    result = re.sub(r"\s+\)", ")", result)
     result = re.sub(r"[ \t]{2,}", " ", result)
     return result.strip()
 
@@ -1636,11 +1717,541 @@ def prepare_recognized_text(text: str, use_formatting: bool = True, use_voice_pu
     return result
 
 
+@dataclass(frozen=True)
+class RecognitionCorrection:
+    start: int
+    end: int
+    source: str
+    replacement: str
+
+
+@dataclass(frozen=True)
+class RecognitionPostprocessResult:
+    text: str
+    corrections: tuple[RecognitionCorrection, ...]
+
+
+@dataclass(frozen=True)
+class RuRecognitionDictionary:
+    replacements: dict[str, str]
+    protected_words: frozenset[str]
+    known_words: frozenset[str]
+    blocked_pairs: dict[str, frozenset[str]]
+    phrase_replacements: dict[str, str]
+
+
+def _load_dictionary_words(value: object) -> frozenset[str]:
+    if not isinstance(value, list):
+        return frozenset()
+    return frozenset(str(item).strip().casefold() for item in value if str(item).strip())
+
+
+def _load_dictionary_replacements(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    replacements: dict[str, str] = {}
+    for source, replacement in value.items():
+        source_text = str(source).strip()
+        replacement_text = str(replacement).strip()
+        if source_text and replacement_text:
+            replacements[source_text.casefold()] = replacement_text
+    return replacements
+
+
+def _load_dictionary_blocked_pairs(value: object) -> dict[str, frozenset[str]]:
+    if not isinstance(value, dict):
+        return {}
+    blocked_pairs: dict[str, frozenset[str]] = {}
+    for source, replacements in value.items():
+        source_text = str(source).strip()
+        if not source_text:
+            continue
+        if isinstance(replacements, list):
+            blocked = frozenset(str(item).strip().casefold() for item in replacements if str(item).strip())
+        else:
+            blocked = frozenset({str(replacements).strip().casefold()}) if str(replacements).strip() else frozenset()
+        if blocked:
+            blocked_pairs[source_text.casefold()] = blocked
+    return blocked_pairs
+
+
+def _load_dictionary_phrase_replacements(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    phrase_replacements: dict[str, str] = {}
+    for source, replacement in value.items():
+        source_text = str(source).strip()
+        replacement_text = str(replacement).strip()
+        if source_text and replacement_text:
+            phrase_replacements[source_text] = replacement_text
+    return phrase_replacements
+
+
+def load_ru_recognition_dictionary_payload() -> dict[str, object]:
+    try:
+        data = json.loads(RU_RECOGNITION_DICTIONARY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    return {
+        "version": 2,
+        "replacements": data.get("replacements") if isinstance(data.get("replacements"), dict) else {},
+        "protected_words": data.get("protected_words") if isinstance(data.get("protected_words"), list) else [],
+        "known_words": data.get("known_words") if isinstance(data.get("known_words"), list) else [],
+        "blocked_pairs": data.get("blocked_pairs") if isinstance(data.get("blocked_pairs"), dict) else {},
+        "phrase_replacements": data.get("phrase_replacements")
+        if isinstance(data.get("phrase_replacements"), dict)
+        else {},
+    }
+
+
+def save_ru_recognition_dictionary_payload(payload: dict[str, object]) -> None:
+    RU_RECOGNITION_DICTIONARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RU_RECOGNITION_DICTIONARY_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_ru_recognition_dictionary() -> RuRecognitionDictionary:
+    data = load_ru_recognition_dictionary_payload()
+    return RuRecognitionDictionary(
+        replacements=_load_dictionary_replacements(data.get("replacements")),
+        protected_words=_load_dictionary_words(data.get("protected_words")),
+        known_words=_load_dictionary_words(data.get("known_words")),
+        blocked_pairs=_load_dictionary_blocked_pairs(data.get("blocked_pairs")),
+        phrase_replacements=_load_dictionary_phrase_replacements(data.get("phrase_replacements")),
+    )
+
+
+def remove_casefolded_list_item(items: list[object], value: str) -> bool:
+    value_key = value.casefold()
+    kept = [item for item in items if str(item).strip().casefold() != value_key]
+    if len(kept) == len(items):
+        return False
+    items[:] = kept
+    return True
+
+
+def remove_casefolded_mapping_key(mapping: dict[str, object], key: str) -> bool:
+    key_folded = key.casefold()
+    existing_key = next((item for item in mapping if str(item).casefold() == key_folded), None)
+    if existing_key is None:
+        return False
+    mapping.pop(existing_key, None)
+    return True
+
+
+def add_ru_dictionary_known_word(word: str) -> bool:
+    clean_word = word.strip()
+    if not clean_word or re.search(r"\s", clean_word):
+        return False
+
+    payload = load_ru_recognition_dictionary_payload()
+    known_words = payload["known_words"]
+    if not isinstance(known_words, list):
+        known_words = []
+        payload["known_words"] = known_words
+
+    if any(str(item).strip().casefold() == clean_word.casefold() for item in known_words):
+        return False
+    known_words.append(clean_word)
+    save_ru_recognition_dictionary_payload(payload)
+    return True
+
+
+def add_ru_dictionary_known_words(words: list[str]) -> int:
+    added = 0
+    for word in words:
+        if add_ru_dictionary_known_word(word):
+            added += 1
+    return added
+
+
+def add_ru_dictionary_replacement(source: str, replacement: str) -> bool:
+    source_text = source.strip()
+    replacement_text = replacement.strip()
+    if not source_text or not replacement_text or source_text.casefold() == replacement_text.casefold():
+        return False
+
+    payload = load_ru_recognition_dictionary_payload()
+    replacements = payload["replacements"]
+    if not isinstance(replacements, dict):
+        replacements = {}
+        payload["replacements"] = replacements
+    replacements[source_text] = replacement_text
+
+    for list_key in ("known_words", "protected_words"):
+        values = payload[list_key]
+        if isinstance(values, list):
+            remove_casefolded_list_item(values, source_text)
+
+    blocked_pairs = payload["blocked_pairs"]
+    if isinstance(blocked_pairs, dict):
+        blocked = blocked_pairs.get(source_text)
+        if isinstance(blocked, list):
+            remove_casefolded_list_item(blocked, replacement_text)
+            if not blocked:
+                blocked_pairs.pop(source_text, None)
+
+    save_ru_recognition_dictionary_payload(payload)
+    return True
+
+
+def remember_rejected_ru_corrections(corrections: tuple[RecognitionCorrection, ...]) -> bool:
+    if not corrections:
+        return False
+
+    payload = load_ru_recognition_dictionary_payload()
+    replacements = payload["replacements"]
+    blocked_pairs = payload["blocked_pairs"]
+    phrase_replacements = payload["phrase_replacements"]
+    if not isinstance(replacements, dict) or not isinstance(blocked_pairs, dict) or not isinstance(phrase_replacements, dict):
+        return False
+
+    changed = False
+    for correction in corrections:
+        source = correction.source.strip()
+        replacement = correction.replacement.strip()
+        if not source or not replacement:
+            continue
+
+        direct_key = next((key for key, value in replacements.items() if str(key).casefold() == source.casefold() and str(value).casefold() == replacement.casefold()), None)
+        if direct_key is not None:
+            replacements.pop(direct_key, None)
+            changed = True
+
+        phrase_key = next((key for key, value in phrase_replacements.items() if str(key).casefold() == source.casefold() and str(value).casefold() == replacement.casefold()), None)
+        if phrase_key is not None:
+            phrase_replacements.pop(phrase_key, None)
+            changed = True
+
+        if re.fullmatch(r"[А-Яа-яЁё]+", source) and re.fullmatch(r"[А-Яа-яЁё]+", replacement):
+            existing_key = next((key for key in blocked_pairs if str(key).casefold() == source.casefold()), source)
+            blocked = blocked_pairs.get(existing_key)
+            if not isinstance(blocked, list):
+                blocked = []
+                blocked_pairs[existing_key] = blocked
+            if not any(str(item).casefold() == replacement.casefold() for item in blocked):
+                blocked.append(replacement)
+                changed = True
+
+    if changed:
+        save_ru_recognition_dictionary_payload(payload)
+    return changed
+
+
+def russian_letter_count(value: str) -> int:
+    return sum(1 for char in value if "а" <= char.lower() <= "я" or char.lower() == "ё")
+
+
+def is_russian_word(value: str) -> bool:
+    return bool(re.fullmatch(r"[А-Яа-яЁё]+", value))
+
+
+def is_uppercase_abbreviation(value: str) -> bool:
+    letters = [char for char in value if char.isalpha()]
+    return len(letters) >= 2 and all(char.upper() == char for char in letters)
+
+
+def is_protected_spellcheck_word(value: str) -> bool:
+    if not value or len(value) < RU_POSTPROCESS_MIN_WORD_LENGTH:
+        return True
+    if any(char.isdigit() for char in value):
+        return True
+    if re.search(r"[A-Za-z@_:/\\]", value):
+        return True
+    if "-" in value:
+        return True
+    if russian_letter_count(value) < RU_POSTPROCESS_MIN_WORD_LENGTH:
+        return True
+    if is_uppercase_abbreviation(value):
+        return True
+    return not is_russian_word(value)
+
+
+def is_protected_spellcheck_context(text: str, start: int, end: int) -> bool:
+    left = start
+    while left > 0 and not text[left - 1].isspace():
+        left -= 1
+    right = end
+    while right < len(text) and not text[right].isspace():
+        right += 1
+    token = text[left:right]
+    token_lower = token.lower()
+    return bool(
+        "@"
+        in token
+        or "://"
+        in token
+        or token_lower.startswith("www.")
+        or "/" in token
+        or "\\" in token
+    )
+
+
+def edit_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    previous[right_index] + 1,
+                    current[right_index - 1] + 1,
+                    previous[right_index - 1] + (left_char != right_char),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def match_word_case(source: str, replacement: str) -> str:
+    if source.isupper():
+        return replacement.upper()
+    if source.islower():
+        return replacement.lower()
+    if source[:1].isupper() and source[1:].islower():
+        return replacement[:1].upper() + replacement[1:].lower()
+    return replacement
+
+
+def match_phrase_case(source: str, replacement: str) -> str:
+    if source.isupper():
+        return replacement.upper()
+    if source[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def dictionary_phrase_pattern(source: str) -> re.Pattern[str]:
+    body = r"\s+".join(re.escape(part) for part in source.split())
+    return re.compile(rf"(?iu)(?<!\w){body}(?!\w)")
+
+
+def apply_ru_dictionary_phrase_replacements(
+    text: str,
+    dictionary: RuRecognitionDictionary,
+) -> RecognitionPostprocessResult:
+    if not dictionary.phrase_replacements:
+        return RecognitionPostprocessResult(text, ())
+
+    result = text
+    corrections: list[RecognitionCorrection] = []
+    replacements = sorted(dictionary.phrase_replacements.items(), key=lambda item: len(item[0]), reverse=True)
+    for source, replacement in replacements:
+        matches = list(dictionary_phrase_pattern(source).finditer(result))
+        if not matches:
+            continue
+        for match in reversed(matches):
+            replace_start = match.start()
+            replace_end = match.end()
+            replacement_text = match_phrase_case(match.group(0), replacement)
+            if replacement_text.startswith((".", ",", ";", ":", "!", "?")) and replace_start > 0 and result[replace_start - 1].isspace():
+                replace_start -= 1
+            source_text = result[replace_start:replace_end]
+            if source_text.casefold() == replacement_text.casefold():
+                continue
+            result = result[:replace_start] + replacement_text + result[replace_end:]
+            corrections.append(
+                RecognitionCorrection(
+                    start=replace_start,
+                    end=replace_end,
+                    source=source_text,
+                    replacement=replacement_text,
+                )
+            )
+
+    if not corrections:
+        return RecognitionPostprocessResult(text, ())
+    corrections.sort(key=lambda item: item.start)
+    return RecognitionPostprocessResult(result, tuple(corrections))
+
+
+def choose_conservative_suggestion(
+    issue: SpellingIssue,
+    text: str,
+    dictionary: RuRecognitionDictionary,
+) -> str | None:
+    source = issue.word
+    start = issue.start
+    end = issue.start + issue.length
+    source_key = source.casefold()
+    if source_key in dictionary.known_words:
+        return None
+    if source_key in dictionary.protected_words:
+        return None
+    if is_protected_spellcheck_word(source) or is_protected_spellcheck_context(text, start, end):
+        return None
+
+    dictionary_replacement = dictionary.replacements.get(source_key)
+    if dictionary_replacement:
+        candidate = dictionary_replacement.strip()
+        if not is_protected_spellcheck_word(candidate) and source.casefold() != candidate.casefold():
+            return match_word_case(source, candidate)
+
+    if not issue.suggestions:
+        return None
+    if len(issue.suggestions) != 1:
+        return None
+
+    candidate = str(issue.suggestions[0]).strip()
+    if is_protected_spellcheck_word(candidate):
+        return None
+    if source.casefold() == candidate.casefold():
+        return None
+    if candidate.casefold() in dictionary.blocked_pairs.get(source_key, frozenset()):
+        return None
+
+    distance = edit_distance(source.casefold(), candidate.casefold())
+    if distance <= 0 or distance > RU_POSTPROCESS_MAX_EDIT_DISTANCE:
+        return None
+    if distance == RU_POSTPROCESS_MAX_EDIT_DISTANCE and russian_letter_count(source) < 8:
+        return None
+    if source[:1].casefold() != candidate[:1].casefold():
+        return None
+
+    return match_word_case(source, candidate)
+
+
+def apply_ru_recognition_postprocess(text: str) -> RecognitionPostprocessResult:
+    if not text.strip():
+        return RecognitionPostprocessResult(text, ())
+
+    dictionary = load_ru_recognition_dictionary()
+    phrase_result = apply_ru_dictionary_phrase_replacements(text, dictionary)
+    working_text = phrase_result.text
+    issues = check_text(working_text, language_tag="ru-RU")
+    word_corrections: list[RecognitionCorrection] = []
+    for issue in issues:
+        replacement = choose_conservative_suggestion(issue, working_text, dictionary)
+        if not replacement:
+            continue
+        word_corrections.append(
+            RecognitionCorrection(
+                start=issue.start,
+                end=issue.start + issue.length,
+                source=issue.word,
+                replacement=replacement,
+            )
+        )
+
+    if not phrase_result.corrections and not word_corrections:
+        return RecognitionPostprocessResult(text, ())
+
+    result = working_text
+    for correction in sorted(word_corrections, key=lambda item: item.start, reverse=True):
+        result = result[: correction.start] + correction.replacement + result[correction.end :]
+    return RecognitionPostprocessResult(result, phrase_result.corrections + tuple(word_corrections))
+
+
+def log_ru_recognition_corrections(corrections: tuple[RecognitionCorrection, ...]) -> None:
+    if not corrections:
+        return
+    try:
+        RU_POSTPROCESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S %z")
+        visible = corrections[:RU_POSTPROCESS_LOG_LIMIT]
+        pairs = "; ".join(f"{item.source} -> {item.replacement}" for item in visible)
+        suffix = f"; ... +{len(corrections) - len(visible)}" if len(corrections) > len(visible) else ""
+        with RU_POSTPROCESS_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(f"{timestamp}\t{pairs}{suffix}\n")
+    except Exception:
+        pass
+
+
+def ru_recognition_corrections_status(corrections: tuple[RecognitionCorrection, ...]) -> str:
+    return f"Исправлено: {len(corrections)}"
+
+
+def run_ru_dictionary_self_test() -> None:
+    original_text = ""
+    if RU_RECOGNITION_DICTIONARY_PATH.exists():
+        original_text = RU_RECOGNITION_DICTIONARY_PATH.read_text(encoding="utf-8")
+
+    try:
+        if not add_ru_dictionary_replacement("тестошибка", "тест"):
+            raise AssertionError("dictionary replacement was not added")
+        payload = load_ru_recognition_dictionary_payload()
+        replacements = payload.get("replacements", {})
+        if not isinstance(replacements, dict) or replacements.get("тестошибка") != "тест":
+            raise AssertionError("dictionary replacement was not saved")
+
+        if not add_ru_dictionary_known_word("Тесттермин"):
+            raise AssertionError("known word was not added")
+        payload = load_ru_recognition_dictionary_payload()
+        known_words = payload.get("known_words", [])
+        if not isinstance(known_words, list) or not any(str(item) == "Тесттермин" for item in known_words):
+            raise AssertionError("known word was not saved")
+
+        rejected = (
+            RecognitionCorrection(
+                start=0,
+                end=10,
+                source="тестошибка",
+                replacement="тест",
+            ),
+        )
+        if not remember_rejected_ru_corrections(rejected):
+            raise AssertionError("rejected correction was not remembered")
+        payload = load_ru_recognition_dictionary_payload()
+        replacements = payload.get("replacements", {})
+        blocked_pairs = payload.get("blocked_pairs", {})
+        if isinstance(replacements, dict) and "тестошибка" in replacements:
+            raise AssertionError("rejected replacement was not removed")
+        if not isinstance(blocked_pairs, dict) or "тестошибка" not in blocked_pairs:
+            raise AssertionError("blocked pair was not saved")
+    finally:
+        if original_text:
+            RU_RECOGNITION_DICTIONARY_PATH.write_text(original_text, encoding="utf-8")
+        elif RU_RECOGNITION_DICTIONARY_PATH.exists():
+            try:
+                RU_RECOGNITION_DICTIONARY_PATH.unlink()
+            except OSError:
+                pass
+
+
 def run_text_cleanup_self_test() -> None:
     cases = [
         (
             "привет точка новый абзац как дела запятая нормально",
             "Привет.\n\nКак дела, нормально.",
+        ),
+        (
+            "список двоеточие первое точка с запятой второе точка",
+            "Список: первое; второе.",
+        ),
+        (
+            "применение твои точя носить на сумке точка запятой дарить точка",
+            "Применение: носить на сумке; дарить.",
+        ),
+        (
+            "оберег точка, запятой применение двоиточие носить точка",
+            "Оберег; применение: носить.",
+        ),
+        (
+            "я думаю многоточие возможно вопросительный знак точно восклицательный знак",
+            "Я думаю... Возможно? Точно!",
+        ),
+        (
+            "первая строка новая строка вторая строка тире продолжение",
+            "Первая строка\nВторая строка - продолжение.",
+        ),
+        (
+            "он сказал кавычки открываются привет кавычки закрываются точка",
+            'Он сказал "привет".',
+        ),
+        (
+            "термин кавычки договор кавычки скобка открывается важно скобка закрывается точка",
+            'Термин "договор" (важно).',
         ),
         (
             "Провегаем команды пунктуаций, запитая, 1, 2, 3, 4, 5, запитая, 6, 7, 8, 9,.",
@@ -1661,7 +2272,47 @@ def run_text_cleanup_self_test() -> None:
             raise AssertionError(f"text cleanup failed: {source!r} -> {actual!r}, expected {expected!r}")
 
 
+def available_model_keys() -> list[str]:
+    return [model_key for model_key in MODEL_LABELS if MODEL_FILES[model_key].exists()]
+
+
+def available_model_options() -> dict[str, Path]:
+    keys = available_model_keys()
+    if not keys:
+        keys = list(REQUIRED_MODEL_KEYS)
+    return {MODEL_LABELS[key]: MODEL_FILES[key] for key in keys}
+
+
+def required_model_paths() -> list[Path]:
+    return [MODEL_FILES[key] for key in REQUIRED_MODEL_KEYS]
+
+
+def sanitize_model_key(model_key: object | None, require_available: bool = False) -> str:
+    key = str(model_key or FALLBACK_AUTO_MODEL_KEY)
+    if key not in MODEL_FILES:
+        return FALLBACK_AUTO_MODEL_KEY
+    if require_available and not MODEL_FILES[key].exists():
+        return choose_best_quality_model_key()
+    return key
+
+
+def choose_best_quality_model_key(results: dict | None = None) -> str:
+    for model_key in QUALITY_MODEL_PREFERENCE:
+        if model_key not in MODEL_FILES:
+            continue
+        if results is not None:
+            item = results.get(model_key, {})
+            if isinstance(item, dict) and item.get("ok"):
+                return model_key
+            continue
+        if MODEL_FILES[model_key].exists():
+            return model_key
+    return FALLBACK_AUTO_MODEL_KEY
+
+
 def choose_auto_model_key(results: dict | None = None) -> str:
+    if results:
+        return choose_best_quality_model_key(results)
     return FALLBACK_AUTO_MODEL_KEY
 
 
@@ -1988,15 +2639,19 @@ class DictaApp:
         self.hotkey_thread_id: int | None = None
         self.translation_worker: threading.Thread | None = None
         self.format_undo_snapshot: tuple[str, str] | None = None
+        self.postprocess_undo_snapshot: tuple[str, str, tuple[RecognitionCorrection, ...]] | None = None
         self.settings_snapshot: dict[str, object] = {}
 
         self.status_var = tk.StringVar(value="Готово")
         self.record_time_var = tk.StringVar(value="Запись: 00:00")
         self.recognition_time_var = tk.StringVar(value="Распознавание: -")
         self.firewall_status_var = tk.StringVar(value="Сеть: проверка...")
-        self.speed_status_var = tk.StringVar(value="Модель: small-q5_1")
-        self.profile_var = tk.StringVar(value=DEFAULT_PROFILE_LABEL)
-        self.model_var = tk.StringVar(value=DEFAULT_MODEL_LABEL)
+        initial_model_key = sanitize_model_key(
+            self.settings.get("model_key", FALLBACK_AUTO_MODEL_KEY),
+            require_available=True,
+        )
+        self.speed_status_var = tk.StringVar(value=f"Модель: {initial_model_key}")
+        self.model_var = tk.StringVar(value=MODEL_LABELS.get(initial_model_key, DEFAULT_MODEL_LABEL))
         self.backend_var = tk.StringVar(
             value=BACKEND_LABELS.get(str(self.settings.get("backend", "auto")), DEFAULT_BACKEND_LABEL)
         )
@@ -2032,7 +2687,7 @@ class DictaApp:
         )
 
         self._build_ui()
-        self._apply_profile_selection()
+        self._update_speed_status()
         self.refresh_input_devices()
         self.settings_snapshot = self._capture_settings_state()
         self._check_local_files()
@@ -2048,7 +2703,7 @@ class DictaApp:
 
         toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(8, weight=1)
+        toolbar.columnconfigure(9, weight=1)
 
         self.record_button = ttk.Button(toolbar, text="Записать", command=self.toggle_recording)
         self.record_button.grid(row=0, column=0, padx=(0, 8))
@@ -2077,7 +2732,15 @@ class DictaApp:
         self.toolbar_recognition_mode_box.bind("<<ComboboxSelected>>", self._on_toolbar_recognition_mode_changed)
 
         self.clear_button = ttk.Button(toolbar, text="Очистить", command=self.clear_text)
-        self.clear_button.grid(row=0, column=5, padx=(0, 16))
+        self.clear_button.grid(row=0, column=5, padx=(0, 8))
+
+        self.postprocess_undo_button = ttk.Button(
+            toolbar,
+            text="Откатить",
+            command=self.undo_last_postprocess,
+            state=tk.DISABLED,
+        )
+        self.postprocess_undo_button.grid(row=0, column=6, padx=(0, 16))
 
         self.input_level_bar = ttk.Progressbar(
             toolbar,
@@ -2086,11 +2749,11 @@ class DictaApp:
             mode="determinate",
             length=120,
         )
-        self.input_level_bar.grid(row=0, column=6, sticky="w", padx=(0, 6))
-        ttk.Label(toolbar, textvariable=self.input_level_text_var).grid(row=0, column=7, sticky="w", padx=(0, 18))
+        self.input_level_bar.grid(row=0, column=7, sticky="w", padx=(0, 6))
+        ttk.Label(toolbar, textvariable=self.input_level_text_var).grid(row=0, column=8, sticky="w", padx=(0, 18))
 
         self.settings_button = ttk.Button(toolbar, text="Настройки", command=self.show_settings)
-        self.settings_button.grid(row=0, column=9, sticky="e")
+        self.settings_button.grid(row=0, column=10, sticky="e")
 
         text_frame = ttk.Frame(self.root, padding=(12, 6, 12, 6))
         text_frame.grid(row=1, column=0, sticky="nsew")
@@ -2275,24 +2938,15 @@ class DictaApp:
 
         performance_tab.columnconfigure(1, weight=1)
         ttk.Label(performance_tab, text="Модель:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
-        ttk.Label(performance_tab, textvariable=self.model_var).grid(row=0, column=1, sticky="w", pady=(0, 8))
         self.model_box = ttk.Combobox(
             performance_tab,
             textvariable=self.model_var,
-            values=list(MODEL_OPTIONS.keys()),
+            values=list(available_model_options().keys()),
             state="readonly",
             width=30,
         )
+        self.model_box.grid(row=0, column=1, sticky="w", pady=(0, 8))
         self.model_box.bind("<<ComboboxSelected>>", self._on_model_changed)
-
-        self.profile_box = ttk.Combobox(
-            performance_tab,
-            textvariable=self.profile_var,
-            values=list(PROFILE_MODEL_KEYS.keys()),
-            state="readonly",
-            width=14,
-        )
-        self.profile_box.bind("<<ComboboxSelected>>", self._on_profile_changed)
 
         ttk.Label(performance_tab, text="Backend:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
         self.backend_box = ttk.Combobox(
@@ -2309,7 +2963,8 @@ class DictaApp:
         benchmark_buttons.grid(row=2, column=1, sticky="w", pady=(6, 8))
         self.benchmark_button = ttk.Button(benchmark_buttons, text="Бенчмарк модели", command=self.start_model_benchmark)
         self.backend_benchmark_button = ttk.Button(benchmark_buttons, text="Backend тест", command=self.start_backend_benchmark)
-        self.backend_benchmark_button.grid(row=0, column=0, sticky="w")
+        self.benchmark_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.backend_benchmark_button.grid(row=0, column=1, sticky="w")
         ttk.Label(performance_tab, textvariable=self.speed_status_var).grid(row=3, column=1, sticky="w")
 
         self.firewall_button = ttk.Button(security_tab, text="Блокировать сеть", command=self.enable_firewall_block)
@@ -2327,6 +2982,7 @@ class DictaApp:
         self.save_settings_button.grid(row=0, column=2, sticky="e")
 
     def show_settings(self) -> None:
+        self._refresh_model_options()
         self._center_settings_window()
         self.settings_window.deiconify()
         self.settings_window.lift()
@@ -2375,7 +3031,7 @@ class DictaApp:
         if not available_whisper_backends():
             expected = "\n".join(f"{name}: {path}" for name, path in WHISPER_BACKENDS.items())
             missing.append(f"Не найден ни один локальный whisper.cpp backend:\n{expected}")
-        for model_path in MODEL_OPTIONS.values():
+        for model_path in required_model_paths():
             if not model_path.exists():
                 missing.append(str(model_path))
 
@@ -2504,8 +3160,13 @@ class DictaApp:
             self._clear_spelling_marks()
             self._schedule_spellcheck(delay_ms=100)
 
-    def _on_profile_changed(self, event=None) -> None:
-        self._apply_profile_selection()
+    def _refresh_model_options(self) -> None:
+        options = list(available_model_options().keys())
+        model_box = getattr(self, "model_box", None)
+        if model_box is not None:
+            model_box.configure(values=options)
+        if self.model_var.get() not in options:
+            self._select_model_key(choose_best_quality_model_key())
 
     def _on_model_changed(self, event=None) -> None:
         self._update_speed_status()
@@ -2535,15 +3196,8 @@ class DictaApp:
         except Exception as exc:
             self._set_status(f"Не удалось сохранить режим: {exc}")
 
-    def _apply_profile_selection(self) -> None:
-        profile = self.profile_var.get()
-        model_key = PROFILE_MODEL_KEYS.get(profile)
-        if model_key is None:
-            model_key = choose_auto_model_key()
-        self._select_model_key(model_key)
-        self._update_speed_status()
-
     def _select_model_key(self, model_key: str) -> None:
+        model_key = sanitize_model_key(model_key, require_available=True)
         label = MODEL_LABELS.get(model_key, DEFAULT_MODEL_LABEL)
         self.model_var.set(label)
 
@@ -2681,11 +3335,10 @@ class DictaApp:
 
         self.is_benchmarking = True
         self._set_status("Бенчмарк модели: подготовка...")
-        self.speed_status_var.set("Бенчмарк модели: идет проверка small-q5_1")
+        self.speed_status_var.set("Бенчмарк модели: идет проверка доступных моделей")
         self._set_record_button_busy("Бенчмарк")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
-        self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(text="Идет тест...", state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
@@ -2730,7 +3383,6 @@ class DictaApp:
         self._set_record_button_busy("Бенчмарк")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
-        self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(text="Идет тест...", state=tk.DISABLED)
@@ -2874,7 +3526,6 @@ class DictaApp:
         self._set_record_button_busy("Проверка")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
-        self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
@@ -2928,7 +3579,6 @@ class DictaApp:
         self._set_record_button_idle()
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state="readonly")
-        self.profile_box.configure(state="readonly")
         self.benchmark_button.configure(state=tk.NORMAL)
         self.backend_box.configure(state="readonly")
         self.backend_benchmark_button.configure(state=tk.NORMAL)
@@ -3017,7 +3667,6 @@ class DictaApp:
         self._set_record_button_busy("Поиск")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
-        self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
@@ -3103,7 +3752,6 @@ class DictaApp:
         self._set_record_button_recording()
         self.stop_button.configure(state=tk.NORMAL)
         self.model_box.configure(state=tk.DISABLED)
-        self.profile_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
@@ -3146,7 +3794,6 @@ class DictaApp:
             self._set_status("Готово")
             self._set_record_button_idle()
             self.model_box.configure(state="readonly")
-            self.profile_box.configure(state="readonly")
             self.benchmark_button.configure(state=tk.NORMAL)
             self.backend_box.configure(state="readonly")
             self.backend_benchmark_button.configure(state=tk.NORMAL)
@@ -3181,6 +3828,7 @@ class DictaApp:
             "recognition_mode": self._selected_recognition_mode_key(),
             "audio_gain_percent": clamp_audio_gain_percent(self.audio_gain_percent_var.get()),
             "backend": self._selected_backend_key(),
+            "model_key": self._selected_model_key(),
         }
         try:
             save_user_settings(settings)
@@ -3195,7 +3843,6 @@ class DictaApp:
     def _capture_settings_state(self) -> dict[str, object]:
         return {
             "input_device": self.input_device_var.get(),
-            "profile": self.profile_var.get(),
             "model": self.model_var.get(),
             "backend": self.backend_var.get(),
             "recognition_mode": self._selected_recognition_mode_key(),
@@ -3209,8 +3856,8 @@ class DictaApp:
         input_device = str(state.get("input_device", ""))
         if input_device in self.input_devices:
             self.input_device_var.set(input_device)
-        self.profile_var.set(DEFAULT_PROFILE_LABEL)
-        self.model_var.set(DEFAULT_MODEL_LABEL)
+        model_key = MODEL_KEY_BY_LABEL.get(str(state.get("model", DEFAULT_MODEL_LABEL)), FALLBACK_AUTO_MODEL_KEY)
+        self._select_model_key(model_key)
         self.backend_var.set(str(state.get("backend", DEFAULT_BACKEND_LABEL)))
         self._select_recognition_mode_key(state.get("recognition_mode", DEFAULT_RECOGNITION_MODE_KEY))
         self.auto_copy_var.set(bool(state.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"])))
@@ -3367,6 +4014,42 @@ class DictaApp:
         self.format_undo_snapshot = None
         self.format_button.configure(text="Автоформат")
 
+    def _reset_postprocess_undo(self) -> None:
+        self.postprocess_undo_snapshot = None
+        self.postprocess_undo_button.configure(state=tk.DISABLED)
+
+    def _set_postprocess_undo(
+        self,
+        original: str,
+        corrected: str,
+        corrections: tuple[RecognitionCorrection, ...],
+    ) -> None:
+        self.postprocess_undo_snapshot = (original, corrected, corrections)
+        self.postprocess_undo_button.configure(state=tk.NORMAL)
+
+    def undo_last_postprocess(self) -> None:
+        if self.postprocess_undo_snapshot is None:
+            self._set_status("Нет автоисправлений для отката")
+            return
+
+        original, corrected, corrections = self.postprocess_undo_snapshot
+        current = self.text.get("1.0", "end-1c")
+        if current != corrected:
+            self._reset_postprocess_undo()
+            self._set_status("Текст изменен, откат автоисправлений недоступен")
+            return
+
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", original)
+        remembered = remember_rejected_ru_corrections(corrections)
+        self._reset_postprocess_undo()
+        if remembered:
+            self._set_status("Автоисправления отменены и запомнены")
+        else:
+            self._set_status("Автоисправления отменены")
+        self._schedule_spellcheck(delay_ms=100)
+        self._update_translation_button_state()
+
     def _copy_selection(self) -> None:
         if not self._has_text_selection():
             return
@@ -3381,6 +4064,7 @@ class DictaApp:
         self._copy_value_to_clipboard(value)
         self.text.delete(tk.SEL_FIRST, tk.SEL_LAST)
         self._reset_format_undo()
+        self._reset_postprocess_undo()
         self._set_status("Вырезано")
         self._schedule_spellcheck(delay_ms=150)
 
@@ -3397,6 +4081,7 @@ class DictaApp:
             self.text.mark_set(tk.INSERT, insert_index)
         self.text.insert(tk.INSERT, value)
         self._reset_format_undo()
+        self._reset_postprocess_undo()
         self._set_status("Вставлено")
         self._schedule_spellcheck(delay_ms=150)
 
@@ -3423,6 +4108,7 @@ class DictaApp:
                 self.text.insert("1.0", original)
                 self.format_undo_snapshot = None
                 self.format_button.configure(text="Автоформат")
+                self._reset_postprocess_undo()
                 self._set_status("Форматирование отменено")
                 self._schedule_spellcheck(delay_ms=100)
                 return
@@ -3439,6 +4125,7 @@ class DictaApp:
             self._set_status("Текст уже отформатирован")
             return
         self.format_undo_snapshot = (value, formatted)
+        self._reset_postprocess_undo()
         self.text.delete("1.0", tk.END)
         self.text.insert("1.0", formatted)
         self.format_button.configure(text="Вернуть")
@@ -3449,6 +4136,7 @@ class DictaApp:
         self.text.delete("1.0", tk.END)
         self.format_undo_snapshot = None
         self.format_button.configure(text="Автоформат")
+        self._reset_postprocess_undo()
         self._clear_last_recognition_audio()
         self._set_text_spellcheck_language_from_mode(self._selected_recognition_mode_key())
         self._clear_spelling_marks()
@@ -3544,16 +4232,27 @@ class DictaApp:
         if issue_tag is not None:
             issue = self.spelling_issues[issue_tag]
             if issue.suggestions:
+                remember_menu = tk.Menu(menu, tearoff=False)
                 for suggestion in issue.suggestions:
                     menu.add_command(
                         label=suggestion,
                         command=lambda value=suggestion, tag=issue_tag: self._replace_spelling_issue(tag, value),
                     )
+                    remember_menu.add_command(
+                        label=suggestion,
+                        command=lambda value=suggestion, tag=issue_tag: self._replace_spelling_issue(
+                            tag,
+                            value,
+                            remember=True,
+                        ),
+                    )
+                menu.add_cascade(label="Исправить и запомнить", menu=remember_menu)
             else:
                 menu.add_command(label="Нет вариантов", state=tk.DISABLED)
 
             menu.add_separator()
-            menu.add_command(label="Добавить в словарь", command=lambda tag=issue_tag: self._add_spelling_word(tag))
+            menu.add_command(label="Считать словом Dicta", command=lambda tag=issue_tag: self._add_dicta_known_word(tag))
+            menu.add_command(label="Добавить в словарь Windows", command=lambda tag=issue_tag: self._add_spelling_word(tag))
             menu.add_command(label="Пропустить", command=lambda tag=issue_tag: self._ignore_spelling_issue(tag))
             menu.add_separator()
 
@@ -3562,9 +4261,20 @@ class DictaApp:
         can_paste = self._clipboard_has_text()
         selection_state = tk.NORMAL if has_selection else tk.DISABLED
 
+        menu.add_command(
+            label="Откатить автоисправления",
+            command=self.undo_last_postprocess,
+            state=tk.NORMAL if self.postprocess_undo_snapshot is not None else tk.DISABLED,
+        )
+        menu.add_separator()
         menu.add_command(label="Вырезать", command=self._cut_selection, state=selection_state)
         menu.add_command(label="Копировать", command=self._copy_selection, state=selection_state)
         menu.add_command(label="Вставить", command=self._paste_clipboard, state=tk.NORMAL if can_paste else tk.DISABLED)
+        menu.add_command(
+            label="Добавить выделенное в словарь Dicta",
+            command=self._add_selected_dicta_known_words,
+            state=selection_state,
+        )
         menu.add_separator()
         menu.add_command(label="Выделить всё", command=self._select_all_text, state=tk.NORMAL if has_text else tk.DISABLED)
 
@@ -3575,15 +4285,43 @@ class DictaApp:
             menu.grab_release()
         return "break"
 
-    def _replace_spelling_issue(self, tag_name: str, replacement: str) -> None:
+    def _replace_spelling_issue(self, tag_name: str, replacement: str, remember: bool = False) -> None:
+        issue = self.spelling_issues.get(tag_name)
         ranges = self.text.tag_ranges(tag_name)
         if len(ranges) < 2:
             return
 
         start, end = ranges[0], ranges[1]
+        source = issue.word if issue is not None else self.text.get(start, end)
         self.text.delete(start, end)
         self.text.insert(start, replacement)
+        self._reset_postprocess_undo()
+        if remember and add_ru_dictionary_replacement(source, replacement):
+            self._set_status(f"Запомнено: {source} -> {replacement}")
         self._schedule_spellcheck(delay_ms=150)
+
+    def _add_dicta_known_word(self, tag_name: str) -> None:
+        issue = self.spelling_issues.get(tag_name)
+        if issue is None:
+            return
+
+        if add_ru_dictionary_known_word(issue.word):
+            self._ignore_spelling_issue(tag_name)
+            self._set_status(f"Добавлено в словарь Dicta: {issue.word}")
+        else:
+            self._set_status("Слово уже есть в словаре Dicta")
+
+    def _add_selected_dicta_known_words(self) -> None:
+        if not self._has_text_selection():
+            return
+        selected = self.text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        words = re.findall(r"[A-Za-zА-Яа-яЁё]+", selected)
+        added = add_ru_dictionary_known_words(words)
+        if added:
+            self._set_status(f"Добавлено в словарь Dicta: {added}")
+            self._schedule_spellcheck(delay_ms=150)
+        else:
+            self._set_status("Нечего добавить в словарь Dicta")
 
     def _ignore_spelling_issue(self, tag_name: str) -> None:
         ranges = self.text.tag_ranges(tag_name)
@@ -3937,7 +4675,6 @@ class DictaApp:
                 self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
-                self.profile_box.configure(state="readonly")
                 self.benchmark_button.configure(state=tk.NORMAL)
                 self.backend_box.configure(state="readonly")
                 self.backend_benchmark_button.configure(state=tk.NORMAL)
@@ -3958,10 +4695,24 @@ class DictaApp:
                     use_voice_punctuation=self.voice_punctuation_var.get()
                     and recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY,
                 )
+                prepared_before_postprocess = prepared
+                postprocess_corrections: tuple[RecognitionCorrection, ...] = ()
+                if recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY:
+                    try:
+                        postprocess_result = apply_ru_recognition_postprocess(prepared)
+                        prepared = postprocess_result.text
+                        postprocess_corrections = postprocess_result.corrections
+                        log_ru_recognition_corrections(postprocess_corrections)
+                    except Exception:
+                        postprocess_corrections = ()
                 self.text.delete("1.0", tk.END)
                 self.text.insert("1.0", prepared)
                 self.format_undo_snapshot = None
                 self.format_button.configure(text="Автоформат")
+                if postprocess_corrections:
+                    self._set_postprocess_undo(prepared_before_postprocess, prepared, postprocess_corrections)
+                else:
+                    self._reset_postprocess_undo()
                 self.recognition_time_var.set(f"Распознавание: {elapsed:.1f} с")
                 self._update_speed_status(
                     vad_stats=vad_stats,
@@ -3977,6 +4728,8 @@ class DictaApp:
                     status = "Готово"
                 if gain_text:
                     status = f"{status}; {gain_text}"
+                if postprocess_corrections:
+                    status = f"{status}; {ru_recognition_corrections_status(postprocess_corrections)}"
                 self._set_status(status)
                 self._schedule_spellcheck(delay_ms=100)
                 self._update_translation_button_state()
@@ -3996,6 +4749,7 @@ class DictaApp:
                 self.text.insert("1.0", prepared)
                 self.format_undo_snapshot = None
                 self.format_button.configure(text="Автоформат")
+                self._reset_postprocess_undo()
                 if self.auto_copy_var.get() and prepared:
                     self._copy_value_to_clipboard(prepared)
                     status = f"Переведено и скопировано: {translation_elapsed:.1f} с"
@@ -4016,6 +4770,7 @@ class DictaApp:
                 self.text.insert("1.0", prepared)
                 self.format_undo_snapshot = None
                 self.format_button.configure(text="Автоформат")
+                self._reset_postprocess_undo()
                 if self.auto_copy_var.get() and prepared:
                     self._copy_value_to_clipboard(prepared)
                     status = f"Переведено в English и скопировано: {translation_elapsed:.1f} с"
@@ -4039,7 +4794,6 @@ class DictaApp:
                 self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
-                self.profile_box.configure(state="readonly")
                 self.benchmark_button.configure(state=tk.NORMAL)
                 self.backend_box.configure(state="readonly")
                 self.backend_benchmark_button.configure(state=tk.NORMAL)
@@ -4050,7 +4804,6 @@ class DictaApp:
             elif event == "benchmark_result":
                 profile = value
                 selected_model = profile.get("selected_model", FALLBACK_AUTO_MODEL_KEY)
-                self.profile_var.set(DEFAULT_PROFILE_LABEL)
                 self._select_model_key(selected_model)
                 self._update_speed_status()
                 self._set_status(f"Бенчмарк готов: выбрана модель {selected_model}")
@@ -4078,7 +4831,6 @@ class DictaApp:
                 self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
-                self.profile_box.configure(state="readonly")
                 self.benchmark_button.configure(text="Бенчмарк модели", state=tk.NORMAL)
                 self.backend_box.configure(state="readonly")
                 self.backend_benchmark_button.configure(text="Backend тест", state=tk.NORMAL)
@@ -4217,7 +4969,7 @@ class DictaApp:
                 [
                     "Запускайте Dicta из полной распакованной папки.",
                     "Проверьте, что рядом есть папка models.",
-                    "Скопируйте ggml-small-q5_1.bin в папку models и повторите запись.",
+                    "Скопируйте выбранную модель в папку models или выберите профиль Стандарт.",
                     "Запустите scripts\\diagnose_dicta.cmd для проверки состава папки.",
                 ],
                 technical=path,
@@ -4549,6 +5301,45 @@ def main() -> None:
         print("Dicta format-test passed.")
         raise SystemExit(0)
 
+    if "--dictionary-test" in sys.argv:
+        run_ru_dictionary_self_test()
+        print("Dicta dictionary-test passed.")
+        raise SystemExit(0)
+
+    if "--postprocess-test" in sys.argv:
+        sample = "Я еду в Екатеринбурх."
+        result = apply_ru_recognition_postprocess(sample)
+        pelmeni = apply_ru_recognition_postprocess("Племень готов.")
+        phrase = apply_ru_recognition_postprocess("Это общество с ограниченной ответственностью.")
+        domain = apply_ru_recognition_postprocess("Сайт example точка ру работает.")
+        known_dictionary = RuRecognitionDictionary(
+            replacements={},
+            protected_words=frozenset(),
+            known_words=frozenset({"абвгд"}),
+            blocked_pairs={},
+            phrase_replacements={},
+        )
+        known_issue = SpellingIssue(start=0, length=5, word="абвгд", suggestions=("абвгде",))
+        print(f"text={result.text}")
+        print(f"corrections={[(item.source, item.replacement) for item in result.corrections]}")
+        if "Екатеринбург" not in result.text:
+            print("Dicta postprocess-test failed. Expected Екатеринбург.")
+            raise SystemExit(1)
+        if "Пельмень готов." not in pelmeni.text or "пламень" in pelmeni.text.casefold():
+            print("Dicta postprocess-test failed. Expected племень -> пельмень.")
+            raise SystemExit(1)
+        if "Это ООО." not in phrase.text:
+            print("Dicta postprocess-test failed. Expected phrase replacement.")
+            raise SystemExit(1)
+        if "example.ru" not in domain.text:
+            print("Dicta postprocess-test failed. Expected phrase replacement for domain.")
+            raise SystemExit(1)
+        if choose_conservative_suggestion(known_issue, known_issue.word, known_dictionary) is not None:
+            print("Dicta postprocess-test failed. known_words must block corrections.")
+            raise SystemExit(1)
+        print("Dicta postprocess-test passed.")
+        raise SystemExit(0)
+
     if "--translation-test" in sys.argv:
         en_sample = "The recognized text is ready."
         ru_sample = "Я лежу дома на диване."
@@ -4613,7 +5404,7 @@ def main() -> None:
             print("Dicta self-test failed. Translation glossary is invalid:")
             print(glossary_error)
             raise SystemExit(1)
-        required = [WHISPER_EXE] if allow_missing_models else [WHISPER_EXE, *MODEL_OPTIONS.values()]
+        required = [WHISPER_EXE] if allow_missing_models else [WHISPER_EXE, *required_model_paths()]
         missing = [path for path in required if not path.exists()]
         if missing:
             print("Dicta self-test failed. Missing files:")
@@ -4621,7 +5412,7 @@ def main() -> None:
                 print(path)
             raise SystemExit(1)
         if allow_missing_models:
-            missing_models = [path for path in MODEL_OPTIONS.values() if not path.exists()]
+            missing_models = [path for path in required_model_paths() if not path.exists()]
             if missing_models:
                 print("Dicta self-test warning: models are not included in this code-only package.")
                 for path in missing_models:
