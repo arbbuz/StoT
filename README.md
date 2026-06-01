@@ -41,11 +41,14 @@ GitHub artifact является code-only пакетом. Перед испол
 models\ggml-small-q5_1.bin
 ```
 
-Опциональный локальный перевод English -> Русский включается только при наличии отдельного translation pack рядом с `Dicta.exe`. Основной code-only пакет не включает Argos runtime и модель перевода.
+Опциональный локальный перевод EN<->RU включается только при наличии отдельного translation pack рядом с `Dicta.exe`. Основной code-only пакет не включает Argos runtime и модели перевода.
+
+Translation pack полностью portable: он не требует установленный Python на целевом ПК. Argos запускается через постоянный `argos-worker.exe`, поэтому первый перевод может включать холодную загрузку runtime/модели, а следующие переводы идут через уже запущенный worker.
 
 ```text
 .tools\argos-translate\
-  python\python.exe
+  argos-worker\argos-worker.exe
+  argos-worker\_internal\...
   packages\translate-en_ru-1_9\
   packages\translate-ru_en-1_9\
 translation\glossary_en_ru.json

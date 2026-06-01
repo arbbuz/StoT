@@ -1,4 +1,5 @@
 import queue
+import atexit
 import ctypes
 import ctypes.wintypes
 import json
@@ -69,7 +70,11 @@ ARGOS_PACKAGES_DIR = TRANSLATION_PACK_DIR / "packages"
 ARGOS_DATA_DIR = TRANSLATION_PACK_DIR / "data"
 ARGOS_CONFIG_DIR = TRANSLATION_PACK_DIR / "config"
 ARGOS_CACHE_DIR = TRANSLATION_PACK_DIR / "cache"
-ARGOS_WORKER_EXE = TRANSLATION_PACK_DIR / "argos-worker.exe"
+ARGOS_WORKER_EXE_CANDIDATES = (
+    TRANSLATION_PACK_DIR / "argos-worker.exe",
+    TRANSLATION_PACK_DIR / "argos-worker" / "argos-worker.exe",
+)
+ARGOS_WORKER_EXE = ARGOS_WORKER_EXE_CANDIDATES[0]
 ARGOS_WORKER_SCRIPT_CANDIDATES = (
     APP_DIR / "scripts" / "argos_translate_worker.py",
     TRANSLATION_PACK_DIR / "argos_translate_worker.py",
@@ -82,6 +87,8 @@ ARGOS_PYTHON_CANDIDATES = (
 TRANSLATION_DIR = APP_DIR / "translation"
 EN_RU_GLOSSARY_PATH = TRANSLATION_DIR / "glossary_en_ru.json"
 ARGOS_TRANSLATION_TIMEOUT_SECONDS = 45
+ARGOS_WORKER_FIRST_TRANSLATION_TIMEOUT_SECONDS = 120
+ARGOS_WORKER_STOP_TIMEOUT_SECONDS = 3
 RECOGNITION_MODE_LABELS = {
     "ru": "Русский текст",
     "en": "English text",
@@ -853,8 +860,9 @@ def find_argos_worker_script() -> Path | None:
 
 
 def find_argos_runtime() -> tuple[str | None, Path | None, Path | None]:
-    if ARGOS_WORKER_EXE.exists():
-        return "exe", ARGOS_WORKER_EXE, None
+    for worker_exe in ARGOS_WORKER_EXE_CANDIDATES:
+        if worker_exe.exists():
+            return "exe", worker_exe, None
 
     worker_script = find_argos_worker_script()
     if worker_script is None:
@@ -1036,6 +1044,213 @@ def _parse_worker_json_response(output: str) -> dict | None:
     return None
 
 
+def _build_argos_worker_env(packages_dir: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARGOS_DEBUG": "0",
+            "ARGOS_DEVICE_TYPE": "cpu",
+            "ARGOS_PACKAGES_DIR": str(packages_dir),
+            "XDG_DATA_HOME": str(ARGOS_DATA_DIR.parent),
+            "XDG_CONFIG_HOME": str(ARGOS_CONFIG_DIR.parent),
+            "XDG_CACHE_HOME": str(ARGOS_CACHE_DIR.parent),
+        }
+    )
+    return env
+
+
+def _build_argos_worker_command(status: dict[str, object]) -> tuple[list[str], Path, tuple[str, str, str]]:
+    runtime_kind = status.get("runtime_kind")
+    runtime_path = status.get("runtime_path")
+    worker_script = status.get("worker_script")
+    packages_dir = Path(status.get("packages_dir") or ARGOS_PACKAGES_DIR)
+
+    if runtime_kind == "exe" and runtime_path:
+        runtime_path = Path(runtime_path)
+        args = [str(runtime_path), "--persistent"]
+        signature = ("exe", str(runtime_path), str(packages_dir))
+        return args, packages_dir, signature
+
+    if runtime_kind == "python" and runtime_path and worker_script:
+        runtime_path = Path(runtime_path)
+        worker_script = Path(worker_script)
+        args = [str(runtime_path), "-u", str(worker_script), "--persistent"]
+        signature = ("python", f"{runtime_path}|{worker_script}", str(packages_dir))
+        return args, packages_dir, signature
+
+    raise RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(status)}")
+
+
+class ArgosTranslationClient:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen | None = None
+        self._stdout_queue: queue.Queue[str | None] = queue.Queue()
+        self._signature: tuple[str, str, str] | None = None
+        self._stderr_tail: list[str] = []
+
+    def translate(
+        self,
+        text: str,
+        status: dict[str, object],
+        from_code: str,
+        to_code: str,
+    ) -> str:
+        request = {
+            "text": text,
+            "from_code": from_code,
+            "to_code": to_code,
+            "packages_dir": str(Path(status.get("packages_dir") or ARGOS_PACKAGES_DIR)),
+        }
+        with self._lock:
+            return self._translate_locked(request, status)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_locked()
+
+    def _translate_locked(self, request: dict[str, str], status: dict[str, object]) -> str:
+        started = self._ensure_started_locked(status)
+        timeout = (
+            ARGOS_WORKER_FIRST_TRANSLATION_TIMEOUT_SECONDS
+            if started
+            else ARGOS_TRANSLATION_TIMEOUT_SECONDS
+        )
+        try:
+            return self._send_request_locked(request, timeout)
+        except Exception:
+            self._stop_locked()
+            raise
+
+    def _ensure_started_locked(self, status: dict[str, object]) -> bool:
+        args, packages_dir, signature = _build_argos_worker_command(status)
+        if self._process is not None and self._signature == signature and self._process.poll() is None:
+            return False
+
+        self._stop_locked()
+        self._stdout_queue = queue.Queue()
+        self._stderr_tail = []
+        self._process = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=_build_argos_worker_env(packages_dir),
+        )
+        self._signature = signature
+        self._start_reader_threads(self._process)
+        return True
+
+    def _start_reader_threads(self, process: subprocess.Popen) -> None:
+        stdout_queue = self._stdout_queue
+
+        def stdout_reader() -> None:
+            try:
+                if process.stdout is None:
+                    return
+                for line in process.stdout:
+                    stdout_queue.put(line)
+            finally:
+                stdout_queue.put(None)
+
+        def stderr_reader() -> None:
+            if process.stderr is None:
+                return
+            for line in process.stderr:
+                line = line.strip()
+                if not line:
+                    continue
+                self._stderr_tail.append(line)
+                del self._stderr_tail[:-20]
+
+        threading.Thread(target=stdout_reader, daemon=True).start()
+        threading.Thread(target=stderr_reader, daemon=True).start()
+
+    def _send_request_locked(self, request: dict[str, str], timeout: int) -> str:
+        process = self._process
+        if process is None or process.stdin is None:
+            raise RuntimeError("translation-failed::worker-not-started")
+        if process.poll() is not None:
+            raise RuntimeError(f"translation-failed::worker-exited::{process.returncode}::{self._stderr_text()}")
+
+        line = json.dumps(request, ensure_ascii=False)
+        try:
+            process.stdin.write(line + "\n")
+            process.stdin.flush()
+        except Exception as exc:
+            raise RuntimeError(f"translation-failed::worker-stdin::{exc}") from exc
+
+        payload = self._read_payload(timeout)
+        if not payload.get("ok"):
+            raise RuntimeError(f"translation-failed::worker::{payload.get('error', 'unknown error')}")
+        return str(payload.get("text", "")).strip()
+
+    def _read_payload(self, timeout: int) -> dict:
+        deadline = time.perf_counter() + timeout
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise RuntimeError(f"translation-timeout::{timeout}")
+            try:
+                line = self._stdout_queue.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise RuntimeError(f"translation-timeout::{timeout}") from exc
+            if line is None:
+                process = self._process
+                returncode = process.returncode if process is not None else "unknown"
+                raise RuntimeError(f"translation-failed::worker-exited::{returncode}::{self._stderr_text()}")
+            payload = _parse_worker_json_response(line.strip())
+            if payload is not None:
+                return payload
+
+    def _stderr_text(self) -> str:
+        return "\n".join(self._stderr_tail[-10:])
+
+    def _stop_locked(self) -> None:
+        process = self._process
+        self._process = None
+        self._signature = None
+        if process is None:
+            return
+
+        if process.poll() is None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.write(json.dumps({"command": "shutdown"}) + "\n")
+                    process.stdin.flush()
+                process.wait(timeout=ARGOS_WORKER_STOP_TIMEOUT_SECONDS)
+            except Exception:
+                try:
+                    process.terminate()
+                    process.wait(timeout=ARGOS_WORKER_STOP_TIMEOUT_SECONDS)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+
+
+_ARGOS_TRANSLATION_CLIENT = ArgosTranslationClient()
+
+
+def stop_argos_translation_worker() -> None:
+    _ARGOS_TRANSLATION_CLIENT.stop()
+
+
+atexit.register(stop_argos_translation_worker)
+
+
 def run_argos_translation(
     text: str,
     status: dict[str, object] | None = None,
@@ -1049,62 +1264,8 @@ def run_argos_translation(
     if not is_translation_direction_available(status, from_code, to_code):
         raise RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(status, from_code, to_code)}")
 
-    runtime_kind = status.get("runtime_kind")
-    runtime_path = status.get("runtime_path")
-    worker_script = status.get("worker_script")
-    packages_dir = Path(status.get("packages_dir") or ARGOS_PACKAGES_DIR)
-    if runtime_kind == "exe" and runtime_path:
-        args = [str(runtime_path)]
-    elif runtime_kind == "python" and runtime_path and worker_script:
-        args = [str(runtime_path), "-u", str(worker_script)]
-    else:
-        raise RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(status)}")
-
-    env = os.environ.copy()
-    env.update(
-        {
-            "ARGOS_DEBUG": "0",
-            "ARGOS_DEVICE_TYPE": "cpu",
-            "ARGOS_PACKAGES_DIR": str(packages_dir),
-            "XDG_DATA_HOME": str(ARGOS_DATA_DIR.parent),
-            "XDG_CONFIG_HOME": str(ARGOS_CONFIG_DIR.parent),
-            "XDG_CACHE_HOME": str(ARGOS_CACHE_DIR.parent),
-        }
-    )
-    request = {
-        "text": text,
-        "from_code": from_code,
-        "to_code": to_code,
-        "packages_dir": str(packages_dir),
-    }
-
-    try:
-        completed = subprocess.run(
-            args,
-            input=json.dumps(request, ensure_ascii=False).encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=ARGOS_TRANSLATION_TIMEOUT_SECONDS,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env=env,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"translation-timeout::{ARGOS_TRANSLATION_TIMEOUT_SECONDS}") from exc
-
-    stdout = completed.stdout.decode("utf-8", errors="replace").strip()
-    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
-    payload = _parse_worker_json_response(stdout)
-    if payload is not None:
-        if not payload.get("ok"):
-            raise RuntimeError(f"translation-failed::worker::{payload.get('error', 'unknown error')}")
-        translated = str(payload.get("text", "")).strip()
-        return apply_translation_postprocess(translated, from_code, to_code)
-
-    technical = "\n".join(part for part in (stderr, stdout) if part)
-    if completed.returncode != 0:
-        raise RuntimeError(f"translation-failed::{completed.returncode}::{technical}")
-    raise RuntimeError(f"translation-failed::invalid-response::{technical}")
+    translated = _ARGOS_TRANSLATION_CLIENT.translate(text, status, from_code, to_code)
+    return apply_translation_postprocess(translated, from_code, to_code)
 
 
 def backend_thread_candidates(backend_name: str) -> list[int]:
@@ -3556,6 +3717,7 @@ class DictaApp:
 
     def on_close(self) -> None:
         self._stop_hotkey_listener()
+        stop_argos_translation_worker()
         if self.stream is not None:
             try:
                 self.stream.stop()
