@@ -109,6 +109,13 @@ foreach ($backend in @("vulkan", "cuda", "openvino")) {
     }
 }
 
+$argosSource = ".tools\argos-translate"
+if (Test-Path -LiteralPath (Join-Path $argosSource "pack_manifest.json")) {
+    $argosDestination = "$dist\.tools\argos-translate"
+    New-Item -ItemType Directory -Force -Path $argosDestination | Out-Null
+    Copy-Item -Path (Join-Path $argosSource "*") -Destination $argosDestination -Recurse -Force
+}
+
 Copy-Item -LiteralPath `
     "assets\app_icon.ico", `
     "assets\app_icon.png" `

@@ -5,6 +5,7 @@ import os
 import sys
 
 _ARGOS_TRANSLATE = None
+_TRANSLATION_CACHE = {}
 
 
 def write_response(payload: dict) -> None:
@@ -14,8 +15,6 @@ def write_response(payload: dict) -> None:
 
 
 def translate_request(request: dict) -> dict:
-    global _ARGOS_TRANSLATE
-
     if not isinstance(request, dict):
         raise RuntimeError("request must be a JSON object")
 
@@ -34,13 +33,27 @@ def translate_request(request: dict) -> dict:
 
     captured_stdout = io.StringIO()
     with contextlib.redirect_stdout(captured_stdout):
-        if _ARGOS_TRANSLATE is None:
-            from argostranslate import translate as argos_translate
-
-            _ARGOS_TRANSLATE = argos_translate
-        translated = _ARGOS_TRANSLATE.translate(text, from_code, to_code)
+        translated = get_translation(from_code, to_code).translate(text)
 
     return {"ok": True, "text": translated}
+
+
+def get_translation(from_code: str, to_code: str):
+    global _ARGOS_TRANSLATE
+
+    if _ARGOS_TRANSLATE is None:
+        from argostranslate import translate as argos_translate
+
+        _ARGOS_TRANSLATE = argos_translate
+
+    key = (from_code, to_code)
+    translation = _TRANSLATION_CACHE.get(key)
+    if translation is None:
+        translation = _ARGOS_TRANSLATE.get_translation_from_codes(from_code, to_code)
+        if translation is None:
+            raise RuntimeError(f"missing translation direction: {from_code}->{to_code}")
+        _TRANSLATION_CACHE[key] = translation
+    return translation
 
 
 def handle_raw_request(raw_request: str) -> dict:

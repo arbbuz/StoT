@@ -13,6 +13,7 @@ import threading
 import time
 import wave
 from array import array
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
@@ -116,6 +117,11 @@ RU_RECOGNITION_DICTIONARY_PATH = APP_DIR / "dicta_dictionary_ru.json"
 ARGOS_TRANSLATION_TIMEOUT_SECONDS = 45
 ARGOS_WORKER_FIRST_TRANSLATION_TIMEOUT_SECONDS = 120
 ARGOS_WORKER_STOP_TIMEOUT_SECONDS = 3
+ARGOS_WORKER_IDLE_STOP_SECONDS = 30
+ARGOS_WORKER_WARMUP_TEXT_BY_DIRECTION = {
+    ("en", "ru"): "test",
+    ("ru", "en"): "тест",
+}
 RECOGNITION_MODE_LABELS = {
     "ru": "Русский текст",
     "en": "English text",
@@ -1091,6 +1097,8 @@ def _build_argos_worker_env(packages_dir: Path) -> dict[str, str]:
         {
             "ARGOS_DEBUG": "0",
             "ARGOS_DEVICE_TYPE": "cpu",
+            "ARGOS_BEAM_SIZE": "1",
+            "ARGOS_COMPUTE_TYPE": "int8",
             "ARGOS_PACKAGES_DIR": str(packages_dir),
             "XDG_DATA_HOME": str(ARGOS_DATA_DIR.parent),
             "XDG_CONFIG_HOME": str(ARGOS_CONFIG_DIR.parent),
@@ -1122,6 +1130,10 @@ def _build_argos_worker_command(status: dict[str, object]) -> tuple[list[str], P
     raise RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(status)}")
 
 
+def _argos_worker_warmup_text(from_code: str, to_code: str) -> str:
+    return ARGOS_WORKER_WARMUP_TEXT_BY_DIRECTION.get((from_code, to_code), "test")
+
+
 class ArgosTranslationClient:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -1129,6 +1141,8 @@ class ArgosTranslationClient:
         self._stdout_queue: queue.Queue[str | None] = queue.Queue()
         self._signature: tuple[str, str, str] | None = None
         self._stderr_tail: list[str] = []
+        self._idle_timer: threading.Timer | None = None
+        self._idle_timer_token: object | None = None
 
     def translate(
         self,
@@ -1144,7 +1158,25 @@ class ArgosTranslationClient:
             "packages_dir": str(Path(status.get("packages_dir") or ARGOS_PACKAGES_DIR)),
         }
         with self._lock:
-            return self._translate_locked(request, status)
+            self._cancel_idle_stop_locked()
+            try:
+                translated = self._translate_locked(request, status)
+            except Exception:
+                raise
+            self._schedule_idle_stop_locked()
+            return translated
+
+    def warm_up(self, status: dict[str, object], from_code: str, to_code: str) -> None:
+        request = {
+            "text": _argos_worker_warmup_text(from_code, to_code),
+            "from_code": from_code,
+            "to_code": to_code,
+            "packages_dir": str(Path(status.get("packages_dir") or ARGOS_PACKAGES_DIR)),
+        }
+        with self._lock:
+            self._cancel_idle_stop_locked()
+            self._translate_locked(request, status)
+            self._schedule_idle_stop_locked()
 
     def stop(self) -> None:
         with self._lock:
@@ -1162,6 +1194,35 @@ class ArgosTranslationClient:
         except Exception:
             self._stop_locked()
             raise
+
+    def _cancel_idle_stop_locked(self) -> None:
+        timer = self._idle_timer
+        self._idle_timer = None
+        self._idle_timer_token = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_idle_stop_locked(self) -> None:
+        if self._process is None or self._process.poll() is not None:
+            return
+        if ARGOS_WORKER_IDLE_STOP_SECONDS <= 0:
+            self._stop_locked(cancel_idle_timer=False)
+            return
+
+        token = object()
+        timer = threading.Timer(ARGOS_WORKER_IDLE_STOP_SECONDS, self._stop_after_idle, args=(token,))
+        timer.daemon = True
+        self._idle_timer = timer
+        self._idle_timer_token = token
+        timer.start()
+
+    def _stop_after_idle(self, token: object) -> None:
+        with self._lock:
+            if token is not self._idle_timer_token:
+                return
+            self._idle_timer = None
+            self._idle_timer_token = None
+            self._stop_locked(cancel_idle_timer=False)
 
     def _ensure_started_locked(self, status: dict[str, object]) -> bool:
         args, packages_dir, signature = _build_argos_worker_command(status)
@@ -1252,7 +1313,9 @@ class ArgosTranslationClient:
     def _stderr_text(self) -> str:
         return "\n".join(self._stderr_tail[-10:])
 
-    def _stop_locked(self) -> None:
+    def _stop_locked(self, cancel_idle_timer: bool = True) -> None:
+        if cancel_idle_timer:
+            self._cancel_idle_stop_locked()
         process = self._process
         self._process = None
         self._signature = None
@@ -1290,6 +1353,18 @@ def stop_argos_translation_worker() -> None:
 
 
 atexit.register(stop_argos_translation_worker)
+
+
+def warm_up_argos_translation(
+    status: dict[str, object] | None = None,
+    from_code: str = "ru",
+    to_code: str = "en",
+) -> None:
+    status = status or detect_translation_pack()
+    if not is_translation_direction_available(status, from_code, to_code):
+        raise RuntimeError(f"missing-translation-pack::{translation_pack_missing_details(status, from_code, to_code)}")
+
+    _ARGOS_TRANSLATION_CLIENT.warm_up(status, from_code, to_code)
 
 
 def run_argos_translation(
@@ -1461,6 +1536,24 @@ def decode_process_output(data: bytes) -> str:
     return data.decode("utf-8", errors="replace").strip()
 
 
+class RecognitionCancelled(RuntimeError):
+    pass
+
+
+def _terminate_process(process: subprocess.Popen, timeout_seconds: float = 2.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=timeout_seconds)
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=timeout_seconds)
+        except Exception:
+            pass
+
+
 def run_whisper_backend(
     backend_name: str,
     exe_path: Path,
@@ -1471,7 +1564,12 @@ def run_whisper_backend(
     threads: int = DEFAULT_WHISPER_THREADS,
     language: str = "ru",
     translate_to_english: bool = False,
+    cancel_event: threading.Event | None = None,
+    process_callback: Callable[[subprocess.Popen | None], None] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RecognitionCancelled()
+
     threads = sanitize_whisper_threads(threads)
     command = build_whisper_command(
         exe_path,
@@ -1482,20 +1580,47 @@ def run_whisper_backend(
         language=language,
         translate_to_english=translate_to_english,
     )
+    process: subprocess.Popen[bytes] | None = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=str(APP_DIR),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            timeout=timeout_seconds,
-            check=False,
         )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{backend_name} t={threads}: timeout after {timeout_seconds} seconds")
+        if process_callback is not None:
+            process_callback(process)
+
+        deadline = time.perf_counter() + timeout_seconds if timeout_seconds is not None else None
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                _terminate_process(process)
+                raise RecognitionCancelled()
+            if deadline is not None and time.perf_counter() >= deadline:
+                _terminate_process(process)
+                raise RuntimeError(f"{backend_name} t={threads}: timeout after {timeout_seconds} seconds")
+            try:
+                wait_timeout = 0.1
+                if deadline is not None:
+                    wait_timeout = max(0.01, min(wait_timeout, deadline - time.perf_counter()))
+                stdout_data, stderr_data = process.communicate(timeout=wait_timeout)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise RecognitionCancelled()
+        completed = subprocess.CompletedProcess(command, process.returncode, stdout_data, stderr_data)
+    except RecognitionCancelled:
+        raise
+    except RuntimeError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"{backend_name} t={threads}: {exc}")
+    finally:
+        if process_callback is not None:
+            process_callback(None)
 
     txt_path = out_base.with_suffix(".txt")
     if completed.returncode == 0 and txt_path.exists():
@@ -1520,6 +1645,8 @@ def run_whisper_with_fallback(
     preferred_backend_key: str | None = None,
     language: str = "ru",
     translate_to_english: bool = False,
+    cancel_event: threading.Event | None = None,
+    process_callback: Callable[[subprocess.Popen | None], None] | None = None,
 ) -> tuple[str, int, subprocess.CompletedProcess[bytes]]:
     backends = available_whisper_backends(preferred_backend_key)
     if not backends:
@@ -1537,6 +1664,9 @@ def run_whisper_with_fallback(
         if txt_path.exists():
             txt_path.unlink()
 
+        if cancel_event is not None and cancel_event.is_set():
+            raise RecognitionCancelled()
+
         threads = choose_backend_threads(backend_name, backend_profile)
         try:
             completed = run_whisper_backend(
@@ -1549,8 +1679,12 @@ def run_whisper_with_fallback(
                 threads=threads,
                 language=language,
                 translate_to_english=translate_to_english,
+                cancel_event=cancel_event,
+                process_callback=process_callback,
             )
             return backend_name, threads, completed
+        except RecognitionCancelled:
+            raise
         except RuntimeError as exc:
             errors.append(str(exc))
             continue
@@ -2664,8 +2798,13 @@ class DictaApp:
         self.hotkey_thread: threading.Thread | None = None
         self.hotkey_thread_id: int | None = None
         self.translation_worker: threading.Thread | None = None
+        self.translation_warmup_worker: threading.Thread | None = None
+        self.recognition_cancel_event = threading.Event()
+        self.recognition_process_lock = threading.Lock()
+        self.recognition_process: subprocess.Popen | None = None
         self.format_undo_snapshot: tuple[str, str] | None = None
         self.postprocess_undo_snapshot: tuple[str, str, tuple[RecognitionCorrection, ...]] | None = None
+        self.translation_undo_snapshot: tuple[str, str, str, str] | None = None
         self.settings_snapshot: dict[str, object] = {}
 
         self.status_var = tk.StringVar(value="Готово")
@@ -2729,7 +2868,7 @@ class DictaApp:
 
         toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(5, weight=1)
+        toolbar.columnconfigure(6, weight=1)
 
         self.record_button = ttk.Button(toolbar, text="Записать", command=self.toggle_recording)
         self.record_button.grid(row=0, column=0, padx=(0, 8))
@@ -2746,6 +2885,14 @@ class DictaApp:
         self.translate_menu.add_command(label="В English", command=self.translate_last_recording_to_english)
         self.translate_button = ttk.Menubutton(toolbar, text="Перевести", menu=self.translate_menu)
         self.translate_button.grid(row=0, column=3, padx=(0, 8))
+
+        self.undo_translation_button = ttk.Button(
+            toolbar,
+            text="Вернуть",
+            command=self.undo_last_translation,
+            state=tk.DISABLED,
+        )
+        self.undo_translation_button.grid(row=0, column=4, padx=(0, 8))
 
         self.more_menu = tk.Menu(toolbar, tearoff=False)
         self.format_menu_index = 0
@@ -2766,10 +2913,10 @@ class DictaApp:
         self.toolbar_recognition_mode_box.grid(row=0, column=2, padx=(0, 8))
         self.toolbar_recognition_mode_box.bind("<<ComboboxSelected>>", self._on_toolbar_recognition_mode_changed)
 
-        self.more_button.grid(row=0, column=4, padx=(0, 8))
+        self.more_button.grid(row=0, column=5, padx=(0, 8))
 
         self.settings_button = ttk.Button(toolbar, text="Настройки", command=self.show_settings)
-        self.settings_button.grid(row=0, column=6, sticky="e")
+        self.settings_button.grid(row=0, column=7, sticky="e")
 
         text_frame = ttk.Frame(self.root, padding=(12, 6, 12, 6))
         text_frame.grid(row=1, column=0, sticky="nsew")
@@ -3148,6 +3295,11 @@ class DictaApp:
         self._set_recognition_mode_controls_state(tk.DISABLED)
         self._set_translation_buttons_state(tk.DISABLED)
 
+    def _set_record_button_recognizing(self) -> None:
+        self.record_button.configure(text="Прервать", command=self.cancel_recognition, state=tk.NORMAL)
+        self._set_recognition_mode_controls_state(tk.DISABLED)
+        self._set_translation_buttons_state(tk.DISABLED)
+
     def _set_record_button_busy(self, text: str) -> None:
         self.record_button.configure(text=text, state=tk.DISABLED)
         self._set_recognition_mode_controls_state(tk.DISABLED)
@@ -3288,6 +3440,8 @@ class DictaApp:
         if translate_menu is not None:
             translate_menu.entryconfigure(self.translate_to_ru_menu_index, state=state)
             translate_menu.entryconfigure(self.translate_to_en_menu_index, state=state)
+        if state == tk.DISABLED:
+            self._set_translation_undo_state(tk.DISABLED)
 
     def _clear_last_recognition_audio(self) -> None:
         self.last_recognition_audio_bytes = None
@@ -3326,6 +3480,8 @@ class DictaApp:
         translate_button = getattr(self, "translate_button", None)
         if translate_button is not None:
             translate_button.configure(state=tk.NORMAL if to_ru_state == tk.NORMAL or to_en_state == tk.NORMAL else tk.DISABLED)
+        undo_translation_state = tk.NORMAL if self._is_translation_undo_available() and not busy else tk.DISABLED
+        self._set_translation_undo_state(undo_translation_state)
 
     def _selected_backend_preference(self) -> str | None:
         backend_key = self._selected_backend_key()
@@ -3846,9 +4002,61 @@ class DictaApp:
             return
 
         self.is_recognizing = True
+        self.recognition_cancel_event.clear()
         self._set_status("Распознавание")
+        self._set_record_button_recognizing()
         self.worker = threading.Thread(target=self._recognize_audio, daemon=True)
         self.worker.start()
+
+    def cancel_recognition(self) -> None:
+        if not self.is_recognizing:
+            return
+
+        self.recognition_cancel_event.set()
+        self._set_status("Прерывание распознавания")
+        self._set_record_button_busy("Прерывание")
+        with self.recognition_process_lock:
+            process = self.recognition_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    def _set_recognition_process(self, process: subprocess.Popen | None) -> None:
+        with self.recognition_process_lock:
+            self.recognition_process = process
+            should_stop = process is not None and self.recognition_cancel_event.is_set()
+        if should_stop and process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    def _start_translation_warmup_after_recognition(self, recognition_mode_key: str) -> None:
+        worker = self.translation_warmup_worker
+        if worker is not None and worker.is_alive():
+            return
+
+        if recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY:
+            direction = ("ru", "en")
+        else:
+            direction = ("en", "ru")
+
+        self.translation_warmup_worker = threading.Thread(
+            target=self._warm_up_translation_worker,
+            args=direction,
+            daemon=True,
+        )
+        self.translation_warmup_worker.start()
+
+    def _warm_up_translation_worker(self, from_code: str, to_code: str) -> None:
+        try:
+            status = detect_translation_pack()
+            if is_translation_direction_available(status, from_code, to_code):
+                warm_up_argos_translation(status, from_code=from_code, to_code=to_code)
+        except Exception:
+            pass
 
     def _save_current_settings(self) -> bool:
         settings = {
@@ -3919,6 +4127,55 @@ class DictaApp:
             return
         self._copy_value_to_clipboard(value)
         self._set_status("Скопировано")
+
+    def _set_translation_undo_state(self, state: str) -> None:
+        undo_button = getattr(self, "undo_translation_button", None)
+        if undo_button is not None:
+            undo_button.configure(state=state)
+
+    def _is_translation_undo_available(self) -> bool:
+        if self.translation_undo_snapshot is None or getattr(self, "text", None) is None:
+            return False
+        _source, translated, _source_language_tag, _translated_language_tag = self.translation_undo_snapshot
+        return self.text.get("1.0", "end-1c") == translated
+
+    def _set_translation_undo(
+        self,
+        source: str,
+        translated: str,
+        source_language_tag: str,
+        translated_language_tag: str,
+    ) -> None:
+        self.translation_undo_snapshot = (source, translated, source_language_tag, translated_language_tag)
+        self._update_translation_button_state()
+
+    def _reset_translation_undo(self) -> None:
+        self.translation_undo_snapshot = None
+        self._set_translation_undo_state(tk.DISABLED)
+
+    def undo_last_translation(self) -> None:
+        if self.translation_undo_snapshot is None:
+            self._set_status("Нет перевода для возврата")
+            return
+
+        source, translated, source_language_tag, _translated_language_tag = self.translation_undo_snapshot
+        current = self.text.get("1.0", "end-1c")
+        if current != translated:
+            self._reset_translation_undo()
+            self._set_status("Текст изменен, возврат перевода недоступен")
+            self._update_translation_button_state()
+            return
+
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", source)
+        self.current_text_spellcheck_language_tag = source_language_tag
+        self.format_undo_snapshot = None
+        self._set_format_action_label("Автоформат")
+        self._reset_postprocess_undo()
+        self._reset_translation_undo()
+        self._set_status("Перевод возвращен")
+        self._schedule_spellcheck(delay_ms=100)
+        self._update_translation_button_state()
 
     def translate_current_text_to_russian(self) -> None:
         if (
@@ -4083,6 +4340,7 @@ class DictaApp:
         self.text.insert("1.0", original)
         remembered = remember_rejected_ru_corrections(corrections)
         self._reset_postprocess_undo()
+        self._reset_translation_undo()
         if remembered:
             self._set_status("Автоисправления отменены и запомнены")
         else:
@@ -4105,6 +4363,7 @@ class DictaApp:
         self.text.delete(tk.SEL_FIRST, tk.SEL_LAST)
         self._reset_format_undo()
         self._reset_postprocess_undo()
+        self._reset_translation_undo()
         self._set_status("Вырезано")
         self._schedule_spellcheck(delay_ms=150)
 
@@ -4122,6 +4381,7 @@ class DictaApp:
         self.text.insert(tk.INSERT, value)
         self._reset_format_undo()
         self._reset_postprocess_undo()
+        self._reset_translation_undo()
         self._set_status("Вставлено")
         self._schedule_spellcheck(delay_ms=150)
 
@@ -4149,6 +4409,7 @@ class DictaApp:
                 self.format_undo_snapshot = None
                 self._set_format_action_label("Автоформат")
                 self._reset_postprocess_undo()
+                self._reset_translation_undo()
                 self._set_status("Форматирование отменено")
                 self._schedule_spellcheck(delay_ms=100)
                 return
@@ -4166,6 +4427,7 @@ class DictaApp:
             return
         self.format_undo_snapshot = (value, formatted)
         self._reset_postprocess_undo()
+        self._reset_translation_undo()
         self.text.delete("1.0", tk.END)
         self.text.insert("1.0", formatted)
         self._set_format_action_label("Вернуть форматирование")
@@ -4177,6 +4439,7 @@ class DictaApp:
         self.format_undo_snapshot = None
         self._set_format_action_label("Автоформат")
         self._reset_postprocess_undo()
+        self._reset_translation_undo()
         self._clear_last_recognition_audio()
         self._set_text_spellcheck_language_from_mode(self._selected_recognition_mode_key())
         self._clear_spelling_marks()
@@ -4552,6 +4815,9 @@ class DictaApp:
         started_at = time.perf_counter()
 
         try:
+            if self.recognition_cancel_event.is_set():
+                raise RecognitionCancelled()
+
             with tempfile.NamedTemporaryFile(prefix="dicta_", suffix=".wav", delete=False) as wav_file:
                 wav_path = Path(wav_file.name)
 
@@ -4571,12 +4837,16 @@ class DictaApp:
             audio_ms = len(audio_bytes) / (sample_rate * SAMPLE_WIDTH_BYTES) * 1000
             if audio_ms < MIN_AUDIO_MS:
                 raise RuntimeError("silent-or-short-recording")
+            if self.recognition_cancel_event.is_set():
+                raise RecognitionCancelled()
 
             with wave.open(str(wav_path), "wb") as wav:
                 wav.setnchannels(CHANNELS)
                 wav.setsampwidth(SAMPLE_WIDTH_BYTES)
                 wav.setframerate(sample_rate)
                 wav.writeframes(audio_bytes)
+            if self.recognition_cancel_event.is_set():
+                raise RecognitionCancelled()
 
             out_base = Path(tempfile.gettempdir()) / f"{wav_path.stem}_out"
             txt_path = out_base.with_suffix(".txt")
@@ -4590,7 +4860,11 @@ class DictaApp:
                 preferred_backend_key=self._selected_backend_preference(),
                 language=recognition_language,
                 translate_to_english=False,
+                cancel_event=self.recognition_cancel_event,
+                process_callback=self._set_recognition_process,
             )
+            if self.recognition_cancel_event.is_set():
+                raise RecognitionCancelled()
 
             elapsed = time.perf_counter() - started_at
 
@@ -4610,9 +4884,12 @@ class DictaApp:
                     (recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key),
                 )
             )
+        except RecognitionCancelled:
+            self.ui_queue.put(("recognition_cancelled", None))
         except Exception as exc:
             self.ui_queue.put(("error", self._format_recognition_error(exc)))
         finally:
+            self._set_recognition_process(None)
             self.audio_chunks = []
             for path in (wav_path, txt_path):
                 if path and path.exists():
@@ -4749,6 +5026,7 @@ class DictaApp:
                 self.text.insert("1.0", prepared)
                 self.format_undo_snapshot = None
                 self._set_format_action_label("Автоформат")
+                self._reset_translation_undo()
                 if postprocess_corrections:
                     self._set_postprocess_undo(prepared_before_postprocess, prepared, postprocess_corrections)
                 else:
@@ -4771,6 +5049,7 @@ class DictaApp:
                 if postprocess_corrections:
                     status = f"{status}; {ru_recognition_corrections_status(postprocess_corrections)}"
                 self._set_status(status)
+                self._start_translation_warmup_after_recognition(str(recognition_mode_key))
                 self._schedule_spellcheck(delay_ms=100)
                 self._update_translation_button_state()
             elif event == "translation_to_ru_result":
@@ -4779,6 +5058,7 @@ class DictaApp:
                 if current != str(source).strip():
                     self._set_status("Текст изменен, перевод не применен")
                     continue
+                source_language_tag = self.current_text_spellcheck_language_tag
                 prepared = prepare_recognized_text(
                     str(translated),
                     use_formatting=self.format_text_var.get(),
@@ -4790,6 +5070,7 @@ class DictaApp:
                 self.format_undo_snapshot = None
                 self._set_format_action_label("Автоформат")
                 self._reset_postprocess_undo()
+                self._set_translation_undo(current, prepared, source_language_tag, "ru-RU")
                 if self.auto_copy_var.get() and prepared:
                     self._copy_value_to_clipboard(prepared)
                     status = f"Переведено и скопировано: {translation_elapsed:.1f} с"
@@ -4799,7 +5080,12 @@ class DictaApp:
                 self._schedule_spellcheck(delay_ms=100)
                 self._update_translation_button_state()
             elif event == "translation_to_en_result":
-                _source, translated, translation_elapsed = value
+                source, translated, translation_elapsed = value
+                current = self.text.get("1.0", tk.END).strip()
+                if current != str(source).strip():
+                    self._set_status("Текст изменен, перевод не применен")
+                    continue
+                source_language_tag = self.current_text_spellcheck_language_tag
                 prepared = prepare_recognized_text(
                     str(translated),
                     use_formatting=self.format_text_var.get(),
@@ -4811,6 +5097,7 @@ class DictaApp:
                 self.format_undo_snapshot = None
                 self._set_format_action_label("Автоформат")
                 self._reset_postprocess_undo()
+                self._set_translation_undo(current, prepared, source_language_tag, "en-US")
                 if self.auto_copy_var.get() and prepared:
                     self._copy_value_to_clipboard(prepared)
                     status = f"Переведено в English и скопировано: {translation_elapsed:.1f} с"
@@ -4829,8 +5116,13 @@ class DictaApp:
             elif event == "error":
                 self._set_status("Ошибка распознавания")
                 messagebox.showerror("Dicta", str(value))
+            elif event == "recognition_cancelled":
+                self._set_status("Распознавание прервано")
+                self.recognition_time_var.set("Распознавание: -")
             elif event == "ready":
                 self.is_recognizing = False
+                self.worker = None
+                self._set_recognition_process(None)
                 self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
