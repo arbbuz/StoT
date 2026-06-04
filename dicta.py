@@ -19,6 +19,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import comtypes
+from comtypes import COMMETHOD, GUID, HRESULT, IUnknown
+from comtypes.client import CreateObject
 import sounddevice as sd
 
 from windows_spellcheck import SpellingIssue, add_word, check_text
@@ -91,6 +94,14 @@ QUALITY_MODEL_PREFERENCE = (
     "small",
     "small-q5_1",
 )
+BACKEND_BENCHMARK_MODEL_PREFERENCE = (
+    "small-q5_1",
+    "small",
+    "medium-q5_0",
+    "medium",
+    "large-v3-turbo-q5_0",
+    "large-v3-turbo",
+)
 FALLBACK_AUTO_MODEL_KEY = "small-q5_1"
 TRANSLATION_PACK_DIR = APP_DIR / ".tools" / "argos-translate"
 ARGOS_PACKAGES_DIR = TRANSLATION_PACK_DIR / "packages"
@@ -147,12 +158,21 @@ SPELLCHECK_AVAILABILITY_TESTS = (
     ("ru-RU", "Русский", "тест"),
     ("en-US", "Английский", "test"),
 )
+AUDIO_SOURCE_LABELS = {
+    "microphone": "Микрофон",
+    "system": "Системный звук встречи",
+}
+AUDIO_SOURCE_KEY_BY_LABEL = {label: key for key, label in AUDIO_SOURCE_LABELS.items()}
+DEFAULT_AUDIO_SOURCE_KEY = "microphone"
+DEFAULT_SYSTEM_OUTPUT_DEVICE_ID = "default"
+DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL = "По умолчанию Windows"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
 INPUT_SAMPLE_RATE_FALLBACKS = (48000, 44100, 32000)
 INPUT_SAMPLE_DTYPES = ("int16", "float32", "int24", "int32")
 MICROPHONE_PROBE_SECONDS = 1.5
+SYSTEM_AUDIO_TEST_SECONDS = 1.5
 MICROPHONE_WORKING_PEAK_PERCENT = 1
 SILENCE_WINDOW_MS = 30
 SILENCE_PADDING_MS = 250
@@ -168,9 +188,16 @@ AUDIO_GAIN_MAX_PERCENT = 1000
 RU_POSTPROCESS_MIN_WORD_LENGTH = 5
 RU_POSTPROCESS_MAX_EDIT_DISTANCE = 2
 RU_POSTPROCESS_LOG_LIMIT = 200
+WHISPER_PROGRESS_PATTERN = re.compile(r"progress\s*=\s*(\d{1,3})%", re.IGNORECASE)
+RECOGNITION_FALLBACK_PROGRESS_MAX = 90
 BENCHMARK_AUDIO_SECONDS = 2.0
+BENCHMARK_TOTAL_TIMEOUT_SECONDS = 180
+BENCHMARK_ATTEMPT_TIMEOUT_SECONDS = 180
+BENCHMARK_QUICK_BACKEND_LIMIT = 0
 DEFAULT_WHISPER_THREADS = 4
 GPU_BACKEND_KEYS = {"vulkan", "cuda", "openvino"}
+GPU_BACKEND_PRIORITY = ("cuda", "vulkan", "openvino")
+CPU_BACKEND_PRIORITY = ("avx2", "sse42")
 BACKEND_BENCHMARK_THREAD_COUNTS = {
     "gpu": (1, 2, 4, 6, 8),
     "cpu": (2, 4, 6, 8, 12),
@@ -187,11 +214,233 @@ DEFAULT_USER_SETTINGS = {
     "auto_copy": False,
     "format_text": True,
     "voice_punctuation": True,
+    "audio_source": DEFAULT_AUDIO_SOURCE_KEY,
+    "system_output_device_id": DEFAULT_SYSTEM_OUTPUT_DEVICE_ID,
     "recognition_mode": DEFAULT_RECOGNITION_MODE_KEY,
     "backend": "auto",
     "model_key": FALLBACK_AUTO_MODEL_KEY,
     "audio_gain_percent": 0,
 }
+
+
+WASAPI_E_RENDER = 0
+WASAPI_E_CONSOLE = 0
+WASAPI_CLSCTX_ALL = 23
+WASAPI_DEVICE_STATE_ACTIVE = 1
+WASAPI_SHAREMODE_SHARED = 0
+WASAPI_STREAMFLAGS_LOOPBACK = 0x00020000
+WASAPI_BUFFERFLAGS_SILENT = 0x00000002
+WASAPI_STGM_READ = 0
+WAVE_FORMAT_PCM = 0x0001
+WAVE_FORMAT_IEEE_FLOAT = 0x0003
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+VT_LPWSTR = 31
+KSDATAFORMAT_SUBTYPE_PCM = "{00000001-0000-0010-8000-00aa00389b71}"
+KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = "{00000003-0000-0010-8000-00aa00389b71}"
+PKEY_DEVICE_FRIENDLY_NAME_FMTID = "{A45C254E-DF1C-4EFD-8020-67D146A850E0}"
+PKEY_DEVICE_FRIENDLY_NAME_PID = 14
+
+
+class WAVEFORMATEX(ctypes.Structure):
+    _fields_ = [
+        ("wFormatTag", ctypes.c_ushort),
+        ("nChannels", ctypes.c_ushort),
+        ("nSamplesPerSec", ctypes.c_uint),
+        ("nAvgBytesPerSec", ctypes.c_uint),
+        ("nBlockAlign", ctypes.c_ushort),
+        ("wBitsPerSample", ctypes.c_ushort),
+        ("cbSize", ctypes.c_ushort),
+    ]
+
+
+class WAVEFORMATEXTENSIBLE(ctypes.Structure):
+    _fields_ = [
+        ("Format", WAVEFORMATEX),
+        ("wValidBitsPerSample", ctypes.c_ushort),
+        ("dwChannelMask", ctypes.c_ulong),
+        ("SubFormat", GUID),
+    ]
+
+
+class PROPERTYKEY(ctypes.Structure):
+    _fields_ = [
+        ("fmtid", GUID),
+        ("pid", ctypes.c_ulong),
+    ]
+
+
+class PROPVARIANT_UNION(ctypes.Union):
+    _fields_ = [
+        ("pwszVal", ctypes.c_wchar_p),
+        ("pszVal", ctypes.c_char_p),
+        ("ulVal", ctypes.c_ulong),
+        ("uhVal", ctypes.c_ushort),
+        ("boolVal", ctypes.c_short),
+        ("llVal", ctypes.c_longlong),
+        ("ullVal", ctypes.c_ulonglong),
+    ]
+
+
+class PROPVARIANT(ctypes.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [
+        ("vt", ctypes.c_ushort),
+        ("wReserved1", ctypes.c_ushort),
+        ("wReserved2", ctypes.c_ushort),
+        ("wReserved3", ctypes.c_ushort),
+        ("value", PROPVARIANT_UNION),
+    ]
+
+
+PKEY_DEVICE_FRIENDLY_NAME = PROPERTYKEY(
+    GUID(PKEY_DEVICE_FRIENDLY_NAME_FMTID),
+    PKEY_DEVICE_FRIENDLY_NAME_PID,
+)
+
+
+class IPropertyStore(IUnknown):
+    _iid_ = GUID("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "GetCount", (["out"], ctypes.POINTER(ctypes.c_ulong), "cProps")),
+        COMMETHOD([], HRESULT, "GetAt"),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "GetValue",
+            (["in"], ctypes.POINTER(PROPERTYKEY), "key"),
+            (["out"], ctypes.POINTER(PROPVARIANT), "pv"),
+        ),
+        COMMETHOD([], HRESULT, "SetValue"),
+        COMMETHOD([], HRESULT, "Commit"),
+    ]
+
+
+class IMMDevice(IUnknown):
+    _iid_ = GUID("{D666063F-1587-4E43-81F1-B948E807363F}")
+    _methods_ = [
+        COMMETHOD(
+            [],
+            HRESULT,
+            "Activate",
+            (["in"], ctypes.POINTER(GUID), "iid"),
+            (["in"], ctypes.c_ulong, "dwClsCtx"),
+            (["in"], ctypes.c_void_p, "pActivationParams"),
+            (["out"], ctypes.POINTER(ctypes.c_void_p), "ppInterface"),
+        ),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "OpenPropertyStore",
+            (["in"], ctypes.c_ulong, "stgmAccess"),
+            (["out"], ctypes.POINTER(ctypes.POINTER(IPropertyStore)), "ppProperties"),
+        ),
+        COMMETHOD([], HRESULT, "GetId", (["out"], ctypes.POINTER(ctypes.c_wchar_p), "ppstrId")),
+        COMMETHOD([], HRESULT, "GetState", (["out"], ctypes.POINTER(ctypes.c_ulong), "pdwState")),
+    ]
+
+
+class IMMDeviceCollection(IUnknown):
+    _iid_ = GUID("{0BD7A1BE-7A1A-44DB-8397-C0F65C15A6D5}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "GetCount", (["out"], ctypes.POINTER(ctypes.c_uint), "pcDevices")),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "Item",
+            (["in"], ctypes.c_uint, "nDevice"),
+            (["out"], ctypes.POINTER(ctypes.POINTER(IMMDevice)), "ppDevice"),
+        ),
+    ]
+
+
+class IMMDeviceEnumerator(IUnknown):
+    _iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+    _methods_ = [
+        COMMETHOD(
+            [],
+            HRESULT,
+            "EnumAudioEndpoints",
+            (["in"], ctypes.c_int, "dataFlow"),
+            (["in"], ctypes.c_ulong, "dwStateMask"),
+            (["out"], ctypes.POINTER(ctypes.POINTER(IMMDeviceCollection)), "ppDevices"),
+        ),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "GetDefaultAudioEndpoint",
+            (["in"], ctypes.c_int, "dataFlow"),
+            (["in"], ctypes.c_int, "role"),
+            (["out"], ctypes.POINTER(ctypes.POINTER(IMMDevice)), "ppEndpoint"),
+        ),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "GetDevice",
+            (["in"], ctypes.c_wchar_p, "pwstrId"),
+            (["out"], ctypes.POINTER(ctypes.POINTER(IMMDevice)), "ppDevice"),
+        ),
+        COMMETHOD([], HRESULT, "RegisterEndpointNotificationCallback"),
+        COMMETHOD([], HRESULT, "UnregisterEndpointNotificationCallback"),
+    ]
+
+
+class IAudioClient(IUnknown):
+    _iid_ = GUID("{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}")
+    _methods_ = [
+        COMMETHOD(
+            [],
+            HRESULT,
+            "Initialize",
+            (["in"], ctypes.c_int, "ShareMode"),
+            (["in"], ctypes.c_ulong, "StreamFlags"),
+            (["in"], ctypes.c_longlong, "hnsBufferDuration"),
+            (["in"], ctypes.c_longlong, "hnsPeriodicity"),
+            (["in"], ctypes.POINTER(WAVEFORMATEX), "pFormat"),
+            (["in"], ctypes.POINTER(GUID), "AudioSessionGuid"),
+        ),
+        COMMETHOD([], HRESULT, "GetBufferSize", (["out"], ctypes.POINTER(ctypes.c_uint), "pNumBufferFrames")),
+        COMMETHOD([], HRESULT, "GetStreamLatency"),
+        COMMETHOD([], HRESULT, "GetCurrentPadding"),
+        COMMETHOD([], HRESULT, "IsFormatSupported"),
+        COMMETHOD([], HRESULT, "GetMixFormat", (["out"], ctypes.POINTER(ctypes.POINTER(WAVEFORMATEX)), "ppDeviceFormat")),
+        COMMETHOD([], HRESULT, "GetDevicePeriod"),
+        COMMETHOD([], HRESULT, "Start"),
+        COMMETHOD([], HRESULT, "Stop"),
+        COMMETHOD([], HRESULT, "Reset"),
+        COMMETHOD([], HRESULT, "SetEventHandle"),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "GetService",
+            (["in"], ctypes.POINTER(GUID), "riid"),
+            (["out"], ctypes.POINTER(ctypes.c_void_p), "ppv"),
+        ),
+    ]
+
+
+class IAudioCaptureClient(IUnknown):
+    _iid_ = GUID("{C8ADBD64-E71E-48a0-A4DE-185C395CD317}")
+    _methods_ = [
+        COMMETHOD(
+            [],
+            HRESULT,
+            "GetBuffer",
+            (["out"], ctypes.POINTER(ctypes.POINTER(ctypes.c_byte)), "ppData"),
+            (["out"], ctypes.POINTER(ctypes.c_uint), "pNumFramesToRead"),
+            (["out"], ctypes.POINTER(ctypes.c_ulong), "pdwFlags"),
+            (["out"], ctypes.POINTER(ctypes.c_ulonglong), "pu64DevicePosition"),
+            (["out"], ctypes.POINTER(ctypes.c_ulonglong), "pu64QPCPosition"),
+        ),
+        COMMETHOD([], HRESULT, "ReleaseBuffer", (["in"], ctypes.c_uint, "NumFramesRead")),
+        COMMETHOD([], HRESULT, "GetNextPacketSize", (["out"], ctypes.POINTER(ctypes.c_uint), "pNumFramesInNextPacket")),
+    ]
+
+
+@dataclass(frozen=True)
+class WasapiOutputDeviceInfo:
+    device_id: str
+    name: str
+    is_default: bool = False
 
 
 def clean_input_device_name(name: str) -> str:
@@ -443,6 +692,350 @@ def int32_pcm_to_pcm16_mono(audio: bytes, source_channels: int) -> bytes:
     return mono.tobytes()
 
 
+def wasapi_create_device_enumerator() -> IMMDeviceEnumerator:
+    return CreateObject(
+        GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}"),
+        interface=IMMDeviceEnumerator,
+    )
+
+
+def wasapi_device_id(device: IMMDevice) -> str:
+    return str(device.GetId())
+
+
+def wasapi_output_device_name(device: IMMDevice) -> str:
+    prop_variant: PROPVARIANT | None = None
+    try:
+        store = device.OpenPropertyStore(WASAPI_STGM_READ)
+        prop_variant = store.GetValue(ctypes.byref(PKEY_DEVICE_FRIENDLY_NAME))
+        if int(prop_variant.vt) == VT_LPWSTR and prop_variant.pwszVal:
+            return clean_input_device_name(str(prop_variant.pwszVal))
+    except Exception:
+        pass
+    finally:
+        if prop_variant is not None:
+            try:
+                ctypes.windll.ole32.PropVariantClear(ctypes.byref(prop_variant))
+            except Exception:
+                pass
+    device_id = wasapi_device_id(device)
+    return device_id[-48:] if len(device_id) > 48 else device_id
+
+
+def wasapi_default_output_device(enumerator: IMMDeviceEnumerator | None = None) -> IMMDevice:
+    enumerator = enumerator or wasapi_create_device_enumerator()
+    return enumerator.GetDefaultAudioEndpoint(WASAPI_E_RENDER, WASAPI_E_CONSOLE)
+
+
+def wasapi_output_device_by_id(device_id: str | None) -> IMMDevice:
+    enumerator = wasapi_create_device_enumerator()
+    if not device_id or device_id == DEFAULT_SYSTEM_OUTPUT_DEVICE_ID:
+        return wasapi_default_output_device(enumerator)
+    return enumerator.GetDevice(str(device_id))
+
+
+def collect_wasapi_output_devices() -> list[WasapiOutputDeviceInfo]:
+    if os.name != "nt":
+        return []
+
+    comtypes.CoInitialize()
+    try:
+        enumerator = wasapi_create_device_enumerator()
+        default_id = ""
+        try:
+            default_id = wasapi_device_id(wasapi_default_output_device(enumerator))
+        except Exception:
+            default_id = ""
+
+        collection = enumerator.EnumAudioEndpoints(WASAPI_E_RENDER, WASAPI_DEVICE_STATE_ACTIVE)
+        count = int(collection.GetCount())
+        devices: list[WasapiOutputDeviceInfo] = []
+        seen_ids: set[str] = set()
+        for index in range(count):
+            device = collection.Item(index)
+            try:
+                device_id = wasapi_device_id(device)
+                if not device_id or device_id in seen_ids:
+                    continue
+                seen_ids.add(device_id)
+                devices.append(
+                    WasapiOutputDeviceInfo(
+                        device_id=device_id,
+                        name=wasapi_output_device_name(device),
+                        is_default=bool(default_id and device_id == default_id),
+                    )
+                )
+            except Exception:
+                continue
+        devices.sort(key=lambda item: (not item.is_default, item.name.lower()))
+        return devices
+    finally:
+        comtypes.CoUninitialize()
+
+
+def build_system_output_device_choices(
+    devices: list[WasapiOutputDeviceInfo],
+) -> tuple[list[str], dict[str, str], dict[str, WasapiOutputDeviceInfo]]:
+    default_device = next((device for device in devices if device.is_default), None)
+    default_label = DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL
+    if default_device is not None and default_device.name:
+        default_label = f"{DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL}: {default_device.name}"
+    labels = [default_label]
+    label_to_id = {default_label: DEFAULT_SYSTEM_OUTPUT_DEVICE_ID}
+    id_to_device = {device.device_id: device for device in devices}
+    used_labels = set(labels)
+    name_counts: dict[str, int] = {}
+    for device in devices:
+        device_name = device.name or "Устройство вывода Windows"
+        base_label = f"Только это устройство: {device_name}"
+        duplicate_count = name_counts.get(base_label, 0) + 1
+        name_counts[base_label] = duplicate_count
+        label = base_label if duplicate_count == 1 else f"{base_label} #{duplicate_count}"
+        while label in used_labels:
+            duplicate_count += 1
+            label = f"{base_label} #{duplicate_count}"
+        used_labels.add(label)
+        labels.append(label)
+        label_to_id[label] = device.device_id
+    return labels, label_to_id, id_to_device
+
+
+def system_output_device_label_for_id(label_to_id: dict[str, str], device_id: object | None) -> str:
+    sanitized = sanitize_system_output_device_id(device_id)
+    fallback_label = next(
+        (
+            label
+            for label, candidate in label_to_id.items()
+            if candidate == DEFAULT_SYSTEM_OUTPUT_DEVICE_ID
+        ),
+        DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL,
+    )
+    for label, candidate in label_to_id.items():
+        if candidate == sanitized:
+            return label
+    return fallback_label
+
+
+def wasapi_mix_format_info(
+    format_pointer,
+    *,
+    description: str = "Системный звук Windows",
+    output_device_id: str | None = None,
+    output_device_name: str | None = None,
+) -> dict:
+    fmt = format_pointer.contents
+    sample_format = "float32" if fmt.wBitsPerSample == 32 else f"pcm{fmt.wBitsPerSample}"
+    subformat = ""
+    if fmt.wFormatTag == WAVE_FORMAT_IEEE_FLOAT:
+        sample_format = "float32"
+    elif fmt.wFormatTag == WAVE_FORMAT_PCM:
+        sample_format = f"pcm{fmt.wBitsPerSample}"
+    elif fmt.wFormatTag == WAVE_FORMAT_EXTENSIBLE and fmt.cbSize >= 22:
+        try:
+            extensible = ctypes.cast(format_pointer, ctypes.POINTER(WAVEFORMATEXTENSIBLE)).contents
+            subformat = str(extensible.SubFormat).lower()
+            if subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT:
+                sample_format = "float32"
+            elif subformat == KSDATAFORMAT_SUBTYPE_PCM:
+                sample_format = f"pcm{fmt.wBitsPerSample}"
+        except Exception:
+            pass
+    return {
+        "source_type": "system_loopback",
+        "description": description,
+        "output_device_id": output_device_id or DEFAULT_SYSTEM_OUTPUT_DEVICE_ID,
+        "output_device_name": output_device_name or "",
+        "sample_rate": int(fmt.nSamplesPerSec),
+        "source_channels": int(fmt.nChannels),
+        "channels": CHANNELS,
+        "bits_per_sample": int(fmt.wBitsPerSample),
+        "block_align": int(fmt.nBlockAlign),
+        "format_tag": int(fmt.wFormatTag),
+        "sample_format": sample_format,
+        "subformat": subformat,
+    }
+
+
+def wasapi_mix_to_pcm16_mono(audio: bytes, config: dict) -> bytes:
+    sample_format = str(config.get("sample_format", "float32"))
+    source_channels = max(1, int(config.get("source_channels", CHANNELS)))
+    if sample_format == "float32":
+        return float32_pcm_to_pcm16_mono(audio, source_channels)
+    if sample_format == "pcm16":
+        return downmix_pcm16_to_mono(audio, source_channels)
+    if sample_format == "pcm24":
+        return int24_pcm_to_pcm16_mono(audio, source_channels)
+    if sample_format == "pcm32":
+        return int32_pcm_to_pcm16_mono(audio, source_channels)
+    return b""
+
+
+class WasapiLoopbackStream:
+    def __init__(self, callback, device_id: str | None = None) -> None:
+        self.callback = callback
+        self.device_id = sanitize_system_output_device_id(device_id)
+        self.config: dict | None = None
+        self._ready_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_error: Exception | None = None
+
+    def start(self) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Системный звук доступен только на Windows.")
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+        if not self._ready_event.wait(timeout=5):
+            self.stop()
+            raise RuntimeError("Не удалось запустить запись системного звука.")
+        if self._start_error is not None:
+            raise RuntimeError(f"Не удалось открыть системный звук: {self._start_error}")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+
+    def close(self) -> None:
+        self.stop()
+
+    def _capture_loop(self) -> None:
+        client = None
+        capture_client = None
+        started = False
+        mix_format = None
+        comtypes.CoInitialize()
+        try:
+            device = wasapi_output_device_by_id(self.device_id)
+            if int(device.GetState()) != WASAPI_DEVICE_STATE_ACTIVE:
+                raise RuntimeError("устройство вывода Windows не активно")
+            actual_device_id = wasapi_device_id(device)
+            output_device_name = wasapi_output_device_name(device)
+
+            client_pointer = device.Activate(ctypes.byref(IAudioClient._iid_), WASAPI_CLSCTX_ALL, None)
+            client = ctypes.cast(client_pointer, ctypes.POINTER(IAudioClient))
+            mix_format = client.GetMixFormat()
+            self.config = wasapi_mix_format_info(
+                mix_format,
+                description=f"Системный звук: {output_device_name}",
+                output_device_id=actual_device_id,
+                output_device_name=output_device_name,
+            )
+            try:
+                client.Initialize(
+                    WASAPI_SHAREMODE_SHARED,
+                    WASAPI_STREAMFLAGS_LOOPBACK,
+                    10_000_000,
+                    0,
+                    mix_format,
+                    None,
+                )
+            finally:
+                try:
+                    ctypes.windll.ole32.CoTaskMemFree(mix_format)
+                except Exception:
+                    pass
+                mix_format = None
+            capture_pointer = client.GetService(ctypes.byref(IAudioCaptureClient._iid_))
+            capture_client = ctypes.cast(capture_pointer, ctypes.POINTER(IAudioCaptureClient))
+            client.Start()
+            started = True
+            self._ready_event.set()
+
+            while not self._stop_event.is_set():
+                packet_size = int(capture_client.GetNextPacketSize())
+                if packet_size <= 0:
+                    time.sleep(0.02)
+                    continue
+                while packet_size > 0 and not self._stop_event.is_set():
+                    data, frames, flags, _position, _qpc = capture_client.GetBuffer()
+                    try:
+                        byte_count = int(frames) * int(self.config.get("block_align", 0))
+                        if flags & WASAPI_BUFFERFLAGS_SILENT or not data:
+                            raw_audio = b"\x00" * byte_count
+                        else:
+                            raw_audio = ctypes.string_at(data, byte_count)
+                        pcm16 = wasapi_mix_to_pcm16_mono(raw_audio, self.config)
+                        if pcm16:
+                            self.callback(pcm16, int(frames), None, None)
+                    finally:
+                        capture_client.ReleaseBuffer(int(frames))
+                    packet_size = int(capture_client.GetNextPacketSize())
+        except Exception as exc:
+            self._start_error = exc
+            self._ready_event.set()
+        finally:
+            if started and client is not None:
+                try:
+                    client.Stop()
+                except Exception:
+                    pass
+            if mix_format is not None:
+                try:
+                    ctypes.windll.ole32.CoTaskMemFree(mix_format)
+                except Exception:
+                    pass
+            comtypes.CoUninitialize()
+
+
+def open_wasapi_loopback_stream(
+    callback,
+    start: bool = False,
+    device_id: str | None = None,
+) -> tuple[WasapiLoopbackStream, dict]:
+    stream = WasapiLoopbackStream(callback, device_id=device_id)
+    if start:
+        stream.start()
+    config = stream.config or {
+        "source_type": "system_loopback",
+        "description": "Системный звук Windows",
+        "output_device_id": sanitize_system_output_device_id(device_id),
+        "output_device_name": "",
+        "sample_rate": SAMPLE_RATE,
+        "source_channels": CHANNELS,
+        "channels": CHANNELS,
+        "sample_format": "unknown",
+    }
+    return stream, config
+
+
+def measure_wasapi_loopback_level(device_id: str | None, seconds: float = SYSTEM_AUDIO_TEST_SECONDS) -> dict:
+    peak = 0
+    byte_count = 0
+    callback_count = 0
+
+    def callback(data, frames, time_info, status) -> None:
+        nonlocal peak, byte_count, callback_count
+        audio = bytes(data)
+        callback_count += 1
+        byte_count += len(audio)
+        peak = max(peak, audio_peak_percent(audio))
+
+    stream = None
+    config: dict | None = None
+    try:
+        stream, config = open_wasapi_loopback_stream(callback, start=True, device_id=device_id)
+        deadline = time.perf_counter() + max(0.1, float(seconds))
+        while time.perf_counter() < deadline:
+            time.sleep(0.05)
+        return {
+            "opened": True,
+            "ok": peak >= MICROPHONE_WORKING_PEAK_PERCENT,
+            "peak": peak,
+            "bytes": byte_count,
+            "callback_count": callback_count,
+            "config": config,
+        }
+    finally:
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+
 def audio_peak_percent(audio: bytes) -> int:
     usable_length = len(audio) - (len(audio) % SAMPLE_WIDTH_BYTES)
     if usable_length < SAMPLE_WIDTH_BYTES:
@@ -526,6 +1119,14 @@ def audio_gain_status_text(audio_stats: dict | None) -> str | None:
 def input_stream_config_text(config: dict | None) -> str:
     if not config:
         return "режим неизвестен"
+    if config.get("source_type") == "system_loopback":
+        source_channels = int(config.get("source_channels", CHANNELS))
+        channel_text = "1 канал" if source_channels == 1 else f"{source_channels}->1 канал"
+        sample_format = str(config.get("sample_format", "system"))
+        return (
+            f"{config.get('description', 'Системный звук Windows')}, "
+            f"{config.get('sample_rate', SAMPLE_RATE)} Hz, {channel_text}, {sample_format}->PCM16"
+        )
     source_channels = int(config.get("source_channels", CHANNELS))
     channel_text = "1 канал" if source_channels == 1 else f"{source_channels}->1 канал"
     dtype = str(config.get("dtype", "int16"))
@@ -878,6 +1479,20 @@ def sanitize_recognition_mode_key(value: object | None) -> str:
     if value in {"en_to_ru", "ru_to_en"}:
         return ENGLISH_RECOGNITION_MODE_KEY if value == "en_to_ru" else RUSSIAN_RECOGNITION_MODE_KEY
     return DEFAULT_RECOGNITION_MODE_KEY
+
+
+def sanitize_audio_source_key(value: object | None) -> str:
+    if isinstance(value, str) and value in AUDIO_SOURCE_LABELS:
+        return value
+    if isinstance(value, str) and value in AUDIO_SOURCE_KEY_BY_LABEL:
+        return AUDIO_SOURCE_KEY_BY_LABEL[value]
+    return DEFAULT_AUDIO_SOURCE_KEY
+
+
+def sanitize_system_output_device_id(value: object | None) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return DEFAULT_SYSTEM_OUTPUT_DEVICE_ID
 
 
 def recognition_mode_language(mode_key: object | None) -> str:
@@ -1394,6 +2009,77 @@ def backend_thread_candidates(backend_name: str) -> list[int]:
     return sorted(set(candidates))
 
 
+def quick_backend_benchmark_names(preferred_backend_key: str | None = None) -> list[str]:
+    available = {
+        name
+        for name, path in WHISPER_BACKENDS.items()
+        if path.exists()
+    }
+    if not available:
+        return []
+
+    priority: list[str] = []
+    if preferred_backend_key and preferred_backend_key not in {"auto", FALLBACK_AUTO_BACKEND_KEY}:
+        priority.append(preferred_backend_key)
+
+    priority.extend(name for name in GPU_BACKEND_PRIORITY if name in available)
+    priority.extend(name for name in CPU_BACKEND_PRIORITY if name in available)
+    priority.extend(
+        name
+        for name in WHISPER_BACKENDS
+        if name in available and name != FALLBACK_AUTO_BACKEND_KEY
+    )
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for backend_name in priority:
+        if backend_name in seen or backend_name not in available:
+            continue
+        result.append(backend_name)
+        seen.add(backend_name)
+        if BENCHMARK_QUICK_BACKEND_LIMIT and len(result) >= BENCHMARK_QUICK_BACKEND_LIMIT:
+            break
+    return result
+
+
+def backend_result_error_text(item: dict | None) -> str:
+    if not isinstance(item, dict):
+        return ""
+
+    parts: list[str] = []
+    error = item.get("error")
+    if error:
+        parts.append(str(error))
+
+    thread_results = item.get("thread_results")
+    if isinstance(thread_results, dict):
+        for thread_item in thread_results.values():
+            if isinstance(thread_item, dict) and thread_item.get("error"):
+                parts.append(str(thread_item["error"]))
+
+    return "\n".join(parts)
+
+
+def backend_result_is_timeout(item: dict | None) -> bool:
+    text = backend_result_error_text(item).lower()
+    return "timeout" in text or "overall timeout" in text or "лимит времени" in text
+
+
+def should_auto_select_compat_after_quick_benchmark(results: dict) -> bool:
+    for backend_name in CPU_BACKEND_PRIORITY:
+        backend_path = WHISPER_BACKENDS.get(backend_name)
+        if not backend_path or not backend_path.exists():
+            continue
+
+        item = results.get(backend_name)
+        if not isinstance(item, dict) or item.get("ok") or item.get("skipped"):
+            return False
+        if backend_result_is_timeout(item):
+            return False
+
+    return True
+
+
 def choose_backend_threads_from_results(backend_name: str, results: dict | None = None) -> int:
     item = results.get(backend_name) if isinstance(results, dict) else None
     if not isinstance(item, dict):
@@ -1444,11 +2130,13 @@ def choose_backend_threads(backend_name: str, profile: dict | None = None) -> in
 
 
 def choose_auto_backend_key(results: dict | None = None) -> str:
+    saved_selected: str | None = None
     if results is None:
-        selected = load_backend_profile().get("selected_backend")
-        if isinstance(selected, str) and is_whisper_backend_available(selected):
-            return selected
-        results = load_backend_profile().get("results", {})
+        profile = load_backend_profile()
+        selected = profile.get("selected_backend")
+        if isinstance(selected, str):
+            saved_selected = selected
+        results = profile.get("results", {})
 
     best_backend: str | None = None
     best_elapsed: float | None = None
@@ -1466,6 +2154,8 @@ def choose_auto_backend_key(results: dict | None = None) -> str:
 
     if best_backend and is_whisper_backend_available(best_backend):
         return best_backend
+    if saved_selected and is_whisper_backend_available(saved_selected):
+        return saved_selected
     for backend_name in WHISPER_BACKENDS:
         if is_whisper_backend_available(backend_name):
             return backend_name
@@ -1503,6 +2193,7 @@ def build_whisper_command(
     threads: int = DEFAULT_WHISPER_THREADS,
     language: str = "ru",
     translate_to_english: bool = False,
+    print_progress: bool = False,
 ) -> list[str]:
     threads = sanitize_whisper_threads(threads)
     language = language if language in RECOGNITION_MODE_LANGUAGES.values() else "ru"
@@ -1522,13 +2213,14 @@ def build_whisper_command(
             "-t",
             str(threads),
             "-nt",
-            "-np",
             "-nf",
             "-otxt",
             "-of",
             str(out_base),
         ]
     )
+    if not print_progress:
+        command.append("-np")
     return command
 
 
@@ -1566,6 +2258,7 @@ def run_whisper_backend(
     translate_to_english: bool = False,
     cancel_event: threading.Event | None = None,
     process_callback: Callable[[subprocess.Popen | None], None] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if cancel_event is not None and cancel_event.is_set():
         raise RecognitionCancelled()
@@ -1579,6 +2272,7 @@ def run_whisper_backend(
         threads=threads,
         language=language,
         translate_to_english=translate_to_english,
+        print_progress=progress_callback is not None,
     )
     process: subprocess.Popen[bytes] | None = None
     try:
@@ -1593,21 +2287,83 @@ def run_whisper_backend(
             process_callback(process)
 
         deadline = time.perf_counter() + timeout_seconds if timeout_seconds is not None else None
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                _terminate_process(process)
-                raise RecognitionCancelled()
-            if deadline is not None and time.perf_counter() >= deadline:
-                _terminate_process(process)
-                raise RuntimeError(f"{backend_name} t={threads}: timeout after {timeout_seconds} seconds")
-            try:
-                wait_timeout = 0.1
-                if deadline is not None:
-                    wait_timeout = max(0.01, min(wait_timeout, deadline - time.perf_counter()))
-                stdout_data, stderr_data = process.communicate(timeout=wait_timeout)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+        if progress_callback is None:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    _terminate_process(process)
+                    raise RecognitionCancelled()
+                if deadline is not None and time.perf_counter() >= deadline:
+                    _terminate_process(process)
+                    raise RuntimeError(f"{backend_name} t={threads}: timeout after {timeout_seconds} seconds")
+                try:
+                    wait_timeout = 0.1
+                    if deadline is not None:
+                        wait_timeout = max(0.01, min(wait_timeout, deadline - time.perf_counter()))
+                    stdout_data, stderr_data = process.communicate(timeout=wait_timeout)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        else:
+            stdout_buffer = bytearray()
+            stderr_buffer = bytearray()
+            last_progress = -1
+
+            def emit_progress_from_text(text: str) -> None:
+                nonlocal last_progress
+                for match in WHISPER_PROGRESS_PATTERN.finditer(text):
+                    value = max(0, min(100, int(match.group(1))))
+                    if value > last_progress:
+                        last_progress = value
+                        progress_callback(value)
+
+            def stdout_reader() -> None:
+                if process is None or process.stdout is None:
+                    return
+                while True:
+                    chunk = process.stdout.read(4096)
+                    if not chunk:
+                        break
+                    stdout_buffer.extend(chunk)
+
+            def stderr_reader() -> None:
+                if process is None or process.stderr is None:
+                    return
+                line_buffer = bytearray()
+                while True:
+                    chunk = process.stderr.read(1)
+                    if not chunk:
+                        break
+                    stderr_buffer.extend(chunk)
+                    if chunk in (b"\r", b"\n"):
+                        if line_buffer:
+                            emit_progress_from_text(line_buffer.decode("utf-8", errors="replace"))
+                            line_buffer.clear()
+                    else:
+                        line_buffer.extend(chunk)
+                if line_buffer:
+                    emit_progress_from_text(line_buffer.decode("utf-8", errors="replace"))
+
+            stdout_thread = threading.Thread(target=stdout_reader, daemon=True)
+            stderr_thread = threading.Thread(target=stderr_reader, daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    _terminate_process(process)
+                    raise RecognitionCancelled()
+                if deadline is not None and time.perf_counter() >= deadline:
+                    _terminate_process(process)
+                    raise RuntimeError(f"{backend_name} t={threads}: timeout after {timeout_seconds} seconds")
+                returncode = process.poll()
+                if returncode is not None:
+                    break
+                time.sleep(0.1)
+
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+            stdout_data = bytes(stdout_buffer)
+            stderr_data = bytes(stderr_buffer)
 
         if cancel_event is not None and cancel_event.is_set():
             raise RecognitionCancelled()
@@ -1647,6 +2403,8 @@ def run_whisper_with_fallback(
     translate_to_english: bool = False,
     cancel_event: threading.Event | None = None,
     process_callback: Callable[[subprocess.Popen | None], None] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+    deadline: float | None = None,
 ) -> tuple[str, int, subprocess.CompletedProcess[bytes]]:
     backends = available_whisper_backends(preferred_backend_key)
     if not backends:
@@ -1661,6 +2419,8 @@ def run_whisper_with_fallback(
         errors.append(f"{preferred_backend_key}: missing backend: {preferred_path}")
 
     for backend_name, exe_path in backends:
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise RuntimeError("overall timeout")
         if txt_path.exists():
             txt_path.unlink()
 
@@ -1668,6 +2428,10 @@ def run_whisper_with_fallback(
             raise RecognitionCancelled()
 
         threads = choose_backend_threads(backend_name, backend_profile)
+        attempt_timeout = timeout_seconds
+        if deadline is not None:
+            remaining = max(0.01, deadline - time.perf_counter())
+            attempt_timeout = remaining if attempt_timeout is None else min(attempt_timeout, remaining)
         try:
             completed = run_whisper_backend(
                 backend_name,
@@ -1675,12 +2439,13 @@ def run_whisper_with_fallback(
                 model_path,
                 wav_path,
                 out_base,
-                timeout_seconds,
+                attempt_timeout,
                 threads=threads,
                 language=language,
                 translate_to_english=translate_to_english,
                 cancel_event=cancel_event,
                 process_callback=process_callback,
+                progress_callback=progress_callback,
             )
             return backend_name, threads, completed
         except RecognitionCancelled:
@@ -1715,6 +2480,12 @@ def load_user_settings() -> dict:
             if isinstance(stored, dict):
                 for key in ("auto_copy", "format_text", "voice_punctuation"):
                     settings[key] = bool(stored.get(key, DEFAULT_USER_SETTINGS[key]))
+                settings["audio_source"] = sanitize_audio_source_key(
+                    stored.get("audio_source", DEFAULT_USER_SETTINGS["audio_source"])
+                )
+                settings["system_output_device_id"] = sanitize_system_output_device_id(
+                    stored.get("system_output_device_id", DEFAULT_USER_SETTINGS["system_output_device_id"])
+                )
                 settings["audio_gain_percent"] = clamp_audio_gain_percent(
                     stored.get("audio_gain_percent", DEFAULT_USER_SETTINGS["audio_gain_percent"])
                 )
@@ -1737,6 +2508,10 @@ def save_user_settings(settings: dict) -> None:
         "auto_copy": bool(settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"])),
         "format_text": bool(settings.get("format_text", DEFAULT_USER_SETTINGS["format_text"])),
         "voice_punctuation": bool(settings.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])),
+        "audio_source": sanitize_audio_source_key(settings.get("audio_source", DEFAULT_USER_SETTINGS["audio_source"])),
+        "system_output_device_id": sanitize_system_output_device_id(
+            settings.get("system_output_device_id", DEFAULT_USER_SETTINGS["system_output_device_id"])
+        ),
         "recognition_mode": sanitize_recognition_mode_key(
             settings.get("recognition_mode", DEFAULT_USER_SETTINGS["recognition_mode"])
         ),
@@ -2476,6 +3251,17 @@ def choose_auto_model_key(results: dict | None = None) -> str:
     return FALLBACK_AUTO_MODEL_KEY
 
 
+def choose_backend_benchmark_model_key() -> str:
+    for model_key in BACKEND_BENCHMARK_MODEL_PREFERENCE:
+        model_path = MODEL_FILES.get(model_key)
+        if model_path and model_path.exists():
+            return model_key
+    for model_key, model_path in MODEL_FILES.items():
+        if model_path.exists():
+            return model_key
+    return FALLBACK_AUTO_MODEL_KEY
+
+
 def write_benchmark_wav(wav_path: Path, seconds: float = BENCHMARK_AUDIO_SECONDS) -> None:
     total_frames = int(SAMPLE_RATE * seconds)
     frames = bytearray()
@@ -2547,8 +3333,16 @@ def run_faster_whisper_benchmark(wav_path: Path, model_key: str) -> dict:
         }
 
 
-def run_model_benchmark(allow_missing_models: bool = False, print_fn=None, preferred_backend_key: str | None = None) -> dict:
+def run_model_benchmark(
+    allow_missing_models: bool = False,
+    print_fn=None,
+    preferred_backend_key: str | None = None,
+    cancel_event: threading.Event | None = None,
+    total_timeout_seconds: float = BENCHMARK_TOTAL_TIMEOUT_SECONDS,
+    attempt_timeout_seconds: float = BENCHMARK_ATTEMPT_TIMEOUT_SECONDS,
+) -> dict:
     results: dict[str, dict] = {}
+    deadline = time.perf_counter() + max(1.0, float(total_timeout_seconds))
 
     with tempfile.TemporaryDirectory(prefix="dicta_benchmark_") as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -2556,6 +3350,12 @@ def run_model_benchmark(allow_missing_models: bool = False, print_fn=None, prefe
         write_benchmark_wav(wav_path)
 
         for model_key, model_path in MODEL_FILES.items():
+            if cancel_event is not None and cancel_event.is_set():
+                raise RecognitionCancelled()
+            if time.perf_counter() >= deadline:
+                if print_fn:
+                    print_fn("общий лимит времени исчерпан")
+                break
             if not model_path.exists():
                 results[model_key] = {"ok": False, "error": f"missing model: {model_path}"}
                 if print_fn:
@@ -2569,12 +3369,15 @@ def run_model_benchmark(allow_missing_models: bool = False, print_fn=None, prefe
                 print_fn(f"{model_key}: проверка...")
             started_at = time.perf_counter()
             try:
+                remaining = max(0.01, deadline - time.perf_counter())
                 backend_name, backend_threads, _completed = run_whisper_with_fallback(
                     model_path,
                     wav_path,
                     out_base,
-                    timeout_seconds=300,
+                    timeout_seconds=min(attempt_timeout_seconds, remaining),
                     preferred_backend_key=preferred_backend_key,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
                 )
                 elapsed = time.perf_counter() - started_at
                 rtf = elapsed / BENCHMARK_AUDIO_SECONDS
@@ -2613,10 +3416,16 @@ def run_backend_benchmark(
     allow_missing_models: bool = False,
     include_faster_whisper: bool = False,
     print_fn=None,
+    preferred_backend_key: str | None = None,
+    cancel_event: threading.Event | None = None,
+    quick: bool = True,
+    total_timeout_seconds: float = BENCHMARK_TOTAL_TIMEOUT_SECONDS,
+    attempt_timeout_seconds: float = BENCHMARK_ATTEMPT_TIMEOUT_SECONDS,
 ) -> dict:
-    model_key = model_key or choose_auto_model_key()
+    model_key = model_key or choose_backend_benchmark_model_key()
     model_path = MODEL_FILES.get(model_key, MODEL_FILES[FALLBACK_AUTO_MODEL_KEY])
     results: dict[str, dict] = {}
+    deadline = time.perf_counter() + max(1.0, float(total_timeout_seconds))
 
     with tempfile.TemporaryDirectory(prefix="dicta_backend_benchmark_") as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -2643,7 +3452,28 @@ def run_backend_benchmark(
                 }
                 return profile
         else:
-            for backend_name, exe_path in WHISPER_BACKENDS.items():
+            if quick:
+                backend_names = quick_backend_benchmark_names(preferred_backend_key)
+            else:
+                backend_names = list(WHISPER_BACKENDS.keys())
+            for backend_name in WHISPER_BACKENDS:
+                if backend_name not in backend_names:
+                    path = WHISPER_BACKENDS[backend_name]
+                    results[backend_name] = {
+                        "ok": False,
+                        "available": path.exists(),
+                        "skipped": True,
+                        "error": "skipped by quick backend selection" if quick else "not selected",
+                    }
+
+            for backend_name in backend_names:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RecognitionCancelled()
+                if time.perf_counter() >= deadline:
+                    if print_fn:
+                        print_fn("общий лимит времени исчерпан")
+                    break
+                exe_path = WHISPER_BACKENDS[backend_name]
                 if not exe_path.exists():
                     results[backend_name] = {
                         "ok": False,
@@ -2653,9 +3483,28 @@ def run_backend_benchmark(
                     if print_fn:
                         print_fn(f"{backend_name}: missing backend")
                     continue
+                if backend_name in DISABLED_WHISPER_BACKENDS:
+                    results[backend_name] = {
+                        "ok": False,
+                        "available": True,
+                        "error": "backend disabled for this session",
+                    }
+                    if print_fn:
+                        print_fn(f"{backend_name}: пропущен после ошибки запуска")
+                    continue
 
                 thread_results: dict[str, dict] = {}
-                for threads in backend_thread_candidates(backend_name):
+                if quick:
+                    thread_candidates = [choose_backend_threads(backend_name)]
+                else:
+                    thread_candidates = backend_thread_candidates(backend_name)
+                for threads in thread_candidates:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RecognitionCancelled()
+                    if time.perf_counter() >= deadline:
+                        if print_fn:
+                            print_fn("общий лимит времени исчерпан")
+                        break
                     out_base = tmp_path / f"backend_{backend_name}_t{threads}"
                     txt_path = out_base.with_suffix(".txt")
                     if txt_path.exists():
@@ -2665,14 +3514,16 @@ def run_backend_benchmark(
                         print_fn(f"{backend_name} t={threads}: проверка...")
                     started_at = time.perf_counter()
                     try:
+                        remaining = max(0.01, deadline - time.perf_counter())
                         run_whisper_backend(
                             backend_name,
                             exe_path,
                             model_path,
                             wav_path,
                             out_base,
-                            timeout_seconds=300,
+                            timeout_seconds=min(attempt_timeout_seconds, remaining),
                             threads=threads,
+                            cancel_event=cancel_event,
                         )
                         elapsed = time.perf_counter() - started_at
                         rtf = elapsed / BENCHMARK_AUDIO_SECONDS
@@ -2740,8 +3591,23 @@ def run_backend_benchmark(
                 else:
                     print_fn(f"faster-whisper: skipped: {result.get('error')}")
 
-    selected_backend = choose_auto_backend_key(results)
-    selected_threads = choose_backend_threads_from_results(selected_backend, results)
+    has_success = any(results.get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS)
+    compat_available = is_whisper_backend_available(FALLBACK_AUTO_BACKEND_KEY)
+    compat_auto_selected = bool(
+        quick
+        and not has_success
+        and compat_available
+        and should_auto_select_compat_after_quick_benchmark(results)
+    )
+    if has_success:
+        selected_backend = choose_auto_backend_key(results)
+        selected_threads = choose_backend_threads_from_results(selected_backend, results)
+    elif compat_auto_selected:
+        selected_backend = FALLBACK_AUTO_BACKEND_KEY
+        selected_threads = DEFAULT_WHISPER_THREADS
+    else:
+        selected_backend = choose_auto_backend_key(results)
+        selected_threads = choose_backend_threads_from_results(selected_backend, results)
     profile = {
         "version": 2,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
@@ -2749,9 +3615,12 @@ def run_backend_benchmark(
         "model": model_key,
         "selected_backend": selected_backend,
         "selected_threads": selected_threads,
+        "quick": bool(quick),
+        "compat_auto_selected": compat_auto_selected,
+        "compat_suggested": bool(quick and not has_success and compat_available and not compat_auto_selected),
         "results": results,
     }
-    if any(results.get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS):
+    if has_success or compat_auto_selected:
         save_backend_profile(profile)
     return profile
 
@@ -2772,16 +3641,24 @@ class DictaApp:
         self.is_recognizing = False
         self.is_testing_microphone = False
         self.is_finding_microphone = False
+        self.is_testing_system_audio = False
         self.is_benchmarking = False
         self.is_translating = False
         self.record_started_at: float | None = None
         self.record_sample_rate = SAMPLE_RATE
+        self.recognition_progress_started_at = 0.0
+        self.recognition_progress_estimate_seconds = 90.0
+        self.recognition_progress_has_real_update = False
         self.last_input_stream_config: dict | None = None
         self.mic_test_stream: sd.RawInputStream | None = None
         self.mic_test_peak = 0
         self.last_level_event_at = 0.0
         self.input_devices: dict[str, list[int]] = {}
         self.preferred_input_configs: dict[str, dict] = {}
+        self.system_output_devices: dict[str, str] = {
+            DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL: DEFAULT_SYSTEM_OUTPUT_DEVICE_ID
+        }
+        self.system_output_device_info_by_id: dict[str, WasapiOutputDeviceInfo] = {}
         self.last_recognition_audio_bytes: bytes | None = None
         self.last_recognition_sample_rate: int | None = None
         self.last_recognition_model_path: Path | None = None
@@ -2800,8 +3677,10 @@ class DictaApp:
         self.translation_worker: threading.Thread | None = None
         self.translation_warmup_worker: threading.Thread | None = None
         self.recognition_cancel_event = threading.Event()
+        self.benchmark_cancel_event = threading.Event()
         self.recognition_process_lock = threading.Lock()
         self.recognition_process: subprocess.Popen | None = None
+        self.last_recording_source_key = DEFAULT_AUDIO_SOURCE_KEY
         self.format_undo_snapshot: tuple[str, str] | None = None
         self.postprocess_undo_snapshot: tuple[str, str, tuple[RecognitionCorrection, ...]] | None = None
         self.translation_undo_snapshot: tuple[str, str, str, str] | None = None
@@ -2809,7 +3688,9 @@ class DictaApp:
 
         self.status_var = tk.StringVar(value="Готово")
         self.record_time_var = tk.StringVar(value="Запись: 00:00")
-        self.recognition_time_var = tk.StringVar(value="Распознавание: -")
+        self.recognition_time_var = tk.StringVar(value="-")
+        self.recognition_progress_var = tk.DoubleVar(value=0)
+        self.recognition_progress_text_var = tk.StringVar(value="0%")
         self.firewall_status_var = tk.StringVar(value="Сеть: проверка...")
         initial_model_key = sanitize_model_key(
             self.settings.get("model_key", FALLBACK_AUTO_MODEL_KEY),
@@ -2821,6 +3702,11 @@ class DictaApp:
             value=BACKEND_LABELS.get(str(self.settings.get("backend", "auto")), DEFAULT_BACKEND_LABEL)
         )
         self.input_device_var = tk.StringVar(value="")
+        initial_audio_source = sanitize_audio_source_key(
+            self.settings.get("audio_source", DEFAULT_AUDIO_SOURCE_KEY)
+        )
+        self.audio_source_var = tk.StringVar(value=AUDIO_SOURCE_LABELS[initial_audio_source])
+        self.system_output_device_var = tk.StringVar(value=DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL)
         self.input_level_var = tk.DoubleVar(value=0)
         self.input_level_text_var = tk.StringVar(value="Уровень: -")
         self.microphone_search_progress_var = tk.DoubleVar(value=0)
@@ -2853,6 +3739,7 @@ class DictaApp:
 
         self._build_ui()
         self._update_speed_status()
+        self.refresh_system_output_devices(show_status=False)
         self.refresh_input_devices()
         self.settings_snapshot = self._capture_settings_state()
         self._check_local_files()
@@ -2938,10 +3825,24 @@ class DictaApp:
         ttk.Separator(self.root, orient="horizontal").grid(row=2, column=0, sticky="ew")
         status_bar = ttk.Frame(self.root, padding=(12, 4, 12, 6))
         status_bar.grid(row=3, column=0, sticky="ew")
-        status_bar.columnconfigure(1, weight=1)
+        status_bar.columnconfigure(9, weight=1)
 
         ttk.Label(status_bar, text="Статус:").grid(row=0, column=0, sticky="w", padx=(0, 4))
-        ttk.Label(status_bar, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.recognition_progress_bar = ttk.Progressbar(
+            status_bar,
+            variable=self.recognition_progress_var,
+            maximum=100,
+            mode="determinate",
+            length=110,
+        )
+        self.recognition_progress_bar.grid(row=0, column=2, sticky="w", padx=(0, 4))
+        ttk.Label(status_bar, textvariable=self.recognition_progress_text_var, width=5).grid(
+            row=0,
+            column=3,
+            sticky="w",
+            padx=(0, 18),
+        )
         self.input_level_bar = ttk.Progressbar(
             status_bar,
             variable=self.input_level_var,
@@ -2949,11 +3850,11 @@ class DictaApp:
             mode="determinate",
             length=90,
         )
-        self.input_level_bar.grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Label(status_bar, textvariable=self.input_level_text_var).grid(row=0, column=3, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.record_time_var).grid(row=0, column=4, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.recognition_time_var).grid(row=0, column=5, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.spellcheck_status_var).grid(row=0, column=6, sticky="e")
+        ttk.Label(status_bar, textvariable=self.input_level_text_var).grid(row=0, column=4, sticky="w", padx=(0, 6))
+        self.input_level_bar.grid(row=0, column=5, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.record_time_var).grid(row=0, column=6, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.recognition_time_var).grid(row=0, column=7, sticky="w", padx=(0, 18))
+        ttk.Label(status_bar, textvariable=self.spellcheck_status_var).grid(row=0, column=8, sticky="w")
 
         self._build_settings_window()
         self._update_translation_button_state()
@@ -2961,8 +3862,8 @@ class DictaApp:
     def _build_settings_window(self) -> None:
         self.settings_window = tk.Toplevel(self.root)
         self.settings_window.title("Dicta: настройки")
-        self.settings_window.geometry("720x500")
-        self.settings_window.minsize(620, 360)
+        self.settings_window.geometry("820x540")
+        self.settings_window.minsize(720, 420)
         self.settings_window.transient(self.root)
         self.settings_window.protocol("WM_DELETE_WINDOW", self.hide_settings)
         self.settings_window.withdraw()
@@ -2981,23 +3882,61 @@ class DictaApp:
 
         text_tab.columnconfigure(1, weight=1)
         recording_tab.columnconfigure(1, weight=1)
-        ttk.Label(recording_tab, text="Микрофон:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        ttk.Label(recording_tab, text="Источник:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self.audio_source_box = ttk.Combobox(
+            recording_tab,
+            textvariable=self.audio_source_var,
+            values=list(AUDIO_SOURCE_LABELS.values()),
+            state="readonly",
+            width=28,
+        )
+        self.audio_source_box.grid(row=0, column=1, sticky="w", pady=(0, 8))
+        self.audio_source_box.bind("<<ComboboxSelected>>", self._on_audio_source_changed)
+
+        ttk.Label(recording_tab, text="Устройство вывода:").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 8)
+        )
+        self.system_output_device_box = ttk.Combobox(
+            recording_tab,
+            textvariable=self.system_output_device_var,
+            values=[DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL],
+            state="readonly",
+            width=64,
+        )
+        self.system_output_device_box.grid(row=1, column=1, columnspan=4, sticky="ew", pady=(0, 8))
+        self.system_output_device_box.bind("<<ComboboxSelected>>", self._on_system_output_device_changed)
+        system_output_buttons = ttk.Frame(recording_tab)
+        system_output_buttons.grid(row=2, column=1, columnspan=4, sticky="w", pady=(0, 8))
+        self.refresh_system_output_button = ttk.Button(
+            system_output_buttons,
+            text="Обновить",
+            command=self.refresh_system_output_devices,
+        )
+        self.refresh_system_output_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.test_system_audio_button = ttk.Button(
+            system_output_buttons,
+            text="Проверить звук",
+            command=self.start_system_audio_test,
+        )
+        self.test_system_audio_button.grid(row=0, column=1, sticky="w")
+
+        ttk.Label(recording_tab, text="Микрофон:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
         self.input_device_box = ttk.Combobox(
             recording_tab,
             textvariable=self.input_device_var,
             state="readonly",
             width=52,
         )
-        self.input_device_box.grid(row=0, column=1, columnspan=4, sticky="ew", pady=(0, 8))
+        self.input_device_box.grid(row=3, column=1, columnspan=4, sticky="ew", pady=(0, 8))
         microphone_buttons = ttk.Frame(recording_tab)
-        microphone_buttons.grid(row=1, column=1, columnspan=4, sticky="w")
+        microphone_buttons.grid(row=4, column=1, columnspan=4, sticky="w")
         self.refresh_input_button = ttk.Button(microphone_buttons, text="Обновить", command=self.refresh_input_devices)
         self.refresh_input_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.test_input_button = ttk.Button(microphone_buttons, text="Проверить", command=self.start_microphone_test)
         self.test_input_button.grid(row=0, column=1, sticky="w", padx=(0, 8))
         self.find_input_button = ttk.Button(microphone_buttons, text="Найти микрофон", command=self.start_microphone_search)
         self.find_input_button.grid(row=0, column=2, sticky="w")
-        ttk.Label(recording_tab, textvariable=self.input_level_text_var).grid(row=2, column=1, sticky="w", pady=(14, 0))
+        ttk.Label(recording_tab, textvariable=self.input_level_text_var).grid(row=5, column=1, sticky="w", pady=(14, 0))
         self.microphone_search_progress = ttk.Progressbar(
             recording_tab,
             variable=self.input_level_var,
@@ -3005,15 +3944,15 @@ class DictaApp:
             mode="determinate",
             length=180,
         )
-        self.microphone_search_progress.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 0), padx=(0, 8))
+        self.microphone_search_progress.grid(row=6, column=1, columnspan=2, sticky="ew", pady=(10, 0), padx=(0, 8))
         ttk.Label(recording_tab, textvariable=self.microphone_search_status_var, width=28).grid(
-            row=3,
+            row=6,
             column=3,
             columnspan=2,
             sticky="w",
             pady=(10, 0),
         )
-        ttk.Label(recording_tab, text="Усиление записи:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        ttk.Label(recording_tab, text="Усиление записи:").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
         self.audio_gain_scale = ttk.Scale(
             recording_tab,
             from_=0,
@@ -3021,14 +3960,14 @@ class DictaApp:
             variable=self.audio_gain_percent_var,
             command=self._on_audio_gain_changed,
         )
-        self.audio_gain_scale.grid(row=4, column=1, columnspan=2, sticky="ew", pady=(10, 0), padx=(0, 8))
+        self.audio_gain_scale.grid(row=7, column=1, columnspan=2, sticky="ew", pady=(10, 0), padx=(0, 8))
         ttk.Label(recording_tab, textvariable=self.audio_gain_percent_text_var, width=14).grid(
-            row=4,
+            row=7,
             column=3,
             sticky="w",
             pady=(10, 0),
         )
-        ttk.Label(recording_tab, textvariable=self.hotkey_status_var).grid(row=5, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(recording_tab, textvariable=self.hotkey_status_var).grid(row=8, column=1, sticky="w", pady=(8, 0))
 
         ttk.Label(text_tab, text="Режим:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
         self.recognition_mode_box = ttk.Combobox(
@@ -3134,7 +4073,7 @@ class DictaApp:
         benchmark_buttons = ttk.Frame(performance_tab)
         benchmark_buttons.grid(row=2, column=1, sticky="w", pady=(6, 8))
         self.benchmark_button = ttk.Button(benchmark_buttons, text="Бенчмарк модели", command=self.start_model_benchmark)
-        self.backend_benchmark_button = ttk.Button(benchmark_buttons, text="Backend тест", command=self.start_backend_benchmark)
+        self.backend_benchmark_button = ttk.Button(benchmark_buttons, text="Подобрать движок", command=self.start_backend_benchmark)
         self.benchmark_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.backend_benchmark_button.grid(row=0, column=1, sticky="w")
         ttk.Label(performance_tab, textvariable=self.speed_status_var).grid(row=3, column=1, sticky="w")
@@ -3274,7 +4213,7 @@ class DictaApp:
         if self.is_recording:
             self.stop_recording()
             return
-        if self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
+        if self._is_audio_source_busy():
             return
         if self.record_button.instate(["!disabled"]):
             self.start_recording()
@@ -3289,21 +4228,25 @@ class DictaApp:
         self.record_button.configure(text="Записать", command=self.toggle_recording, state=tk.NORMAL)
         self._set_recognition_mode_controls_state("readonly")
         self._update_translation_button_state()
+        self._update_audio_source_controls_state()
 
     def _set_record_button_recording(self) -> None:
         self.record_button.configure(text="Стоп", command=self.stop_recording, state=tk.NORMAL)
         self._set_recognition_mode_controls_state(tk.DISABLED)
         self._set_translation_buttons_state(tk.DISABLED)
+        self._update_audio_source_controls_state()
 
     def _set_record_button_recognizing(self) -> None:
         self.record_button.configure(text="Прервать", command=self.cancel_recognition, state=tk.NORMAL)
         self._set_recognition_mode_controls_state(tk.DISABLED)
         self._set_translation_buttons_state(tk.DISABLED)
+        self._update_audio_source_controls_state()
 
     def _set_record_button_busy(self, text: str) -> None:
         self.record_button.configure(text=text, state=tk.DISABLED)
         self._set_recognition_mode_controls_state(tk.DISABLED)
         self._set_translation_buttons_state(tk.DISABLED)
+        self._update_audio_source_controls_state()
 
     def _set_recognition_mode_controls_state(self, state: str) -> None:
         for control_name in ("toolbar_recognition_mode_box", "recognition_mode_box"):
@@ -3390,6 +4333,84 @@ class DictaApp:
     def _select_recognition_mode_key(self, mode_key: object | None) -> None:
         self.recognition_mode_var.set(RECOGNITION_MODE_LABELS[sanitize_recognition_mode_key(mode_key)])
 
+    def _selected_audio_source_key(self) -> str:
+        return AUDIO_SOURCE_KEY_BY_LABEL.get(self.audio_source_var.get(), DEFAULT_AUDIO_SOURCE_KEY)
+
+    def _select_audio_source_key(self, source_key: object | None) -> None:
+        self.audio_source_var.set(AUDIO_SOURCE_LABELS[sanitize_audio_source_key(source_key)])
+
+    def _is_system_audio_source_selected(self) -> bool:
+        return self._selected_audio_source_key() == "system"
+
+    def _is_audio_source_busy(self) -> bool:
+        return (
+            self.is_recording
+            or self.is_recognizing
+            or self.is_testing_microphone
+            or self.is_finding_microphone
+            or self.is_testing_system_audio
+            or self.is_benchmarking
+            or self.is_translating
+        )
+
+    def _on_audio_source_changed(self, event=None) -> None:
+        if self._is_system_audio_source_selected() and not self._is_audio_source_busy():
+            self.refresh_system_output_devices(show_status=False)
+        self._update_audio_source_controls_state()
+        if self._is_system_audio_source_selected():
+            self._set_status("Источник записи: системный звук встречи")
+        else:
+            self._set_status("Источник записи: микрофон")
+
+    def _selected_system_output_device_id(self) -> str:
+        return self.system_output_devices.get(
+            self.system_output_device_var.get(),
+            DEFAULT_SYSTEM_OUTPUT_DEVICE_ID,
+        )
+
+    def _select_system_output_device_id(self, device_id: object | None) -> None:
+        if not self.system_output_devices:
+            self.system_output_devices = {
+                DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL: DEFAULT_SYSTEM_OUTPUT_DEVICE_ID
+            }
+        label = system_output_device_label_for_id(self.system_output_devices, device_id)
+        self.system_output_device_var.set(label)
+
+    def _on_system_output_device_changed(self, event=None) -> None:
+        self._set_status("Устройство вывода выбрано")
+
+    def _update_audio_source_controls_state(self) -> None:
+        busy = self._is_audio_source_busy()
+        source_box = getattr(self, "audio_source_box", None)
+        if source_box is not None:
+            source_box.configure(state=tk.DISABLED if busy else "readonly")
+
+        system_controls_available = self._is_system_audio_source_selected()
+        system_box_state = "readonly" if system_controls_available and not busy and self.system_output_devices else tk.DISABLED
+        system_refresh_state = tk.NORMAL if system_controls_available and not busy else tk.DISABLED
+        system_test_state = tk.NORMAL if system_controls_available and not busy and self.system_output_devices else tk.DISABLED
+        for control_name, state in (
+            ("system_output_device_box", system_box_state),
+            ("refresh_system_output_button", system_refresh_state),
+            ("test_system_audio_button", system_test_state),
+        ):
+            control = getattr(self, control_name, None)
+            if control is not None:
+                control.configure(state=state)
+
+        microphone_controls_available = bool(self.input_devices) and not self._is_system_audio_source_selected()
+        microphone_state = "readonly" if microphone_controls_available and not busy else tk.DISABLED
+        microphone_button_state = tk.NORMAL if microphone_controls_available and not busy else tk.DISABLED
+        for control_name, state in (
+            ("input_device_box", microphone_state),
+            ("refresh_input_button", microphone_button_state),
+            ("test_input_button", microphone_button_state),
+            ("find_input_button", microphone_button_state),
+        ):
+            control = getattr(self, control_name, None)
+            if control is not None:
+                control.configure(state=state)
+
     def _active_spellcheck_language_tag(self) -> str:
         language_tag = getattr(self, "current_text_spellcheck_language_tag", "")
         if language_tag in SPELLCHECK_LANGUAGE_LABELS:
@@ -3458,6 +4479,7 @@ class DictaApp:
             or self.is_recognizing
             or self.is_testing_microphone
             or self.is_finding_microphone
+            or self.is_testing_system_audio
             or self.is_benchmarking
             or self.is_translating
         )
@@ -3516,16 +4538,17 @@ class DictaApp:
         return backends[0][0] if backends else "нет whisper-cli"
 
     def start_model_benchmark(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
+        if self._is_audio_source_busy():
             return
 
+        self.benchmark_cancel_event.clear()
         self.is_benchmarking = True
         self._set_status("Бенчмарк модели: подготовка...")
         self.speed_status_var.set("Бенчмарк модели: идет проверка доступных моделей")
         self._set_record_button_busy("Бенчмарк")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
-        self.benchmark_button.configure(text="Идет тест...", state=tk.DISABLED)
+        self.benchmark_button.configure(text="Прервать тест", command=self.cancel_benchmark, state=tk.NORMAL)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
         self.input_device_box.configure(state=tk.DISABLED)
@@ -3542,11 +4565,14 @@ class DictaApp:
             profile = run_model_benchmark(
                 allow_missing_models=True,
                 preferred_backend_key=self._selected_backend_preference(),
+                cancel_event=self.benchmark_cancel_event,
                 print_fn=report_progress,
             )
             if not any(item.get("ok") for item in profile.get("results", {}).values()):
                 raise RuntimeError("No local models were available for benchmark.")
             self.ui_queue.put(("benchmark_result", profile))
+        except RecognitionCancelled:
+            self.ui_queue.put(("benchmark_cancelled", None))
         except Exception as exc:
             self.ui_queue.put(("benchmark_error", self._format_problem_message(
                 "Не удалось выполнить бенчмарк модели.",
@@ -3560,18 +4586,19 @@ class DictaApp:
             self.ui_queue.put(("benchmark_ready", None))
 
     def start_backend_benchmark(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
+        if self._is_audio_source_busy():
             return
 
+        self.benchmark_cancel_event.clear()
         self.is_benchmarking = True
-        self._set_status("Backend тест: подготовка...")
-        self.speed_status_var.set("Backend тест: идет проверка backend и потоков")
+        self._set_status("Подбор движка: подготовка...")
+        self.speed_status_var.set("Подбор движка: быстрый тест легкой модели")
         self._set_record_button_busy("Бенчмарк")
         self.stop_button.configure(state=tk.DISABLED)
         self.model_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
-        self.backend_benchmark_button.configure(text="Идет тест...", state=tk.DISABLED)
+        self.backend_benchmark_button.configure(text="Прервать тест", command=self.cancel_benchmark, state=tk.NORMAL)
         self.input_device_box.configure(state=tk.DISABLED)
         self.refresh_input_button.configure(state=tk.DISABLED)
         self.test_input_button.configure(state=tk.DISABLED)
@@ -3583,14 +4610,27 @@ class DictaApp:
             def report_progress(message: str) -> None:
                 self.ui_queue.put(("backend_benchmark_progress", message))
 
+            benchmark_model_key = choose_backend_benchmark_model_key()
+            report_progress(f"модель для теста: {benchmark_model_key}")
             profile = run_backend_benchmark(
-                model_key=self._selected_model_key(),
+                model_key=benchmark_model_key,
                 allow_missing_models=True,
+                preferred_backend_key=self._selected_backend_preference(),
+                cancel_event=self.benchmark_cancel_event,
+                quick=True,
                 print_fn=report_progress,
             )
-            if not any(profile.get("results", {}).get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS):
+            if profile.get("compat_suggested"):
+                self.ui_queue.put(("backend_benchmark_compat_suggested", profile))
+                return
+            if (
+                not profile.get("compat_auto_selected")
+                and not any(profile.get("results", {}).get(backend_name, {}).get("ok") for backend_name in WHISPER_BACKENDS)
+            ):
                 raise RuntimeError("No local whisper.cpp backends completed the benchmark.")
             self.ui_queue.put(("backend_benchmark_result", profile))
+        except RecognitionCancelled:
+            self.ui_queue.put(("benchmark_cancelled", None))
         except Exception as exc:
             self.ui_queue.put(("benchmark_error", self._format_problem_message(
                 "Не удалось выполнить бенчмарк backend.",
@@ -3604,6 +4644,49 @@ class DictaApp:
         finally:
             self.ui_queue.put(("benchmark_ready", None))
 
+    def cancel_benchmark(self) -> None:
+        if not self.is_benchmarking:
+            return
+        self.benchmark_cancel_event.set()
+        self._set_status("Прерывание теста")
+        self.speed_status_var.set("Тест прерывается...")
+        self.benchmark_button.configure(text="Прерывание...", state=tk.DISABLED)
+        self.backend_benchmark_button.configure(text="Прерывание...", state=tk.DISABLED)
+
+    def refresh_system_output_devices(self, show_status: bool = True) -> None:
+        previous_device_id = self._selected_system_output_device_id()
+        saved_device_id = sanitize_system_output_device_id(
+            self.settings.get("system_output_device_id", DEFAULT_SYSTEM_OUTPUT_DEVICE_ID)
+        )
+        if not show_status and previous_device_id == DEFAULT_SYSTEM_OUTPUT_DEVICE_ID:
+            previous_device_id = saved_device_id
+
+        try:
+            devices = collect_wasapi_output_devices()
+        except Exception as exc:
+            self.system_output_devices = {
+                DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL: DEFAULT_SYSTEM_OUTPUT_DEVICE_ID
+            }
+            self.system_output_device_info_by_id = {}
+            self.system_output_device_box.configure(values=[DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL])
+            self.system_output_device_var.set(DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL)
+            self._update_audio_source_controls_state()
+            if show_status:
+                self._set_status(f"Не удалось прочитать устройства вывода: {exc}")
+            return
+
+        labels, label_to_id, id_to_device = build_system_output_device_choices(devices)
+        self.system_output_devices = label_to_id
+        self.system_output_device_info_by_id = id_to_device
+        self.system_output_device_box.configure(values=labels)
+        self._select_system_output_device_id(previous_device_id)
+        self._update_audio_source_controls_state()
+        if show_status:
+            if devices:
+                self._set_status(f"Устройства вывода обновлены: {len(devices)}")
+            else:
+                self._set_status("Активные устройства вывода не найдены")
+
     def refresh_input_devices(self) -> None:
         previous_value = self.input_device_var.get()
 
@@ -3612,10 +4695,14 @@ class DictaApp:
         except Exception as exc:
             self.input_devices = {}
             self.input_device_var.set("")
-            self.input_device_box.configure(values=[], state=tk.DISABLED)
-            self.test_input_button.configure(state=tk.DISABLED)
-            self.find_input_button.configure(state=tk.DISABLED)
-            self._set_status("Не удалось прочитать микрофоны")
+            self.input_device_box.configure(values=[])
+            self._update_audio_source_controls_state()
+            if self._is_system_audio_source_selected():
+                self._set_record_button_idle()
+                self._set_status("Микрофоны не прочитаны; системный звук доступен")
+            else:
+                self._set_record_button_busy("Нет микрофона")
+                self._set_status("Не удалось прочитать микрофоны")
             return
 
         self.input_devices = input_devices
@@ -3625,11 +4712,14 @@ class DictaApp:
         self.input_device_box.configure(values=labels)
         if not labels:
             self.input_device_var.set("")
-            self.input_device_box.configure(state=tk.DISABLED)
-            self._set_record_button_busy("Нет микрофона")
-            self.test_input_button.configure(state=tk.DISABLED)
-            self.find_input_button.configure(state=tk.DISABLED)
-            self._set_status("Микрофоны не найдены")
+            self._update_audio_source_controls_state()
+            if self._is_system_audio_source_selected():
+                if not self._is_audio_source_busy():
+                    self._set_record_button_idle()
+                self._set_status("Микрофоны не найдены; системный звук доступен")
+            else:
+                self._set_record_button_busy("Нет микрофона")
+                self._set_status("Микрофоны не найдены")
             return
 
         selected = None
@@ -3643,17 +4733,9 @@ class DictaApp:
 
         self.input_device_var.set(selected)
         self.input_device_box.configure(state="readonly")
-        if not (
-            self.is_recording
-            or self.is_recognizing
-            or self.is_testing_microphone
-            or self.is_finding_microphone
-            or self.is_benchmarking
-            or self.is_translating
-        ):
+        if not self._is_audio_source_busy():
             self._set_record_button_idle()
-        self.test_input_button.configure(state=tk.NORMAL)
-        self.find_input_button.configure(state=tk.NORMAL)
+        self._update_audio_source_controls_state()
 
     def _clean_input_device_name(self, name: str) -> str:
         return clean_input_device_name(name)
@@ -3680,8 +4762,94 @@ class DictaApp:
     def _input_device_default_sample_rate(self, device_index: int) -> int:
         return input_device_default_sample_rate(device_index)
 
+    def start_system_audio_test(self) -> None:
+        if self._is_audio_source_busy():
+            return
+        if not self._is_system_audio_source_selected():
+            self._set_status("Выберите источник: системный звук встречи")
+            return
+
+        self.is_testing_system_audio = True
+        self.last_input_stream_config = None
+        self.microphone_search_progress_var.set(0)
+        self.microphone_search_status_var.set("Системный звук: проверка...")
+        self._set_input_level(0)
+        self._set_status("Проверка системного звука: включите звук встречи")
+        self._set_record_button_busy("Проверка")
+        self.stop_button.configure(state=tk.DISABLED)
+        self.model_box.configure(state=tk.DISABLED)
+        self.benchmark_button.configure(state=tk.DISABLED)
+        self.backend_box.configure(state=tk.DISABLED)
+        self.backend_benchmark_button.configure(state=tk.DISABLED)
+        self._update_audio_source_controls_state()
+        device_id = self._selected_system_output_device_id()
+        threading.Thread(target=self._system_audio_test_worker, args=(device_id,), daemon=True).start()
+
+    def _system_audio_test_worker(self, device_id: str) -> None:
+        try:
+            result = measure_wasapi_loopback_level(device_id, seconds=SYSTEM_AUDIO_TEST_SECONDS)
+            self.ui_queue.put(("system_audio_test_result", result))
+        except Exception as exc:
+            self.ui_queue.put(("system_audio_test_error", self._format_system_audio_error(
+                "Не удалось проверить системный звук.",
+                exc,
+            )))
+        finally:
+            self.ui_queue.put(("system_audio_test_ready", None))
+
+    def finish_system_audio_test(self) -> None:
+        if not self.is_testing_system_audio:
+            return
+
+        self.is_testing_system_audio = False
+        self._set_record_button_idle()
+        self.stop_button.configure(state=tk.DISABLED)
+        self.model_box.configure(state="readonly")
+        self.benchmark_button.configure(state=tk.NORMAL)
+        self.backend_box.configure(state="readonly")
+        self.backend_benchmark_button.configure(state=tk.NORMAL)
+        self._update_audio_source_controls_state()
+        self.microphone_search_progress_var.set(0)
+
+    def _handle_system_audio_test_result(self, result: dict) -> None:
+        peak = int(result.get("peak", 0))
+        self.last_input_stream_config = result.get("config") if isinstance(result.get("config"), dict) else None
+        self.input_level_var.set(peak)
+        self.input_level_text_var.set(f"Пик: {peak}%")
+        config_text = input_stream_config_text(self.last_input_stream_config)
+        callback_count = int(result.get("callback_count", 0) or 0)
+        byte_count = int(result.get("bytes", 0) or 0)
+
+        if result.get("ok"):
+            self._set_status(f"Системный звук работает, пик {peak}%")
+            self.microphone_search_status_var.set(f"Системный звук: пик {peak}%")
+            return
+
+        self._set_status("Системный звук открыт, но сигнал не найден")
+        self.microphone_search_status_var.set("Системный звук: тишина")
+        messagebox.showwarning(
+            "Dicta",
+            self._format_problem_message(
+                "Dicta открыла выбранное устройство вывода, но не увидела заметного звука.",
+                [
+                    "Включите воспроизведение встречи, видео или другого источника звука.",
+                    "Проверьте, что звук слышен именно в выбранных колонках или наушниках.",
+                    "Если звук идет в другое устройство, выберите его в строке Устройство вывода.",
+                    "Проверьте громкость Teams, Zoom, браузера или другой программы встречи.",
+                ],
+                details=(
+                    f"Открытый режим: {config_text}\n"
+                    f"Callback count: {callback_count}\n"
+                    f"Bytes: {byte_count}"
+                ),
+            ),
+        )
+
     def start_microphone_test(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
+        if self._is_audio_source_busy():
+            return
+        if self._is_system_audio_source_selected():
+            self._set_status("Выбран системный звук; проверка микрофона не нужна")
             return
 
         self.mic_test_peak = 0
@@ -3768,10 +4936,7 @@ class DictaApp:
         self.benchmark_button.configure(state=tk.NORMAL)
         self.backend_box.configure(state="readonly")
         self.backend_benchmark_button.configure(state=tk.NORMAL)
-        self.input_device_box.configure(state="readonly")
-        self.refresh_input_button.configure(state=tk.NORMAL)
-        self.test_input_button.configure(state=tk.NORMAL)
-        self.find_input_button.configure(state=tk.NORMAL)
+        self._update_audio_source_controls_state()
         self.microphone_search_progress_var.set(0)
 
     def _handle_microphone_test_result(self, label: str, result: dict) -> None:
@@ -3834,7 +4999,10 @@ class DictaApp:
         )
 
     def start_microphone_search(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
+        if self._is_audio_source_busy():
+            return
+        if self._is_system_audio_source_selected():
+            self._set_status("Выбран системный звук; поиск микрофона не нужен")
             return
 
         self.refresh_input_devices()
@@ -3908,23 +5076,28 @@ class DictaApp:
         return "\n".join(lines)
 
     def start_recording(self) -> None:
-        if self.is_recording or self.is_recognizing or self.is_testing_microphone or self.is_finding_microphone or self.is_benchmarking or self.is_translating:
+        if self._is_audio_source_busy():
             return
 
         self.audio_chunks = []
-        self.recognition_time_var.set("Распознавание: -")
+        self.recognition_time_var.set("-")
+        self._reset_recognition_progress()
         self.last_input_stream_config = None
+        self.last_recording_source_key = self._selected_audio_source_key()
         self._clear_last_recognition_audio()
         self._set_input_level(0)
 
         try:
-            self.stream = self._open_input_stream(self._selected_input_device_indexes())
+            self.stream = self._open_recording_stream()
         except Exception as exc:
             self.stream = None
-            self._set_status("Ошибка микрофона")
+            source_is_system = self._is_system_audio_source_selected()
+            self._set_status("Ошибка системного звука" if source_is_system else "Ошибка микрофона")
             messagebox.showerror(
                 "Dicta",
-                self._format_microphone_error(
+                self._format_system_audio_error("Не удалось начать запись системного звука.", exc)
+                if source_is_system
+                else self._format_microphone_error(
                     "Не удалось начать запись.",
                     exc,
                     include_diagnostics=True,
@@ -3934,17 +5107,26 @@ class DictaApp:
 
         self.is_recording = True
         self.record_started_at = time.perf_counter()
-        self._set_status("Запись")
+        self._set_status("Запись системного звука" if self.last_recording_source_key == "system" else "Запись")
         self._set_record_button_recording()
         self.stop_button.configure(state=tk.NORMAL)
         self.model_box.configure(state=tk.DISABLED)
         self.benchmark_button.configure(state=tk.DISABLED)
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
-        self.input_device_box.configure(state=tk.DISABLED)
-        self.refresh_input_button.configure(state=tk.DISABLED)
-        self.test_input_button.configure(state=tk.DISABLED)
-        self.find_input_button.configure(state=tk.DISABLED)
+        self._update_audio_source_controls_state()
+
+    def _open_recording_stream(self):
+        if self._is_system_audio_source_selected():
+            stream, config = open_wasapi_loopback_stream(
+                self._audio_callback,
+                start=True,
+                device_id=self._selected_system_output_device_id(),
+            )
+            self.record_sample_rate = int(config.get("sample_rate", SAMPLE_RATE))
+            self.last_input_stream_config = config
+            return stream
+        return self._open_input_stream(self._selected_input_device_indexes())
 
     def _open_input_stream(self, device_indexes: list[int], callback=None) -> sd.RawInputStream:
         stream_callback = callback or self._audio_callback
@@ -3983,19 +5165,26 @@ class DictaApp:
             self.benchmark_button.configure(state=tk.NORMAL)
             self.backend_box.configure(state="readonly")
             self.backend_benchmark_button.configure(state=tk.NORMAL)
-            self.input_device_box.configure(state="readonly")
-            self.refresh_input_button.configure(state=tk.NORMAL)
-            self.test_input_button.configure(state=tk.NORMAL)
-            self.find_input_button.configure(state=tk.NORMAL)
+            self._update_audio_source_controls_state()
+            if self.last_recording_source_key == "system":
+                summary = "Запись пустая: Dicta не получила системный звук."
+                steps = [
+                    "Проверьте, что звук встречи слышен в колонках или наушниках.",
+                    "Проверьте, что нужные колонки или наушники выбраны в Windows как устройство вывода по умолчанию.",
+                    "Проверьте громкость Teams, Zoom, браузера или другой программы встречи.",
+                ]
+            else:
+                summary = "Запись пустая: Dicta не получил аудиоданные от микрофона."
+                steps = [
+                    "Нажмите Проверить и скажите несколько слов.",
+                    "Если индикатор уровня не двигается, нажмите Найти микрофон или выберите другой микрофон.",
+                    "Если проблема повторяется, запустите scripts\\diagnose_dicta.cmd.",
+                ]
             messagebox.showwarning(
                 "Dicta",
                 self._format_problem_message(
-                    "Запись пустая: Dicta не получил аудиоданные от микрофона.",
-                    [
-                        "Нажмите Проверить и скажите несколько слов.",
-                        "Если индикатор уровня не двигается, нажмите Найти микрофон или выберите другой микрофон.",
-                        "Если проблема повторяется, запустите scripts\\diagnose_dicta.cmd.",
-                    ],
+                    summary,
+                    steps,
                     details=f"Открытый режим: {input_stream_config_text(self.last_input_stream_config)}",
                 ),
             )
@@ -4003,6 +5192,7 @@ class DictaApp:
 
         self.is_recognizing = True
         self.recognition_cancel_event.clear()
+        self._start_recognition_progress()
         self._set_status("Распознавание")
         self._set_record_button_recognizing()
         self.worker = threading.Thread(target=self._recognize_audio, daemon=True)
@@ -4063,6 +5253,8 @@ class DictaApp:
             "auto_copy": self.auto_copy_var.get(),
             "format_text": self.format_text_var.get(),
             "voice_punctuation": self.voice_punctuation_var.get(),
+            "audio_source": self._selected_audio_source_key(),
+            "system_output_device_id": self._selected_system_output_device_id(),
             "recognition_mode": self._selected_recognition_mode_key(),
             "audio_gain_percent": clamp_audio_gain_percent(self.audio_gain_percent_var.get()),
             "backend": self._selected_backend_key(),
@@ -4081,6 +5273,8 @@ class DictaApp:
     def _capture_settings_state(self) -> dict[str, object]:
         return {
             "input_device": self.input_device_var.get(),
+            "audio_source": self._selected_audio_source_key(),
+            "system_output_device_id": self._selected_system_output_device_id(),
             "model": self.model_var.get(),
             "backend": self.backend_var.get(),
             "recognition_mode": self._selected_recognition_mode_key(),
@@ -4094,6 +5288,10 @@ class DictaApp:
         input_device = str(state.get("input_device", ""))
         if input_device in self.input_devices:
             self.input_device_var.set(input_device)
+        self._select_audio_source_key(state.get("audio_source", DEFAULT_USER_SETTINGS["audio_source"]))
+        self._select_system_output_device_id(
+            state.get("system_output_device_id", DEFAULT_USER_SETTINGS["system_output_device_id"])
+        )
         model_key = MODEL_KEY_BY_LABEL.get(str(state.get("model", DEFAULT_MODEL_LABEL)), FALLBACK_AUTO_MODEL_KEY)
         self._select_model_key(model_key)
         self.backend_var.set(str(state.get("backend", DEFAULT_BACKEND_LABEL)))
@@ -4105,6 +5303,7 @@ class DictaApp:
             clamp_audio_gain_percent(state.get("audio_gain_percent", DEFAULT_USER_SETTINGS["audio_gain_percent"]))
         )
         self._on_audio_gain_changed()
+        self._update_audio_source_controls_state()
         self._update_speed_status()
 
     def save_settings_changes(self) -> None:
@@ -4183,6 +5382,7 @@ class DictaApp:
             or self.is_recognizing
             or self.is_testing_microphone
             or self.is_finding_microphone
+            or self.is_testing_system_audio
             or self.is_benchmarking
             or self.is_translating
         ):
@@ -4233,6 +5433,7 @@ class DictaApp:
             or self.is_recognizing
             or self.is_testing_microphone
             or self.is_finding_microphone
+            or self.is_testing_system_audio
             or self.is_benchmarking
             or self.is_translating
         ):
@@ -4805,6 +6006,71 @@ class DictaApp:
         self.input_level_var.set(value)
         self.input_level_text_var.set(f"Уровень: {value}%")
 
+    def _set_recognition_progress(self, value: object) -> None:
+        try:
+            percent = int(round(float(value)))
+        except Exception:
+            percent = 0
+        percent = max(0, min(100, percent))
+        self.recognition_progress_var.set(percent)
+        self.recognition_progress_text_var.set(f"{percent}%")
+
+    def _reset_recognition_progress(self) -> None:
+        self.recognition_progress_has_real_update = False
+        self._set_recognition_progress(0)
+
+    def _recognition_progress_estimate(self) -> float:
+        try:
+            audio_seconds = sum(len(chunk) for chunk in self.audio_chunks) / (
+                max(1, int(self.record_sample_rate or SAMPLE_RATE)) * SAMPLE_WIDTH_BYTES
+            )
+        except Exception:
+            audio_seconds = 10.0
+
+        model_factor = {
+            "small-q5_1": 0.8,
+            "small": 1.0,
+            "medium-q5_0": 1.8,
+            "medium": 2.4,
+            "large-v3-turbo-q5_0": 2.8,
+            "large-v3-turbo": 3.4,
+        }.get(self._selected_model_key(), 1.0)
+        backend_key = self._selected_backend_preference()
+        if backend_key == "auto":
+            backend_key = self._preferred_backend_name()
+        backend_factor = {
+            "vulkan": 0.7,
+            "cuda": 0.7,
+            "openvino": 0.9,
+            "avx2": 1.0,
+            "sse42": 1.7,
+            "compat": 3.0,
+        }.get(backend_key, 1.5)
+        return max(60.0, min(300.0, 15.0 + audio_seconds * model_factor * backend_factor * 3.0))
+
+    def _start_recognition_progress(self) -> None:
+        self.recognition_progress_started_at = time.perf_counter()
+        self.recognition_progress_estimate_seconds = self._recognition_progress_estimate()
+        self.recognition_progress_has_real_update = False
+        self._set_recognition_progress(0)
+        self.root.after(300, self._tick_recognition_progress)
+
+    def _tick_recognition_progress(self) -> None:
+        if not self.is_recognizing:
+            return
+        if self.recognition_progress_has_real_update:
+            self.root.after(500, self._tick_recognition_progress)
+            return
+        elapsed = max(0.0, time.perf_counter() - self.recognition_progress_started_at)
+        estimate = max(1.0, self.recognition_progress_estimate_seconds)
+        estimated_percent = int(
+            round(RECOGNITION_FALLBACK_PROGRESS_MAX * (1.0 - math.exp(-elapsed / estimate)))
+        )
+        estimated_percent = min(RECOGNITION_FALLBACK_PROGRESS_MAX, estimated_percent)
+        if estimated_percent > int(self.recognition_progress_var.get()):
+            self._set_recognition_progress(estimated_percent)
+        self.root.after(500, self._tick_recognition_progress)
+
     def _selected_model_path(self) -> Path:
         return MODEL_FILES.get(self._selected_model_key(), MODEL_OPTIONS[DEFAULT_MODEL_LABEL])
 
@@ -4853,6 +6119,9 @@ class DictaApp:
             if txt_path.exists():
                 txt_path.unlink()
 
+            def report_recognition_progress(percent: int) -> None:
+                self.ui_queue.put(("recognition_progress", ("real", percent)))
+
             backend_name, backend_threads, completed = run_whisper_with_fallback(
                 selected_model,
                 wav_path,
@@ -4862,6 +6131,7 @@ class DictaApp:
                 translate_to_english=False,
                 cancel_event=self.recognition_cancel_event,
                 process_callback=self._set_recognition_process,
+                progress_callback=report_recognition_progress,
             )
             if self.recognition_cancel_event.is_set():
                 raise RecognitionCancelled()
@@ -4910,6 +6180,19 @@ class DictaApp:
                 self._set_status(str(value))
             elif event == "input_level":
                 self._set_input_level(int(value))
+            elif event == "recognition_progress":
+                is_real_progress = False
+                progress_value = value
+                if isinstance(value, tuple) and len(value) >= 2:
+                    is_real_progress = value[0] == "real"
+                    progress_value = value[1]
+                try:
+                    progress_int = int(progress_value)
+                except Exception:
+                    progress_int = 0
+                if is_real_progress:
+                    self.recognition_progress_has_real_update = True
+                self._set_recognition_progress(max(progress_int, int(self.recognition_progress_var.get())))
             elif event == "microphone_test_progress":
                 checked, total, config, peak = value
                 total = max(1, int(total))
@@ -4929,6 +6212,16 @@ class DictaApp:
                 messagebox.showerror("Dicta", str(value))
             elif event == "microphone_test_ready":
                 self.finish_microphone_test()
+            elif event == "system_audio_test_result":
+                self.finish_system_audio_test()
+                self._handle_system_audio_test_result(value if isinstance(value, dict) else {})
+            elif event == "system_audio_test_error":
+                self.finish_system_audio_test()
+                self._set_status("Ошибка системного звука")
+                self.microphone_search_status_var.set("Системный звук: ошибка")
+                messagebox.showerror("Dicta", str(value))
+            elif event == "system_audio_test_ready":
+                self.finish_system_audio_test()
             elif event == "microphone_search_progress":
                 checked, total, label, peak = value
                 total = max(1, int(total))
@@ -4995,16 +6288,14 @@ class DictaApp:
                 self.benchmark_button.configure(state=tk.NORMAL)
                 self.backend_box.configure(state="readonly")
                 self.backend_benchmark_button.configure(state=tk.NORMAL)
-                self.input_device_box.configure(state="readonly" if self.input_devices else tk.DISABLED)
-                self.refresh_input_button.configure(state=tk.NORMAL)
-                self.test_input_button.configure(state=tk.NORMAL if self.input_devices else tk.DISABLED)
-                self.find_input_button.configure(state=tk.NORMAL if self.input_devices else tk.DISABLED)
+                self._update_audio_source_controls_state()
             elif event == "hotkey":
                 self._handle_record_hotkey()
             elif event == "hotkey_status":
                 self.hotkey_status_var.set(str(value))
             elif event == "recognized":
                 recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key = value[:7]
+                self._set_recognition_progress(100)
                 self._set_text_spellcheck_language_from_mode(recognition_mode_key)
                 prepared = prepare_recognized_text(
                     str(recognized),
@@ -5031,7 +6322,7 @@ class DictaApp:
                     self._set_postprocess_undo(prepared_before_postprocess, prepared, postprocess_corrections)
                 else:
                     self._reset_postprocess_undo()
-                self.recognition_time_var.set(f"Распознавание: {elapsed:.1f} с")
+                self.recognition_time_var.set(f"{elapsed:.1f} с")
                 self._update_speed_status(
                     vad_stats=vad_stats,
                     audio_stats=audio_stats,
@@ -5114,11 +6405,13 @@ class DictaApp:
                 self.translation_worker = None
                 self._set_record_button_idle()
             elif event == "error":
+                self._reset_recognition_progress()
                 self._set_status("Ошибка распознавания")
                 messagebox.showerror("Dicta", str(value))
             elif event == "recognition_cancelled":
+                self._reset_recognition_progress()
                 self._set_status("Распознавание прервано")
-                self.recognition_time_var.set("Распознавание: -")
+                self.recognition_time_var.set("-")
             elif event == "ready":
                 self.is_recognizing = False
                 self.worker = None
@@ -5129,10 +6422,7 @@ class DictaApp:
                 self.benchmark_button.configure(state=tk.NORMAL)
                 self.backend_box.configure(state="readonly")
                 self.backend_benchmark_button.configure(state=tk.NORMAL)
-                self.input_device_box.configure(state="readonly")
-                self.refresh_input_button.configure(state=tk.NORMAL)
-                self.test_input_button.configure(state=tk.NORMAL)
-                self.find_input_button.configure(state=tk.NORMAL)
+                self._update_audio_source_controls_state()
             elif event == "benchmark_result":
                 profile = value
                 selected_model = profile.get("selected_model", FALLBACK_AUTO_MODEL_KEY)
@@ -5147,29 +6437,41 @@ class DictaApp:
                 profile = value
                 selected_backend = profile.get("selected_backend", FALLBACK_AUTO_BACKEND_KEY)
                 selected_threads = parse_positive_int(profile.get("selected_threads")) or choose_backend_threads(selected_backend)
-                self._select_backend_key("auto")
+                self._select_backend_key(selected_backend if selected_backend in BACKEND_LABELS else "auto")
                 self._save_current_settings()
                 self._update_speed_status()
-                self._set_status(f"Backend бенчмарк готов: выбран {selected_backend}, t={selected_threads}")
+                if profile.get("compat_auto_selected"):
+                    self._set_status(f"AVX2/SSE4.2 не работают; выбран Compat, t={selected_threads}")
+                else:
+                    benchmark_model = profile.get("model", choose_backend_benchmark_model_key())
+                    self._set_status(f"Движок выбран: {selected_backend}, t={selected_threads}; тест {benchmark_model}")
             elif event == "backend_benchmark_progress":
                 message = str(value)
-                self._set_status(f"Backend тест: {message}")
-                self.speed_status_var.set(f"Backend тест: {message}")
+                self._set_status(f"Подбор движка: {message}")
+                self.speed_status_var.set(f"Подбор движка: {message}")
+            elif event == "backend_benchmark_compat_suggested":
+                self._set_status("Подбор не завершился; Backend не изменен, Compat доступен вручную")
+                self._update_speed_status()
+            elif event == "benchmark_cancelled":
+                self._set_status("Тест прерван")
+                self.speed_status_var.set("Тест прерван")
             elif event == "benchmark_error":
                 self._set_status("Ошибка бенчмарка")
                 messagebox.showerror("Dicta", str(value))
             elif event == "benchmark_ready":
                 self.is_benchmarking = False
+                self.benchmark_cancel_event.clear()
                 self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
                 self.model_box.configure(state="readonly")
-                self.benchmark_button.configure(text="Бенчмарк модели", state=tk.NORMAL)
+                self.benchmark_button.configure(text="Бенчмарк модели", command=self.start_model_benchmark, state=tk.NORMAL)
                 self.backend_box.configure(state="readonly")
-                self.backend_benchmark_button.configure(text="Backend тест", state=tk.NORMAL)
-                self.input_device_box.configure(state="readonly")
-                self.refresh_input_button.configure(state=tk.NORMAL)
-                self.test_input_button.configure(state=tk.NORMAL)
-                self.find_input_button.configure(state=tk.NORMAL)
+                self.backend_benchmark_button.configure(
+                    text="Подобрать движок",
+                    command=self.start_backend_benchmark,
+                    state=tk.NORMAL,
+                )
+                self._update_audio_source_controls_state()
             elif event == "firewall_status":
                 if value is True:
                     self.firewall_status_var.set("Сеть: заблокирована")
@@ -5268,10 +6570,33 @@ class DictaApp:
             technical=self._shorten_technical_text(technical),
         )
 
+    def _format_system_audio_error(self, summary: str, exc: Exception) -> str:
+        technical = str(exc).strip()
+        return self._format_problem_message(
+            summary,
+            [
+                "Проверьте, что звук встречи слышен в колонках или наушниках.",
+                "Проверьте, что нужные колонки или наушники выбраны в Windows как устройство вывода по умолчанию.",
+                "Проверьте громкость Teams, Zoom, браузера или другой программы встречи.",
+                "Если звук идет в другое устройство, выберите его устройством вывода Windows по умолчанию и повторите запись.",
+            ],
+            details=f"Последний открытый режим: {input_stream_config_text(self.last_input_stream_config)}",
+            technical=self._shorten_technical_text(technical),
+        )
+
     def _format_recognition_error(self, exc: Exception) -> str:
         raw = str(exc).strip()
 
         if raw == "silent-or-short-recording":
+            if self.last_recording_source_key == "system":
+                return self._format_problem_message(
+                    "Запись слишком короткая или похожа на тишину системного звука.",
+                    [
+                        "Начните воспроизведение встречи или видео до остановки записи.",
+                        "Проверьте, что звук слышен в колонках или наушниках.",
+                        "Проверьте, что нужное устройство вывода выбрано в Windows по умолчанию.",
+                    ],
+                )
             return self._format_problem_message(
                 "Запись слишком короткая или похожа на тишину.",
                 [
