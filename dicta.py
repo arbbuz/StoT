@@ -3965,7 +3965,6 @@ class DictaApp:
         self.input_level_bar.grid(row=0, column=5, sticky="w", padx=(0, 18))
         ttk.Label(status_bar, textvariable=self.record_time_var).grid(row=0, column=6, sticky="w", padx=(0, 18))
         ttk.Label(status_bar, textvariable=self.recognition_time_var).grid(row=0, column=7, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.spellcheck_status_var).grid(row=0, column=8, sticky="w")
 
         self._build_settings_window()
         self._update_translation_button_state()
