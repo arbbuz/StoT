@@ -1,10 +1,28 @@
 # Dicta Codex Handoff
 
-Last updated: 2026-05-26
+Last updated: 2026-06-04
 
 Workspace: `C:\Users\Olga\Documents\VoiceHelper`
 
-Packaged app: `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`
+Packaged app for DictaProtocol manual checks: `C:\Users\Olga\Documents\VoiceHelper\dist\DictaProtocol\Dicta.exe`
+
+## Current DictaProtocol Handoff
+
+- Current branch: `DictaProtocol`, tracking `origin/DictaProtocol`.
+- Last pushed commit before the current uncommitted work: `71df883 Refine Dicta protocol audio and backend selection`.
+- Current uncommitted work is in `dicta.py`: stage 2 meeting protocol capture, toolbar source selector, and long-meeting streaming protocol changes.
+- Current packaged EXE for manual verification: `C:\Users\Olga\Documents\VoiceHelper\dist\DictaProtocol\Dicta.exe`.
+- Do not create additional folders under `dist`; keep using only existing `dist\DictaProtocol` for this branch unless the user explicitly asks otherwise.
+- Do not commit or push unless the user explicitly asks.
+
+## Long Command Visibility Rule
+
+- For build/package/self-test commands that may take more than 30 seconds, do not split the work into many tiny commands just to show activity.
+- Before the long command, send one short update with expected duration and the exact next step after it.
+- Run the command with a finite timeout.
+- Immediately after the command returns, send one short update with actual elapsed time and result before starting another long step.
+- Do not say that the process is normal/fine unless the command has returned successfully.
+- If the user interrupts during a perceived hang, first check live processes and report the exact process/build state.
 
 ## Current State
 

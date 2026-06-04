@@ -161,6 +161,7 @@ SPELLCHECK_AVAILABILITY_TESTS = (
 AUDIO_SOURCE_LABELS = {
     "microphone": "Микрофон",
     "system": "Системный звук встречи",
+    "combined": "Системный звук + микрофон",
 }
 AUDIO_SOURCE_KEY_BY_LABEL = {label: key for key, label in AUDIO_SOURCE_LABELS.items()}
 DEFAULT_AUDIO_SOURCE_KEY = "microphone"
@@ -173,6 +174,8 @@ INPUT_SAMPLE_RATE_FALLBACKS = (48000, 44100, 32000)
 INPUT_SAMPLE_DTYPES = ("int16", "float32", "int24", "int32")
 MICROPHONE_PROBE_SECONDS = 1.5
 SYSTEM_AUDIO_TEST_SECONDS = 1.5
+PROTOCOL_CHUNK_SECONDS = 60.0
+PROTOCOL_FINAL_CHUNK_MIN_SECONDS = 1.0
 MICROPHONE_WORKING_PEAK_PERCENT = 1
 SILENCE_WINDOW_MS = 30
 SILENCE_PADDING_MS = 250
@@ -692,6 +695,65 @@ def int32_pcm_to_pcm16_mono(audio: bytes, source_channels: int) -> bytes:
     return mono.tobytes()
 
 
+def pcm16_mono_to_array(audio: bytes) -> array:
+    usable_length = len(audio) - (len(audio) % SAMPLE_WIDTH_BYTES)
+    samples = array("h")
+    if usable_length <= 0:
+        return samples
+    samples.frombytes(audio[:usable_length])
+    return samples
+
+
+def resample_pcm16_mono(audio: bytes, source_rate: int, target_rate: int = SAMPLE_RATE) -> bytes:
+    source_rate = max(1, int(source_rate or target_rate))
+    target_rate = max(1, int(target_rate or source_rate))
+    samples = pcm16_mono_to_array(audio)
+    if not samples or source_rate == target_rate:
+        return samples.tobytes()
+
+    target_count = max(1, int(round(len(samples) * target_rate / source_rate)))
+    if target_count == 1:
+        return array("h", [int(samples[0])]).tobytes()
+
+    result = array("h")
+    scale = (len(samples) - 1) / (target_count - 1)
+    for index in range(target_count):
+        position = index * scale
+        left = int(position)
+        right = min(left + 1, len(samples) - 1)
+        fraction = position - left
+        value = int(round(int(samples[left]) * (1.0 - fraction) + int(samples[right]) * fraction))
+        result.append(max(-32768, min(32767, value)))
+    return result.tobytes()
+
+
+def mix_pcm16_mono(a: bytes, b: bytes) -> bytes:
+    first = pcm16_mono_to_array(a)
+    second = pcm16_mono_to_array(b)
+    sample_count = max(len(first), len(second))
+    if sample_count <= 0:
+        return b""
+
+    mixed = array("h")
+    for index in range(sample_count):
+        left = int(first[index]) if index < len(first) else 0
+        right = int(second[index]) if index < len(second) else 0
+        mixed.append(max(-32768, min(32767, left + right)))
+    return mixed.tobytes()
+
+
+def mix_recording_sources(
+    system_audio: bytes,
+    system_rate: int,
+    microphone_audio: bytes,
+    microphone_rate: int,
+    target_rate: int = SAMPLE_RATE,
+) -> bytes:
+    system_resampled = resample_pcm16_mono(system_audio, system_rate, target_rate)
+    microphone_resampled = resample_pcm16_mono(microphone_audio, microphone_rate, target_rate)
+    return mix_pcm16_mono(system_resampled, microphone_resampled)
+
+
 def wasapi_create_device_enumerator() -> IMMDeviceEnumerator:
     return CreateObject(
         GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}"),
@@ -979,6 +1041,25 @@ class WasapiLoopbackStream:
             comtypes.CoUninitialize()
 
 
+class CombinedRecordingStream:
+    def __init__(self, *streams) -> None:
+        self.streams = [stream for stream in streams if stream is not None]
+
+    def stop(self) -> None:
+        for stream in reversed(self.streams):
+            try:
+                stream.stop()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        for stream in reversed(self.streams):
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
 def open_wasapi_loopback_stream(
     callback,
     start: bool = False,
@@ -1119,6 +1200,11 @@ def audio_gain_status_text(audio_stats: dict | None) -> str | None:
 def input_stream_config_text(config: dict | None) -> str:
     if not config:
         return "режим неизвестен"
+    if config.get("source_type") == "combined":
+        return (
+            "Системный звук + микрофон, "
+            f"{config.get('sample_rate', SAMPLE_RATE)} Hz, PCM16"
+        )
     if config.get("source_type") == "system_loopback":
         source_channels = int(config.get("source_channels", CHANNELS))
         channel_text = "1 канал" if source_channels == 1 else f"{source_channels}->1 канал"
@@ -3634,7 +3720,11 @@ class DictaApp:
         self.root.minsize(720, 460)
 
         self.audio_chunks: list[bytes] = []
-        self.stream: sd.RawInputStream | None = None
+        self.system_audio_chunks: list[bytes] = []
+        self.microphone_audio_chunks: list[bytes] = []
+        self.system_audio_sample_rate = SAMPLE_RATE
+        self.microphone_audio_sample_rate = SAMPLE_RATE
+        self.stream = None
         self.worker: threading.Thread | None = None
         self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.is_recording = False
@@ -3644,6 +3734,7 @@ class DictaApp:
         self.is_testing_system_audio = False
         self.is_benchmarking = False
         self.is_translating = False
+        self.is_protocol_recognizing = False
         self.record_started_at: float | None = None
         self.record_sample_rate = SAMPLE_RATE
         self.recognition_progress_started_at = 0.0
@@ -3653,6 +3744,24 @@ class DictaApp:
         self.mic_test_stream: sd.RawInputStream | None = None
         self.mic_test_peak = 0
         self.last_level_event_at = 0.0
+        self.system_recording_peak = 0
+        self.microphone_recording_peak = 0
+        self.recording_lock = threading.Lock()
+        self.system_recording_wav = None
+        self.microphone_recording_wav = None
+        self.recording_temp_paths: list[Path] = []
+        self.protocol_prepare_queue: queue.Queue | None = None
+        self.protocol_recognition_queue: queue.Queue | None = None
+        self.protocol_prepare_thread: threading.Thread | None = None
+        self.protocol_recognition_thread: threading.Thread | None = None
+        self.protocol_system_chunk_parts: list[bytes] = []
+        self.protocol_microphone_chunk_parts: list[bytes] = []
+        self.protocol_system_chunk_bytes = 0
+        self.protocol_microphone_chunk_bytes = 0
+        self.protocol_chunk_index = 0
+        self.protocol_chunks_queued = 0
+        self.protocol_chunks_recognized = 0
+        self.protocol_text_started = False
         self.input_devices: dict[str, list[int]] = {}
         self.preferred_input_configs: dict[str, dict] = {}
         self.system_output_devices: dict[str, str] = {
@@ -3755,7 +3864,7 @@ class DictaApp:
 
         toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(6, weight=1)
+        toolbar.columnconfigure(5, weight=1)
 
         self.record_button = ttk.Button(toolbar, text="Записать", command=self.toggle_recording)
         self.record_button.grid(row=0, column=0, padx=(0, 8))
@@ -3765,25 +3874,17 @@ class DictaApp:
         self.copy_button = ttk.Button(toolbar, text="Скопировать", command=self.copy_text)
         self.copy_button.grid(row=0, column=1, padx=(0, 8))
 
-        self.translate_menu = tk.Menu(toolbar, tearoff=False)
+        self.more_menu = tk.Menu(toolbar, tearoff=False)
+        self.translate_menu = self.more_menu
         self.translate_to_ru_menu_index = 0
         self.translate_to_en_menu_index = 1
-        self.translate_menu.add_command(label="В русский", command=self.translate_current_text_to_russian)
-        self.translate_menu.add_command(label="В English", command=self.translate_last_recording_to_english)
-        self.translate_button = ttk.Menubutton(toolbar, text="Перевести", menu=self.translate_menu)
-        self.translate_button.grid(row=0, column=3, padx=(0, 8))
-
-        self.undo_translation_button = ttk.Button(
-            toolbar,
-            text="Вернуть",
-            command=self.undo_last_translation,
-            state=tk.DISABLED,
-        )
-        self.undo_translation_button.grid(row=0, column=4, padx=(0, 8))
-
-        self.more_menu = tk.Menu(toolbar, tearoff=False)
-        self.format_menu_index = 0
-        self.undo_postprocess_menu_index = 1
+        self.undo_translation_menu_index = 2
+        self.format_menu_index = 4
+        self.undo_postprocess_menu_index = 5
+        self.more_menu.add_command(label="Перевести в русский", command=self.translate_current_text_to_russian)
+        self.more_menu.add_command(label="Перевести в English", command=self.translate_last_recording_to_english)
+        self.more_menu.add_command(label="Вернуть перевод", command=self.undo_last_translation, state=tk.DISABLED)
+        self.more_menu.add_separator()
         self.more_menu.add_command(label="Автоформат", command=self.format_current_text)
         self.more_menu.add_command(label="Откатить автоисправления", command=self.undo_last_postprocess, state=tk.DISABLED)
         self.more_menu.add_separator()
@@ -3800,10 +3901,20 @@ class DictaApp:
         self.toolbar_recognition_mode_box.grid(row=0, column=2, padx=(0, 8))
         self.toolbar_recognition_mode_box.bind("<<ComboboxSelected>>", self._on_toolbar_recognition_mode_changed)
 
-        self.more_button.grid(row=0, column=5, padx=(0, 8))
+        self.toolbar_audio_source_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.audio_source_var,
+            values=list(AUDIO_SOURCE_LABELS.values()),
+            state="readonly",
+            width=27,
+        )
+        self.toolbar_audio_source_box.grid(row=0, column=3, padx=(0, 8))
+        self.toolbar_audio_source_box.bind("<<ComboboxSelected>>", self._on_audio_source_changed)
+
+        self.more_button.grid(row=0, column=4, padx=(0, 8))
 
         self.settings_button = ttk.Button(toolbar, text="Настройки", command=self.show_settings)
-        self.settings_button.grid(row=0, column=7, sticky="e")
+        self.settings_button.grid(row=0, column=6, sticky="e")
 
         text_frame = ttk.Frame(self.root, padding=(12, 6, 12, 6))
         text_frame.grid(row=1, column=0, sticky="nsew")
@@ -4342,10 +4453,20 @@ class DictaApp:
     def _is_system_audio_source_selected(self) -> bool:
         return self._selected_audio_source_key() == "system"
 
+    def _is_combined_audio_source_selected(self) -> bool:
+        return self._selected_audio_source_key() == "combined"
+
+    def _selected_source_uses_system_audio(self) -> bool:
+        return self._selected_audio_source_key() in {"system", "combined"}
+
+    def _selected_source_uses_microphone(self) -> bool:
+        return self._selected_audio_source_key() in {"microphone", "combined"}
+
     def _is_audio_source_busy(self) -> bool:
         return (
             self.is_recording
             or self.is_recognizing
+            or self.is_protocol_recognizing
             or self.is_testing_microphone
             or self.is_finding_microphone
             or self.is_testing_system_audio
@@ -4354,10 +4475,12 @@ class DictaApp:
         )
 
     def _on_audio_source_changed(self, event=None) -> None:
-        if self._is_system_audio_source_selected() and not self._is_audio_source_busy():
+        if self._selected_source_uses_system_audio() and not self._is_audio_source_busy():
             self.refresh_system_output_devices(show_status=False)
         self._update_audio_source_controls_state()
-        if self._is_system_audio_source_selected():
+        if self._is_combined_audio_source_selected():
+            self._set_status("Источник записи: системный звук и микрофон")
+        elif self._is_system_audio_source_selected():
             self._set_status("Источник записи: системный звук встречи")
         else:
             self._set_status("Источник записи: микрофон")
@@ -4381,11 +4504,12 @@ class DictaApp:
 
     def _update_audio_source_controls_state(self) -> None:
         busy = self._is_audio_source_busy()
-        source_box = getattr(self, "audio_source_box", None)
-        if source_box is not None:
-            source_box.configure(state=tk.DISABLED if busy else "readonly")
+        for source_box_name in ("audio_source_box", "toolbar_audio_source_box"):
+            source_box = getattr(self, source_box_name, None)
+            if source_box is not None:
+                source_box.configure(state=tk.DISABLED if busy else "readonly")
 
-        system_controls_available = self._is_system_audio_source_selected()
+        system_controls_available = self._selected_source_uses_system_audio()
         system_box_state = "readonly" if system_controls_available and not busy and self.system_output_devices else tk.DISABLED
         system_refresh_state = tk.NORMAL if system_controls_available and not busy else tk.DISABLED
         system_test_state = tk.NORMAL if system_controls_available and not busy and self.system_output_devices else tk.DISABLED
@@ -4398,7 +4522,7 @@ class DictaApp:
             if control is not None:
                 control.configure(state=state)
 
-        microphone_controls_available = bool(self.input_devices) and not self._is_system_audio_source_selected()
+        microphone_controls_available = bool(self.input_devices) and self._selected_source_uses_microphone()
         microphone_state = "readonly" if microphone_controls_available and not busy else tk.DISABLED
         microphone_button_state = tk.NORMAL if microphone_controls_available and not busy else tk.DISABLED
         for control_name, state in (
@@ -4477,6 +4601,7 @@ class DictaApp:
         busy = (
             self.is_recording
             or self.is_recognizing
+            or self.is_protocol_recognizing
             or self.is_testing_microphone
             or self.is_finding_microphone
             or self.is_testing_system_audio
@@ -4765,8 +4890,8 @@ class DictaApp:
     def start_system_audio_test(self) -> None:
         if self._is_audio_source_busy():
             return
-        if not self._is_system_audio_source_selected():
-            self._set_status("Выберите источник: системный звук встречи")
+        if not self._selected_source_uses_system_audio():
+            self._set_status("Выберите источник с системным звуком")
             return
 
         self.is_testing_system_audio = True
@@ -5080,23 +5205,39 @@ class DictaApp:
             return
 
         self.audio_chunks = []
+        self.system_audio_chunks = []
+        self.microphone_audio_chunks = []
+        self.system_audio_sample_rate = SAMPLE_RATE
+        self.microphone_audio_sample_rate = SAMPLE_RATE
+        self.system_recording_peak = 0
+        self.microphone_recording_peak = 0
         self.recognition_time_var.set("-")
         self._reset_recognition_progress()
         self.last_input_stream_config = None
         self.last_recording_source_key = self._selected_audio_source_key()
         self._clear_last_recognition_audio()
+        self.recognition_cancel_event.clear()
         self._set_input_level(0)
 
         try:
             self.stream = self._open_recording_stream()
         except Exception as exc:
             self.stream = None
-            source_is_system = self._is_system_audio_source_selected()
-            self._set_status("Ошибка системного звука" if source_is_system else "Ошибка микрофона")
+            source_key = self.last_recording_source_key
+            source_uses_system = source_key in {"system", "combined"}
+            source_uses_microphone = source_key in {"microphone", "combined"}
+            if source_key == "combined":
+                self._set_status("Ошибка записи встречи")
+            elif source_uses_system:
+                self._set_status("Ошибка системного звука")
+            else:
+                self._set_status("Ошибка микрофона")
             messagebox.showerror(
                 "Dicta",
                 self._format_system_audio_error("Не удалось начать запись системного звука.", exc)
-                if source_is_system
+                if source_uses_system and not source_uses_microphone
+                else self._format_combined_recording_error("Не удалось начать запись системного звука и микрофона.", exc)
+                if source_uses_system and source_uses_microphone
                 else self._format_microphone_error(
                     "Не удалось начать запись.",
                     exc,
@@ -5107,7 +5248,12 @@ class DictaApp:
 
         self.is_recording = True
         self.record_started_at = time.perf_counter()
-        self._set_status("Запись системного звука" if self.last_recording_source_key == "system" else "Запись")
+        if self.last_recording_source_key == "combined":
+            self._set_status("Запись системного звука и микрофона")
+        elif self.last_recording_source_key == "system":
+            self._set_status("Запись системного звука")
+        else:
+            self._set_status("Запись")
         self._set_record_button_recording()
         self.stop_button.configure(state=tk.NORMAL)
         self.model_box.configure(state=tk.DISABLED)
@@ -5117,6 +5263,8 @@ class DictaApp:
         self._update_audio_source_controls_state()
 
     def _open_recording_stream(self):
+        if self._is_combined_audio_source_selected():
+            return self._open_combined_recording_stream()
         if self._is_system_audio_source_selected():
             stream, config = open_wasapi_loopback_stream(
                 self._audio_callback,
@@ -5127,6 +5275,50 @@ class DictaApp:
             self.last_input_stream_config = config
             return stream
         return self._open_input_stream(self._selected_input_device_indexes())
+
+    def _open_combined_recording_stream(self) -> CombinedRecordingStream:
+        system_stream = None
+        microphone_stream = None
+        try:
+            self._start_protocol_streaming()
+            system_stream, system_config = open_wasapi_loopback_stream(
+                self._system_audio_callback,
+                start=True,
+                device_id=self._selected_system_output_device_id(),
+            )
+            self.system_audio_sample_rate = int(system_config.get("sample_rate", SAMPLE_RATE))
+            self._open_system_recording_file(self.system_audio_sample_rate)
+            self.last_input_stream_config = {
+                "source_type": "combined",
+                "sample_rate": SAMPLE_RATE,
+                "system": system_config,
+                "microphone": {},
+            }
+            microphone_stream = self._open_input_stream(
+                self._selected_input_device_indexes(),
+                callback=self._microphone_recording_callback,
+            )
+            microphone_config = self.last_input_stream_config or {}
+            self.microphone_audio_sample_rate = int(microphone_config.get("sample_rate", SAMPLE_RATE))
+            self._open_microphone_recording_file(self.microphone_audio_sample_rate)
+            self.record_sample_rate = SAMPLE_RATE
+            self.last_input_stream_config = {
+                "source_type": "combined",
+                "sample_rate": SAMPLE_RATE,
+                "system": system_config,
+                "microphone": microphone_config,
+            }
+            return CombinedRecordingStream(system_stream, microphone_stream)
+        except Exception:
+            for stream in (microphone_stream, system_stream):
+                if stream is not None:
+                    try:
+                        stream.stop()
+                        stream.close()
+                    except Exception:
+                        pass
+            self._cancel_protocol_streaming()
+            raise
 
     def _open_input_stream(self, device_indexes: list[int], callback=None) -> sd.RawInputStream:
         stream_callback = callback or self._audio_callback
@@ -5140,6 +5332,205 @@ class DictaApp:
         self.record_sample_rate = int(config.get("sample_rate", SAMPLE_RATE))
         self.last_input_stream_config = config
         return stream
+
+    def _open_recording_file(self, prefix: str, sample_rate: int):
+        fd, path_text = tempfile.mkstemp(prefix=prefix, suffix=".wav")
+        os.close(fd)
+        path = Path(path_text)
+        wav = wave.open(str(path), "wb")
+        wav.setnchannels(CHANNELS)
+        wav.setsampwidth(SAMPLE_WIDTH_BYTES)
+        wav.setframerate(max(1, int(sample_rate or SAMPLE_RATE)))
+        self.recording_temp_paths.append(path)
+        return wav
+
+    def _open_system_recording_file(self, sample_rate: int) -> None:
+        self.system_recording_wav = self._open_recording_file("dicta_system_", sample_rate)
+
+    def _open_microphone_recording_file(self, sample_rate: int) -> None:
+        self.microphone_recording_wav = self._open_recording_file("dicta_microphone_", sample_rate)
+
+    def _close_recording_files(self) -> None:
+        for attr_name in ("system_recording_wav", "microphone_recording_wav"):
+            wav = getattr(self, attr_name, None)
+            if wav is not None:
+                try:
+                    wav.close()
+                except Exception:
+                    pass
+                setattr(self, attr_name, None)
+
+    def _cleanup_recording_temp_files(self) -> None:
+        for path in self.recording_temp_paths:
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+        self.recording_temp_paths = []
+
+    def _start_protocol_streaming(self) -> None:
+        self._cancel_protocol_streaming(mark_cancelled=False)
+        self.protocol_prepare_queue = queue.Queue()
+        self.protocol_recognition_queue = queue.Queue()
+        self.protocol_system_chunk_parts = []
+        self.protocol_microphone_chunk_parts = []
+        self.protocol_system_chunk_bytes = 0
+        self.protocol_microphone_chunk_bytes = 0
+        self.protocol_chunk_index = 0
+        self.protocol_chunks_queued = 0
+        self.protocol_chunks_recognized = 0
+        self.protocol_text_started = False
+        self.recording_temp_paths = []
+        self.is_protocol_recognizing = True
+        self.protocol_prepare_thread = threading.Thread(target=self._protocol_prepare_worker, daemon=True)
+        self.protocol_recognition_thread = threading.Thread(target=self._protocol_recognition_worker, daemon=True)
+        self.protocol_prepare_thread.start()
+        self.protocol_recognition_thread.start()
+
+    def _cancel_protocol_streaming(self, mark_cancelled: bool = True) -> None:
+        if mark_cancelled:
+            self.recognition_cancel_event.set()
+        if self.protocol_prepare_queue is not None:
+            try:
+                self.protocol_prepare_queue.put(None)
+            except Exception:
+                pass
+        self._close_recording_files()
+        self._cleanup_recording_temp_files()
+        self.protocol_system_chunk_parts = []
+        self.protocol_microphone_chunk_parts = []
+        self.protocol_system_chunk_bytes = 0
+        self.protocol_microphone_chunk_bytes = 0
+        self.is_protocol_recognizing = False
+
+    def _protocol_chunk_seconds_locked(self) -> float:
+        system_seconds = self.protocol_system_chunk_bytes / (
+            max(1, int(self.system_audio_sample_rate or SAMPLE_RATE)) * SAMPLE_WIDTH_BYTES
+        )
+        microphone_seconds = self.protocol_microphone_chunk_bytes / (
+            max(1, int(self.microphone_audio_sample_rate or SAMPLE_RATE)) * SAMPLE_WIDTH_BYTES
+        )
+        return max(system_seconds, microphone_seconds)
+
+    def _take_protocol_chunk_locked(self, final: bool = False) -> dict | None:
+        duration = self._protocol_chunk_seconds_locked()
+        if duration <= 0:
+            return None
+        if final and duration < PROTOCOL_FINAL_CHUNK_MIN_SECONDS and self.protocol_chunks_queued > 0:
+            self.protocol_system_chunk_parts = []
+            self.protocol_microphone_chunk_parts = []
+            self.protocol_system_chunk_bytes = 0
+            self.protocol_microphone_chunk_bytes = 0
+            return None
+        if not final and duration < PROTOCOL_CHUNK_SECONDS:
+            return None
+
+        self.protocol_chunk_index += 1
+        chunk = {
+            "index": self.protocol_chunk_index,
+            "system_audio": b"".join(self.protocol_system_chunk_parts),
+            "system_rate": self.system_audio_sample_rate,
+            "microphone_audio": b"".join(self.protocol_microphone_chunk_parts),
+            "microphone_rate": self.microphone_audio_sample_rate,
+            "recognition_mode_key": self._selected_recognition_mode_key(),
+        }
+        self.protocol_system_chunk_parts = []
+        self.protocol_microphone_chunk_parts = []
+        self.protocol_system_chunk_bytes = 0
+        self.protocol_microphone_chunk_bytes = 0
+        self.protocol_chunks_queued += 1
+        return chunk
+
+    def _queue_protocol_chunk(self, chunk: dict | None) -> None:
+        if chunk is None or self.protocol_prepare_queue is None:
+            return
+        self.protocol_prepare_queue.put(chunk)
+
+    def _finish_combined_recording_streaming(self) -> bool:
+        final_chunk: dict | None = None
+        with self.recording_lock:
+            final_chunk = self._take_protocol_chunk_locked(final=True)
+        self._queue_protocol_chunk(final_chunk)
+        self._close_recording_files()
+        if self.protocol_prepare_queue is not None:
+            self.protocol_prepare_queue.put(None)
+        self.record_sample_rate = SAMPLE_RATE
+        return self.protocol_chunks_queued > 0
+
+    def _protocol_prepare_worker(self) -> None:
+        prepare_queue = self.protocol_prepare_queue
+        recognition_queue = self.protocol_recognition_queue
+        if prepare_queue is None or recognition_queue is None:
+            return
+
+        try:
+            while True:
+                item = prepare_queue.get()
+                if item is None:
+                    recognition_queue.put(None)
+                    return
+
+                try:
+                    mixed_audio = mix_recording_sources(
+                        bytes(item.get("system_audio", b"")),
+                        int(item.get("system_rate", SAMPLE_RATE)),
+                        bytes(item.get("microphone_audio", b"")),
+                        int(item.get("microphone_rate", SAMPLE_RATE)),
+                        SAMPLE_RATE,
+                    )
+                    if mixed_audio:
+                        recognition_queue.put(
+                            {
+                                "index": int(item.get("index", 0)),
+                                "audio": mixed_audio,
+                                "sample_rate": SAMPLE_RATE,
+                                "recognition_mode_key": item.get(
+                                    "recognition_mode_key",
+                                    self._selected_recognition_mode_key(),
+                                ),
+                            }
+                        )
+                except Exception as exc:
+                    self.ui_queue.put(("protocol_recognition_error", exc))
+        finally:
+            if recognition_queue is not None:
+                recognition_queue.put(None)
+
+    def _protocol_recognition_worker(self) -> None:
+        recognition_queue = self.protocol_recognition_queue
+        if recognition_queue is None:
+            return
+
+        cancelled = False
+        try:
+            while True:
+                item = recognition_queue.get()
+                if item is None:
+                    break
+                if self.recognition_cancel_event.is_set():
+                    cancelled = True
+                    break
+
+                try:
+                    result = self._recognize_pcm16_audio(
+                        bytes(item.get("audio", b"")),
+                        int(item.get("sample_rate", SAMPLE_RATE)),
+                        str(item.get("recognition_mode_key", self._selected_recognition_mode_key())),
+                    )
+                    if str(result.get("recognized", "")).strip():
+                        self.ui_queue.put(("protocol_chunk_recognized", (int(item.get("index", 0)), result)))
+                except RecognitionCancelled:
+                    cancelled = True
+                    break
+                except Exception as exc:
+                    if str(exc).strip() == "silent-or-short-recording":
+                        continue
+                    self.ui_queue.put(("protocol_recognition_error", exc))
+                    cancelled = True
+                    break
+        finally:
+            self.ui_queue.put(("protocol_recognition_done", {"cancelled": cancelled}))
 
     def stop_recording(self) -> None:
         if not self.is_recording:
@@ -5156,6 +5547,40 @@ class DictaApp:
         finally:
             self.stream = None
 
+        if self.last_recording_source_key == "combined":
+            has_protocol_chunks = self._finish_combined_recording_streaming()
+            if not has_protocol_chunks:
+                self.record_started_at = None
+                self.record_time_var.set("Запись: 00:00")
+                self.is_protocol_recognizing = False
+                self._set_status("Готово")
+                self._set_record_button_idle()
+                self.stop_button.configure(state=tk.DISABLED)
+                self.model_box.configure(state="readonly")
+                self.benchmark_button.configure(state=tk.NORMAL)
+                self.backend_box.configure(state="readonly")
+                self.backend_benchmark_button.configure(state=tk.NORMAL)
+                self._update_audio_source_controls_state()
+                messagebox.showwarning(
+                    "Dicta",
+                    self._format_problem_message(
+                        "Запись пустая: Dicta не получила системный звук и микрофон.",
+                        [
+                            "Проверьте, что звук встречи слышен в колонках или наушниках.",
+                            "Проверьте, что выбранный микрофон работает.",
+                            "Нажмите Проверить звук и Проверить микрофон в настройках записи.",
+                        ],
+                        details=f"Открытый режим: {input_stream_config_text(self.last_input_stream_config)}",
+                    ),
+                )
+                return
+
+            self.is_recognizing = True
+            self._start_recognition_progress()
+            self._set_status("Распознавание протокола")
+            self._set_record_button_recognizing()
+            return
+
         if not self.audio_chunks:
             self.record_started_at = None
             self.record_time_var.set("Запись: 00:00")
@@ -5166,7 +5591,14 @@ class DictaApp:
             self.backend_box.configure(state="readonly")
             self.backend_benchmark_button.configure(state=tk.NORMAL)
             self._update_audio_source_controls_state()
-            if self.last_recording_source_key == "system":
+            if self.last_recording_source_key == "combined":
+                summary = "Запись пустая: Dicta не получила системный звук и микрофон."
+                steps = [
+                    "Проверьте, что звук встречи слышен в колонках или наушниках.",
+                    "Проверьте, что выбранный микрофон работает.",
+                    "Нажмите Проверить звук и Проверить микрофон в настройках записи.",
+                ]
+            elif self.last_recording_source_key == "system":
                 summary = "Запись пустая: Dicta не получила системный звук."
                 steps = [
                     "Проверьте, что звук встречи слышен в колонках или наушниках.",
@@ -5199,7 +5631,7 @@ class DictaApp:
         self.worker.start()
 
     def cancel_recognition(self) -> None:
-        if not self.is_recognizing:
+        if not self.is_recognizing and not self.is_protocol_recognizing:
             return
 
         self.recognition_cancel_event.set()
@@ -5331,6 +5763,10 @@ class DictaApp:
         undo_button = getattr(self, "undo_translation_button", None)
         if undo_button is not None:
             undo_button.configure(state=state)
+        translate_menu = getattr(self, "translate_menu", None)
+        undo_index = getattr(self, "undo_translation_menu_index", None)
+        if translate_menu is not None and undo_index is not None:
+            translate_menu.entryconfigure(undo_index, state=state)
 
     def _is_translation_undo_available(self) -> bool:
         if self.translation_undo_snapshot is None or getattr(self, "text", None) is None:
@@ -5380,6 +5816,7 @@ class DictaApp:
         if (
             self.is_recording
             or self.is_recognizing
+            or self.is_protocol_recognizing
             or self.is_testing_microphone
             or self.is_finding_microphone
             or self.is_testing_system_audio
@@ -5431,6 +5868,7 @@ class DictaApp:
         if (
             self.is_recording
             or self.is_recognizing
+            or self.is_protocol_recognizing
             or self.is_testing_microphone
             or self.is_finding_microphone
             or self.is_testing_system_audio
@@ -5960,6 +6398,12 @@ class DictaApp:
     def on_close(self) -> None:
         self._stop_hotkey_listener()
         stop_argos_translation_worker()
+        self.recognition_cancel_event.set()
+        if self.protocol_prepare_queue is not None:
+            try:
+                self.protocol_prepare_queue.put(None)
+            except Exception:
+                pass
         if self.stream is not None:
             try:
                 self.stream.stop()
@@ -5974,6 +6418,8 @@ class DictaApp:
             except Exception:
                 pass
             self.mic_test_stream = None
+        self._close_recording_files()
+        self._cleanup_recording_temp_files()
         self.root.destroy()
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
@@ -5982,6 +6428,42 @@ class DictaApp:
         data = bytes(indata)
         self.audio_chunks.append(data)
         self._queue_input_level(data)
+
+    def _system_audio_callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            self.ui_queue.put(("status", f"Системный звук: {status}"))
+        data = bytes(indata)
+        chunk = None
+        with self.recording_lock:
+            if self.system_recording_wav is not None:
+                try:
+                    self.system_recording_wav.writeframes(data)
+                except Exception:
+                    pass
+            self.protocol_system_chunk_parts.append(data)
+            self.protocol_system_chunk_bytes += len(data)
+            chunk = self._take_protocol_chunk_locked(final=False)
+        self._queue_protocol_chunk(chunk)
+        self.system_recording_peak = self._audio_peak_percent(data)
+        self._queue_combined_input_level()
+
+    def _microphone_recording_callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            self.ui_queue.put(("status", f"Микрофон: {status}"))
+        data = bytes(indata)
+        chunk = None
+        with self.recording_lock:
+            if self.microphone_recording_wav is not None:
+                try:
+                    self.microphone_recording_wav.writeframes(data)
+                except Exception:
+                    pass
+            self.protocol_microphone_chunk_parts.append(data)
+            self.protocol_microphone_chunk_bytes += len(data)
+            chunk = self._take_protocol_chunk_locked(final=False)
+        self._queue_protocol_chunk(chunk)
+        self.microphone_recording_peak = self._audio_peak_percent(data)
+        self._queue_combined_input_level()
 
     def _microphone_test_callback(self, indata, frames, time_info, status) -> None:
         if status:
@@ -6001,10 +6483,23 @@ class DictaApp:
         self.last_level_event_at = now
         self.ui_queue.put(("input_level", self._audio_peak_percent(audio)))
 
+    def _queue_combined_input_level(self) -> None:
+        now = time.perf_counter()
+        if now - self.last_level_event_at < 0.08:
+            return
+        self.last_level_event_at = now
+        self.ui_queue.put(("combined_input_level", (self.system_recording_peak, self.microphone_recording_peak)))
+
     def _set_input_level(self, value: int) -> None:
         value = max(0, min(100, int(value)))
         self.input_level_var.set(value)
         self.input_level_text_var.set(f"Уровень: {value}%")
+
+    def _set_combined_input_level(self, system_value: int, microphone_value: int) -> None:
+        system_value = max(0, min(100, int(system_value)))
+        microphone_value = max(0, min(100, int(microphone_value)))
+        self.input_level_var.set(max(system_value, microphone_value))
+        self.input_level_text_var.set(f"Уровень: система {system_value}%, микрофон {microphone_value}%")
 
     def _set_recognition_progress(self, value: object) -> None:
         try:
@@ -6074,7 +6569,13 @@ class DictaApp:
     def _selected_model_path(self) -> Path:
         return MODEL_FILES.get(self._selected_model_key(), MODEL_OPTIONS[DEFAULT_MODEL_LABEL])
 
-    def _recognize_audio(self) -> None:
+    def _recognize_pcm16_audio(
+        self,
+        raw_audio: bytes,
+        sample_rate: int,
+        recognition_mode_key: str,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> dict:
         wav_path: Path | None = None
         out_base: Path | None = None
         txt_path: Path | None = None
@@ -6094,10 +6595,8 @@ class DictaApp:
             if not selected_model.exists():
                 raise RuntimeError(f"missing-model::{selected_model}")
 
-            recognition_mode_key = self._selected_recognition_mode_key()
             recognition_language = recognition_mode_language(recognition_mode_key)
-            sample_rate = self.record_sample_rate or SAMPLE_RATE
-            raw_audio = b"".join(self.audio_chunks)
+            sample_rate = int(sample_rate or SAMPLE_RATE)
             normalized_audio, audio_stats = apply_pcm16_gain(raw_audio, self.audio_gain_percent_var.get())
             audio_bytes, vad_stats = self._trim_silence(normalized_audio, sample_rate)
             audio_ms = len(audio_bytes) / (sample_rate * SAMPLE_WIDTH_BYTES) * 1000
@@ -6119,10 +6618,7 @@ class DictaApp:
             if txt_path.exists():
                 txt_path.unlink()
 
-            def report_recognition_progress(percent: int) -> None:
-                self.ui_queue.put(("recognition_progress", ("real", percent)))
-
-            backend_name, backend_threads, completed = run_whisper_with_fallback(
+            backend_name, backend_threads, _completed = run_whisper_with_fallback(
                 selected_model,
                 wav_path,
                 out_base,
@@ -6131,7 +6627,7 @@ class DictaApp:
                 translate_to_english=False,
                 cancel_event=self.recognition_cancel_event,
                 process_callback=self._set_recognition_process,
-                progress_callback=report_recognition_progress,
+                progress_callback=progress_callback,
             )
             if self.recognition_cancel_event.is_set():
                 raise RecognitionCancelled()
@@ -6142,6 +6638,55 @@ class DictaApp:
                 raise RuntimeError("missing-recognition-output")
 
             recognized = txt_path.read_text(encoding="utf-8").strip()
+            return {
+                "recognized": recognized,
+                "elapsed": elapsed,
+                "backend_name": backend_name,
+                "backend_threads": backend_threads,
+                "vad_stats": vad_stats,
+                "audio_stats": audio_stats,
+                "audio_bytes": audio_bytes,
+                "sample_rate": sample_rate,
+                "selected_model": selected_model,
+                "recognition_mode_key": recognition_mode_key,
+            }
+        finally:
+            self._set_recognition_process(None)
+            for path in (wav_path, txt_path):
+                if path and path.exists():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
+    def _recognize_audio(self) -> None:
+        started_at = time.perf_counter()
+
+        try:
+            if self.recognition_cancel_event.is_set():
+                raise RecognitionCancelled()
+
+            recognition_mode_key = self._selected_recognition_mode_key()
+            sample_rate = self.record_sample_rate or SAMPLE_RATE
+            raw_audio = b"".join(self.audio_chunks)
+
+            def report_recognition_progress(percent: int) -> None:
+                self.ui_queue.put(("recognition_progress", ("real", percent)))
+
+            result = self._recognize_pcm16_audio(
+                raw_audio,
+                sample_rate,
+                recognition_mode_key,
+                progress_callback=report_recognition_progress,
+            )
+            recognized = result["recognized"]
+            elapsed = float(result["elapsed"])
+            backend_name = str(result["backend_name"])
+            backend_threads = int(result["backend_threads"])
+            vad_stats = result["vad_stats"]
+            audio_stats = result["audio_stats"]
+            audio_bytes = result["audio_bytes"]
+            selected_model = result["selected_model"]
             self.last_recognition_audio_bytes = bytes(audio_bytes)
             self.last_recognition_sample_rate = sample_rate
             self.last_recognition_model_path = selected_model
@@ -6161,12 +6706,6 @@ class DictaApp:
         finally:
             self._set_recognition_process(None)
             self.audio_chunks = []
-            for path in (wav_path, txt_path):
-                if path and path.exists():
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
             self.ui_queue.put(("ready", None))
 
     def _process_ui_queue(self) -> None:
@@ -6180,6 +6719,9 @@ class DictaApp:
                 self._set_status(str(value))
             elif event == "input_level":
                 self._set_input_level(int(value))
+            elif event == "combined_input_level":
+                system_value, microphone_value = value
+                self._set_combined_input_level(int(system_value), int(microphone_value))
             elif event == "recognition_progress":
                 is_real_progress = False
                 progress_value = value
@@ -6343,6 +6885,78 @@ class DictaApp:
                 self._start_translation_warmup_after_recognition(str(recognition_mode_key))
                 self._schedule_spellcheck(delay_ms=100)
                 self._update_translation_button_state()
+            elif event == "protocol_chunk_recognized":
+                chunk_index, result = value
+                recognition_mode_key = str(result.get("recognition_mode_key", self._selected_recognition_mode_key()))
+                self._set_text_spellcheck_language_from_mode(recognition_mode_key)
+                prepared = prepare_recognized_text(
+                    str(result.get("recognized", "")),
+                    use_formatting=self.format_text_var.get(),
+                    use_voice_punctuation=self.voice_punctuation_var.get()
+                    and recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY,
+                )
+                if recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY:
+                    try:
+                        prepared = apply_ru_recognition_postprocess(prepared).text
+                    except Exception:
+                        pass
+                if prepared:
+                    if not self.protocol_text_started:
+                        self.text.delete("1.0", tk.END)
+                        self.protocol_text_started = True
+                        self.format_undo_snapshot = None
+                        self._set_format_action_label("Автоформат")
+                        self._reset_translation_undo()
+                        self._reset_postprocess_undo()
+                    current = self.text.get("1.0", "end-1c").strip()
+                    insert_text = prepared if not current else "\n\n" + prepared
+                    self.text.insert(tk.END, insert_text)
+                    self.last_recognition_text = self.text.get("1.0", "end-1c").strip()
+                    self.protocol_chunks_recognized += 1
+                    self.recognition_time_var.set(f"{float(result.get('elapsed', 0.0)):.1f} с")
+                    self._update_speed_status(
+                        vad_stats=result.get("vad_stats"),
+                        audio_stats=result.get("audio_stats"),
+                        backend_name=str(result.get("backend_name", "")),
+                        backend_threads=parse_positive_int(result.get("backend_threads")),
+                    )
+                    self._set_status(f"Протокол: фрагмент {int(chunk_index)} готов")
+                    self._schedule_spellcheck(delay_ms=250)
+                    self._update_translation_button_state()
+            elif event == "protocol_recognition_error":
+                self.recognition_cancel_event.set()
+                self._set_status("Ошибка распознавания протокола")
+                messagebox.showerror("Dicta", self._format_recognition_error(value))
+            elif event == "protocol_recognition_done":
+                if not self.is_protocol_recognizing and not self.is_recognizing:
+                    continue
+                cancelled = bool(value.get("cancelled")) if isinstance(value, dict) else False
+                self.is_recognizing = False
+                self.is_protocol_recognizing = False
+                self._set_recognition_process(None)
+                self._set_recognition_progress(0 if cancelled else 100)
+                self.record_started_at = None
+                self.record_time_var.set("Запись: 00:00")
+                self._set_record_button_idle()
+                self.stop_button.configure(state=tk.DISABLED)
+                self.model_box.configure(state="readonly")
+                self.benchmark_button.configure(state=tk.NORMAL)
+                self.backend_box.configure(state="readonly")
+                self.backend_benchmark_button.configure(state=tk.NORMAL)
+                self._update_audio_source_controls_state()
+                self._cleanup_recording_temp_files()
+                if cancelled:
+                    self._set_status("Распознавание протокола прервано")
+                    self.recognition_time_var.set("-")
+                else:
+                    text_value = self.text.get("1.0", "end-1c").strip()
+                    if self.auto_copy_var.get() and text_value:
+                        self._copy_value_to_clipboard(text_value)
+                        self._set_status("Протокол готов и скопирован")
+                    else:
+                        self._set_status("Протокол готов")
+                    self._start_translation_warmup_after_recognition(self._selected_recognition_mode_key())
+                    self._update_translation_button_state()
             elif event == "translation_to_ru_result":
                 source, translated, translation_elapsed = value
                 current = self.text.get("1.0", tk.END).strip()
@@ -6584,10 +7198,33 @@ class DictaApp:
             technical=self._shorten_technical_text(technical),
         )
 
+    def _format_combined_recording_error(self, summary: str, exc: Exception) -> str:
+        technical = str(exc).strip()
+        return self._format_problem_message(
+            summary,
+            [
+                "Проверьте, что звук встречи слышен в колонках или наушниках.",
+                "Проверьте, что выбранный микрофон работает.",
+                "Если звук встречи идет в другое устройство, выберите его в строке Устройство вывода.",
+                "Если микрофон занят другой программой, закройте эту программу или выберите другой микрофон.",
+            ],
+            details=f"Последний открытый режим: {input_stream_config_text(self.last_input_stream_config)}",
+            technical=self._shorten_technical_text(technical),
+        )
+
     def _format_recognition_error(self, exc: Exception) -> str:
         raw = str(exc).strip()
 
         if raw == "silent-or-short-recording":
+            if self.last_recording_source_key == "combined":
+                return self._format_problem_message(
+                    "Запись слишком короткая или похожа на тишину системного звука и микрофона.",
+                    [
+                        "Начните воспроизведение встречи или видео до остановки записи.",
+                        "Скажите несколько слов в выбранный микрофон.",
+                        "Проверьте уровни: система и микрофон должны двигаться во время записи.",
+                    ],
+                )
             if self.last_recording_source_key == "system":
                 return self._format_problem_message(
                     "Запись слишком короткая или похожа на тишину системного звука.",
