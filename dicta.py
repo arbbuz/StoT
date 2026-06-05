@@ -23,6 +23,13 @@ import comtypes
 from comtypes import COMMETHOD, GUID, HRESULT, IUnknown
 from comtypes.client import CreateObject
 import sounddevice as sd
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:
+    pystray = None
+    Image = None
+    ImageDraw = None
 
 from windows_spellcheck import SpellingIssue, add_word, check_text
 
@@ -176,6 +183,7 @@ MICROPHONE_PROBE_SECONDS = 1.5
 SYSTEM_AUDIO_TEST_SECONDS = 1.5
 PROTOCOL_CHUNK_SECONDS = 60.0
 PROTOCOL_FINAL_CHUNK_MIN_SECONDS = 1.0
+PROTOCOL_PARAGRAPH_MAX_WORDS = 70
 MICROPHONE_WORKING_PEAK_PERCENT = 1
 SILENCE_WINDOW_MS = 30
 SILENCE_PADDING_MS = 250
@@ -213,6 +221,13 @@ HOTKEY_MOD_NOREPEAT = 0x4000
 HOTKEY_VK_SPACE = 0x20
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+MINI_RECORDER_WIDTH = 360
+ERROR_ALREADY_EXISTS = 183
+SW_RESTORE = 9
+SINGLE_INSTANCE_MUTEX_NAME = "Local\\DictaSingleInstance"
+SINGLE_INSTANCE_INFO_PATH = Path(tempfile.gettempdir()) / "dicta_single_instance.json"
+SINGLE_INSTANCE_RESTORE_REQUEST_PATH = Path(tempfile.gettempdir()) / "dicta_restore_request.json"
+_SINGLE_INSTANCE_MUTEX_HANDLE = None
 DEFAULT_USER_SETTINGS = {
     "auto_copy": False,
     "format_text": True,
@@ -223,6 +238,7 @@ DEFAULT_USER_SETTINGS = {
     "backend": "auto",
     "model_key": FALLBACK_AUTO_MODEL_KEY,
     "audio_gain_percent": 0,
+    "mini_panel_position": None,
 }
 
 
@@ -2584,6 +2600,15 @@ def load_user_settings() -> dict:
                 settings["model_key"] = sanitize_model_key(
                     stored.get("model_key", DEFAULT_USER_SETTINGS["model_key"])
                 )
+                position = stored.get("mini_panel_position")
+                if isinstance(position, dict):
+                    try:
+                        x = int(position.get("x"))
+                        y = int(position.get("y"))
+                    except Exception:
+                        x = y = -1
+                    if x >= 0 and y >= 0:
+                        settings["mini_panel_position"] = {"x": x, "y": y}
     except Exception:
         return dict(DEFAULT_USER_SETTINGS)
     return settings
@@ -2606,7 +2631,17 @@ def save_user_settings(settings: dict) -> None:
         ),
         "backend": str(settings.get("backend", DEFAULT_USER_SETTINGS["backend"])),
         "model_key": sanitize_model_key(settings.get("model_key", DEFAULT_USER_SETTINGS["model_key"])),
+        "mini_panel_position": None,
     }
+    position = settings.get("mini_panel_position")
+    if isinstance(position, dict):
+        try:
+            x = int(position.get("x"))
+            y = int(position.get("y"))
+        except Exception:
+            x = y = -1
+        if x >= 0 and y >= 0:
+            payload["mini_panel_position"] = {"x": x, "y": y}
     if payload["backend"] not in BACKEND_LABELS:
         payload["backend"] = DEFAULT_USER_SETTINGS["backend"]
     USER_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2724,6 +2759,67 @@ def prepare_recognized_text(text: str, use_formatting: bool = True, use_voice_pu
     if use_formatting:
         result = format_recognized_text(result)
     return result
+
+
+def split_long_protocol_sentence(sentence: str, max_words: int = PROTOCOL_PARAGRAPH_MAX_WORDS) -> list[str]:
+    words = sentence.strip().split()
+    if len(words) <= max_words:
+        return [sentence.strip()] if sentence.strip() else []
+    chunks = []
+    for start in range(0, len(words), max_words):
+        chunk = " ".join(words[start : start + max_words]).strip()
+        if chunk:
+            chunks.append(ensure_final_period(chunk))
+    return chunks
+
+
+def protocol_text_paragraphs(text: str, max_words: int = PROTOCOL_PARAGRAPH_MAX_WORDS) -> list[str]:
+    normalized = normalize_punctuation_spacing(text)
+    if not normalized:
+        return []
+
+    sentences = [
+        match.group(0).strip()
+        for match in re.finditer(r'[^.!?…]+[.!?…]+["»“”]?|[^.!?…]+$', normalized)
+        if match.group(0).strip()
+    ]
+    if not sentences:
+        return split_long_protocol_sentence(normalized, max_words=max_words)
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    current_words = 0
+
+    for sentence in sentences:
+        sentence_words = len(sentence.split())
+        if sentence_words > max_words:
+            if current:
+                paragraphs.append(" ".join(current).strip())
+                current = []
+                current_words = 0
+            paragraphs.extend(split_long_protocol_sentence(sentence, max_words=max_words))
+            continue
+
+        if current and current_words + sentence_words > max_words:
+            paragraphs.append(" ".join(current).strip())
+            current = []
+            current_words = 0
+
+        current.append(sentence)
+        current_words += sentence_words
+
+    if current:
+        paragraphs.append(" ".join(current).strip())
+    return [paragraph for paragraph in paragraphs if paragraph]
+
+
+def format_protocol_chunk_text(chunk_index: object, text: str) -> str:
+    try:
+        index = max(1, int(chunk_index))
+    except (TypeError, ValueError):
+        index = 1
+    body = "\n\n".join(protocol_text_paragraphs(text))
+    return f"Фрагмент {index}\n{body}" if body else f"Фрагмент {index}"
 
 
 @dataclass(frozen=True)
@@ -3292,6 +3388,15 @@ def run_text_cleanup_self_test() -> None:
         if actual != expected:
             raise AssertionError(f"text cleanup failed: {source!r} -> {actual!r}, expected {expected!r}")
 
+    protocol_text = format_protocol_chunk_text(
+        2,
+        "Первое предложение. Второе предложение. " + " ".join(f"слово{i}" for i in range(75)) + ".",
+    )
+    if not protocol_text.startswith("Фрагмент 2\nПервое предложение. Второе предложение."):
+        raise AssertionError(f"protocol chunk header failed: {protocol_text!r}")
+    if "\n\n" not in protocol_text:
+        raise AssertionError(f"protocol chunk paragraphs failed: {protocol_text!r}")
+
 
 def available_model_keys() -> list[str]:
     return [model_key for model_key in MODEL_LABELS if MODEL_FILES[model_key].exists()]
@@ -3711,6 +3816,64 @@ def run_backend_benchmark(
     return profile
 
 
+def acquire_single_instance_mutex() -> bool:
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+    if os.name != "nt":
+        return True
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        if not handle:
+            return True
+        _SINGLE_INSTANCE_MUTEX_HANDLE = handle
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+            _SINGLE_INSTANCE_MUTEX_HANDLE = None
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def release_single_instance_mutex() -> None:
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+    handle = _SINGLE_INSTANCE_MUTEX_HANDLE
+    _SINGLE_INSTANCE_MUTEX_HANDLE = None
+    if os.name != "nt" or not handle:
+        return
+    try:
+        ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
+def request_existing_instance_restore() -> None:
+    try:
+        request = {
+            "requested_at": time.time(),
+            "source_pid": os.getpid(),
+        }
+        SINGLE_INSTANCE_RESTORE_REQUEST_PATH.write_text(json.dumps(request), encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        info = json.loads(SINGLE_INSTANCE_INFO_PATH.read_text(encoding="utf-8"))
+        hwnd = int(info.get("hwnd", 0))
+    except Exception:
+        hwnd = 0
+    if os.name == "nt" and hwnd:
+        try:
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+
 class DictaApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -3794,6 +3957,16 @@ class DictaApp:
         self.postprocess_undo_snapshot: tuple[str, str, tuple[RecognitionCorrection, ...]] | None = None
         self.translation_undo_snapshot: tuple[str, str, str, str] | None = None
         self.settings_snapshot: dict[str, object] = {}
+        self.is_closing = False
+        self.is_minimized_to_tray = False
+        self.tray_icon = None
+        self.tray_thread: threading.Thread | None = None
+        self.mini_panel: tk.Toplevel | None = None
+        self.mini_panel_drag_offset: tuple[int, int] | None = None
+        self.mini_panel_drag_start: tuple[int, int, int, int] | None = None
+        self.mini_panel_position = self._loaded_mini_panel_position()
+        self.main_window_restore_state = "normal"
+        self.restore_request_mtime = 0.0
 
         self.status_var = tk.StringVar(value="Готово")
         self.record_time_var = tk.StringVar(value="Запись: 00:00")
@@ -3818,6 +3991,9 @@ class DictaApp:
         self.system_output_device_var = tk.StringVar(value=DEFAULT_SYSTEM_OUTPUT_DEVICE_LABEL)
         self.input_level_var = tk.DoubleVar(value=0)
         self.input_level_text_var = tk.StringVar(value="Уровень: -")
+        self.mini_system_level_var = tk.DoubleVar(value=0)
+        self.mini_microphone_level_var = tk.DoubleVar(value=0)
+        self.mini_level_text_var = tk.StringVar(value="Сист. 0%   Микр. 0%")
         self.microphone_search_progress_var = tk.DoubleVar(value=0)
         self.microphone_search_status_var = tk.StringVar(value="Поиск: -")
         self.spellcheck_status_var = tk.StringVar(value="Орфография: авто")
@@ -3853,9 +4029,13 @@ class DictaApp:
         self.settings_snapshot = self._capture_settings_state()
         self._check_local_files()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<Unmap>", self._on_root_unmap, add="+")
+        self.root.bind("<Configure>", self._remember_main_window_state, add="+")
         self.root.after(100, self._process_ui_queue)
         self.root.after(250, self._update_record_timer)
+        self.root.after(500, self._poll_restore_request)
         self.root.after(500, self.refresh_firewall_status)
+        self._write_single_instance_info()
         self._start_hotkey_listener()
 
     def _build_ui(self) -> None:
@@ -3966,8 +4146,77 @@ class DictaApp:
         ttk.Label(status_bar, textvariable=self.record_time_var).grid(row=0, column=6, sticky="w", padx=(0, 18))
         ttk.Label(status_bar, textvariable=self.recognition_time_var).grid(row=0, column=7, sticky="w", padx=(0, 18))
 
+        self._build_mini_panel()
         self._build_settings_window()
         self._update_translation_button_state()
+
+    def _build_mini_panel(self) -> None:
+        panel = tk.Toplevel(self.root)
+        self.mini_panel = panel
+        panel.title("Dicta: запись")
+        panel.withdraw()
+        panel.resizable(False, False)
+        panel.overrideredirect(True)
+        panel.columnconfigure(0, weight=1)
+        try:
+            panel.attributes("-topmost", True)
+            panel.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+        if APP_ICON.exists():
+            try:
+                panel.iconbitmap(default=str(APP_ICON))
+            except Exception:
+                pass
+
+        frame = ttk.Frame(panel, padding=(10, 8, 10, 8))
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        time_label = ttk.Label(frame, textvariable=self.record_time_var, width=14)
+        time_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.mini_record_button = ttk.Button(frame, text="Записать", command=self._mini_toggle_recording, width=10)
+        self.mini_record_button.grid(row=0, column=2, sticky="e", padx=(10, 0), pady=(0, 6))
+
+        system_label = ttk.Label(frame, text="Сист.", width=6)
+        system_label.grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(0, 4))
+        system_level_bar = ttk.Progressbar(
+            frame,
+            variable=self.mini_system_level_var,
+            maximum=100,
+            mode="determinate",
+            length=220,
+        )
+        system_level_bar.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(0, 4))
+
+        microphone_label = ttk.Label(frame, text="Микр.", width=6)
+        microphone_label.grid(row=2, column=0, sticky="w", padx=(0, 6))
+        microphone_level_bar = ttk.Progressbar(
+            frame,
+            variable=self.mini_microphone_level_var,
+            maximum=100,
+            mode="determinate",
+            length=220,
+        )
+        microphone_level_bar.grid(row=2, column=1, columnspan=2, sticky="ew")
+
+        level_label = ttk.Label(frame, textvariable=self.mini_level_text_var)
+        level_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(5, 0))
+
+        for widget in (
+            panel,
+            frame,
+            time_label,
+            system_label,
+            system_level_bar,
+            microphone_label,
+            microphone_level_bar,
+            level_label,
+        ):
+            widget.bind("<ButtonPress-1>", self._start_mini_panel_drag)
+            widget.bind("<B1-Motion>", self._drag_mini_panel)
+            widget.bind("<Double-Button-1>", self._restore_from_mini_panel)
+        self._update_mini_record_button_state()
 
     def _build_settings_window(self) -> None:
         self.settings_window = tk.Toplevel(self.root)
@@ -4214,6 +4463,334 @@ class DictaApp:
     def hide_settings(self) -> None:
         self.settings_window.withdraw()
 
+    def _write_single_instance_info(self) -> None:
+        try:
+            self.root.update_idletasks()
+            info = {
+                "pid": os.getpid(),
+                "hwnd": int(self.root.winfo_id()),
+                "updated_at": time.time(),
+            }
+            SINGLE_INSTANCE_INFO_PATH.write_text(json.dumps(info), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _poll_restore_request(self) -> None:
+        if self.is_closing:
+            return
+        try:
+            mtime = SINGLE_INSTANCE_RESTORE_REQUEST_PATH.stat().st_mtime
+            if mtime > self.restore_request_mtime:
+                self.restore_request_mtime = mtime
+                self._show_main_window_from_tray()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        self.root.after(500, self._poll_restore_request)
+
+    def _remember_main_window_state(self, event=None) -> None:
+        if event is not None and event.widget is not self.root:
+            return
+        if self.is_closing or self.is_minimized_to_tray:
+            return
+        try:
+            state = self.root.state()
+        except tk.TclError:
+            return
+        if state in {"normal", "zoomed"}:
+            self.main_window_restore_state = state
+
+    def _on_root_unmap(self, event=None) -> None:
+        if event is not None and event.widget is not self.root:
+            return
+        if self.is_closing or self.is_minimized_to_tray:
+            return
+        self.root.after(50, self._hide_to_tray_if_iconified)
+
+    def _hide_to_tray_if_iconified(self) -> None:
+        if self.is_closing or self.is_minimized_to_tray:
+            return
+        try:
+            is_iconic = self.root.state() == "iconic"
+        except tk.TclError:
+            return
+        if is_iconic:
+            self._hide_main_window_to_tray()
+
+    def _hide_main_window_to_tray(self) -> None:
+        if not self._ensure_tray_icon():
+            try:
+                self.root.deiconify()
+                self.root.state("normal")
+            except tk.TclError:
+                pass
+            self._set_status("Лоток Windows недоступен")
+            return
+
+        self.is_minimized_to_tray = True
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            return
+        self._update_mini_panel_visibility()
+
+    def _show_main_window_from_tray(self) -> None:
+        if self.is_closing:
+            return
+        self.is_minimized_to_tray = False
+        self._hide_mini_panel()
+        try:
+            self.root.deiconify()
+            self.root.state("zoomed" if self.main_window_restore_state == "zoomed" else "normal")
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        self._stop_tray_icon()
+
+    def _tray_show_main(self, icon=None, item=None) -> None:
+        self.ui_queue.put(("tray_show", None))
+
+    def _tray_toggle_recording(self, icon=None, item=None) -> None:
+        self.ui_queue.put(("tray_toggle_recording", None))
+
+    def _tray_exit(self, icon=None, item=None) -> None:
+        self.ui_queue.put(("tray_exit", None))
+
+    def _ensure_tray_icon(self) -> bool:
+        if pystray is None or Image is None:
+            return False
+        if self.tray_icon is not None:
+            return True
+
+        image = self._create_tray_icon_image()
+        if image is None:
+            return False
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Открыть Dicta", self._tray_show_main, default=True),
+            pystray.MenuItem("Записать / Стоп", self._tray_toggle_recording),
+            pystray.MenuItem("Выход", self._tray_exit),
+        )
+        icon = pystray.Icon("Dicta", image, "Dicta", menu)
+        self.tray_icon = icon
+        self.tray_thread = threading.Thread(target=self._run_tray_icon, args=(icon,), daemon=True)
+        self.tray_thread.start()
+        return True
+
+    def _run_tray_icon(self, icon) -> None:
+        try:
+            icon.run()
+        except Exception as exc:
+            self.ui_queue.put(("tray_error", exc))
+        finally:
+            if self.tray_icon is icon:
+                self.tray_icon = None
+
+    def _handle_tray_error(self, exc: Exception) -> None:
+        if not self.is_closing:
+            self._set_status(f"Лоток Windows недоступен: {exc}")
+
+    def _stop_tray_icon(self) -> None:
+        icon = self.tray_icon
+        self.tray_icon = None
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
+    def _create_tray_icon_image(self):
+        if Image is None:
+            return None
+
+        source_paths = (APP_DIR / "assets" / "app_icon.png", APP_ICON)
+        for path in source_paths:
+            if not path.exists():
+                continue
+            try:
+                with Image.open(path) as image:
+                    image = image.convert("RGBA")
+                    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+                    return image.resize((64, 64), resampling)
+            except Exception:
+                continue
+
+        image = Image.new("RGBA", (64, 64), (37, 99, 235, 255))
+        if ImageDraw is not None:
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((10, 10, 54, 54), outline=(255, 255, 255, 255), width=3)
+            draw.text((23, 19), "D", fill=(255, 255, 255, 255))
+        return image
+
+    def _mini_toggle_recording(self) -> None:
+        if self.is_recording:
+            self.stop_recording()
+            return
+        if self.is_recognizing or self.is_protocol_recognizing:
+            self.cancel_recognition()
+            return
+        if not self._is_audio_source_busy():
+            self.start_recording()
+
+    def _update_mini_record_button_state(self) -> None:
+        button = getattr(self, "mini_record_button", None)
+        if button is None:
+            return
+        if self.is_recording:
+            button.configure(text="Стоп", command=self._mini_toggle_recording, state=tk.NORMAL)
+        elif self.is_recognizing or self.is_protocol_recognizing:
+            button.configure(text="Прервать", command=self._mini_toggle_recording, state=tk.NORMAL)
+        elif not self._is_audio_source_busy() and self.record_button.instate(["!disabled"]):
+            button.configure(text="Записать", command=self._mini_toggle_recording, state=tk.NORMAL)
+        else:
+            button.configure(text=self.record_button.cget("text"), command=self._mini_toggle_recording, state=tk.DISABLED)
+
+    def _restore_from_mini_panel(self, event=None) -> None:
+        self._finish_mini_panel_drag()
+        self._show_main_window_from_tray()
+
+    def _loaded_mini_panel_position(self) -> tuple[int, int] | None:
+        position = self.settings.get("mini_panel_position")
+        if not isinstance(position, dict):
+            return None
+        try:
+            x = int(position.get("x"))
+            y = int(position.get("y"))
+        except Exception:
+            return None
+        if x < 0 or y < 0:
+            return None
+        return x, y
+
+    def _mini_panel_position_setting(self) -> dict[str, int] | None:
+        if self.mini_panel_position is None:
+            return None
+        x, y = self.mini_panel_position
+        return {"x": int(x), "y": int(y)}
+
+    def _clamp_mini_panel_position(self, x: int, y: int, width: int, height: int) -> tuple[int, int]:
+        if self.mini_panel is None:
+            return max(0, int(x)), max(0, int(y))
+        screen_width = self.mini_panel.winfo_screenwidth()
+        screen_height = self.mini_panel.winfo_screenheight()
+        x = max(0, min(int(x), max(0, screen_width - max(1, int(width)))))
+        y = max(0, min(int(y), max(0, screen_height - max(1, int(height)))))
+        return x, y
+
+    def _remember_mini_panel_position(self, save: bool = False) -> None:
+        if self.mini_panel is None:
+            return
+        self.mini_panel.update_idletasks()
+        width = max(80, self.mini_panel.winfo_width())
+        height = max(60, self.mini_panel.winfo_height())
+        x, y = self._clamp_mini_panel_position(self.mini_panel.winfo_x(), self.mini_panel.winfo_y(), width, height)
+        self.mini_panel_position = (x, y)
+        if not save:
+            return
+        try:
+            settings = dict(self.settings)
+            settings["mini_panel_position"] = self._mini_panel_position_setting()
+            save_user_settings(settings)
+            self.settings = load_user_settings()
+        except Exception:
+            pass
+
+    def _start_mini_panel_drag(self, event) -> None:
+        if self.mini_panel is None:
+            return
+        self.mini_panel_drag_offset = (int(event.x_root), int(event.y_root))
+        self.mini_panel_drag_start = (
+            int(event.x_root),
+            int(event.y_root),
+            int(self.mini_panel.winfo_x()),
+            int(self.mini_panel.winfo_y()),
+        )
+        self.mini_panel.bind_all("<B1-Motion>", self._drag_mini_panel, add="+")
+        self.mini_panel.bind_all("<ButtonRelease-1>", self._finish_mini_panel_drag, add="+")
+
+    def _drag_mini_panel(self, event) -> None:
+        if self.mini_panel is None:
+            return
+        if self.mini_panel_drag_start is None:
+            self._start_mini_panel_drag(event)
+            return
+        start_x, start_y, window_x, window_y = self.mini_panel_drag_start
+        x = window_x + int(event.x_root) - start_x
+        y = window_y + int(event.y_root) - start_y
+        width = max(80, self.mini_panel.winfo_width())
+        height = max(60, self.mini_panel.winfo_height())
+        x, y = self._clamp_mini_panel_position(x, y, width, height)
+        self.mini_panel_position = (x, y)
+        self.mini_panel.geometry(f"+{x}+{y}")
+
+    def _finish_mini_panel_drag(self, event=None) -> None:
+        dragged = self.mini_panel_drag_start is not None
+        if self.mini_panel is not None:
+            try:
+                self.mini_panel.unbind_all("<B1-Motion>")
+                self.mini_panel.unbind_all("<ButtonRelease-1>")
+            except tk.TclError:
+                pass
+        if dragged:
+            self._remember_mini_panel_position(save=True)
+        self.mini_panel_drag_offset = None
+        self.mini_panel_drag_start = None
+
+    def _position_mini_panel(self) -> None:
+        if self.mini_panel is None:
+            return
+        self.mini_panel.update_idletasks()
+        width = max(MINI_RECORDER_WIDTH, self.mini_panel.winfo_reqwidth())
+        height = max(84, self.mini_panel.winfo_reqheight())
+        if self.mini_panel_position is None:
+            screen_width = self.mini_panel.winfo_screenwidth()
+            screen_height = self.mini_panel.winfo_screenheight()
+            x = max(0, screen_width - width - 24)
+            y = max(0, screen_height - height - 80)
+        else:
+            x, y = self.mini_panel_position
+        x, y = self._clamp_mini_panel_position(x, y, width, height)
+        self.mini_panel_position = (x, y)
+        self.mini_panel.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _show_mini_panel(self) -> None:
+        if self.mini_panel is None:
+            return
+        self._position_mini_panel()
+        self._update_mini_record_button_state()
+        self.mini_panel.deiconify()
+        try:
+            self.mini_panel.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.mini_panel.lift()
+
+    def _hide_mini_panel(self) -> None:
+        self._finish_mini_panel_drag()
+        if self.mini_panel is not None:
+            try:
+                self.mini_panel.withdraw()
+            except tk.TclError:
+                pass
+
+    def _update_mini_panel_visibility(self) -> None:
+        if self.is_minimized_to_tray:
+            self._show_mini_panel()
+            return
+        self._hide_mini_panel()
+
+    def _set_mini_panel_levels(self, system_value: int, microphone_value: int) -> None:
+        system_value = max(0, min(100, int(system_value)))
+        microphone_value = max(0, min(100, int(microphone_value)))
+        self.mini_system_level_var.set(system_value)
+        self.mini_microphone_level_var.set(microphone_value)
+        self.mini_level_text_var.set(f"Сист. {system_value}%   Микр. {microphone_value}%")
+
+    def _reset_mini_panel_levels(self) -> None:
+        self._set_mini_panel_levels(0, 0)
+
     def _center_settings_window(self) -> None:
         self.root.update_idletasks()
         self.settings_window.update_idletasks()
@@ -4339,24 +4916,28 @@ class DictaApp:
         self._set_recognition_mode_controls_state("readonly")
         self._update_translation_button_state()
         self._update_audio_source_controls_state()
+        self._update_mini_record_button_state()
 
     def _set_record_button_recording(self) -> None:
         self.record_button.configure(text="Стоп", command=self.stop_recording, state=tk.NORMAL)
         self._set_recognition_mode_controls_state(tk.DISABLED)
         self._set_translation_buttons_state(tk.DISABLED)
         self._update_audio_source_controls_state()
+        self._update_mini_record_button_state()
 
     def _set_record_button_recognizing(self) -> None:
         self.record_button.configure(text="Прервать", command=self.cancel_recognition, state=tk.NORMAL)
         self._set_recognition_mode_controls_state(tk.DISABLED)
         self._set_translation_buttons_state(tk.DISABLED)
         self._update_audio_source_controls_state()
+        self._update_mini_record_button_state()
 
     def _set_record_button_busy(self, text: str) -> None:
         self.record_button.configure(text=text, state=tk.DISABLED)
         self._set_recognition_mode_controls_state(tk.DISABLED)
         self._set_translation_buttons_state(tk.DISABLED)
         self._update_audio_source_controls_state()
+        self._update_mini_record_button_state()
 
     def _set_recognition_mode_controls_state(self, state: str) -> None:
         for control_name in ("toolbar_recognition_mode_box", "recognition_mode_box"):
@@ -5217,6 +5798,7 @@ class DictaApp:
         self._clear_last_recognition_audio()
         self.recognition_cancel_event.clear()
         self._set_input_level(0)
+        self._reset_mini_panel_levels()
 
         try:
             self.stream = self._open_recording_stream()
@@ -5260,6 +5842,7 @@ class DictaApp:
         self.backend_box.configure(state=tk.DISABLED)
         self.backend_benchmark_button.configure(state=tk.DISABLED)
         self._update_audio_source_controls_state()
+        self._update_mini_panel_visibility()
 
     def _open_recording_stream(self):
         if self._is_combined_audio_source_selected():
@@ -5536,6 +6119,7 @@ class DictaApp:
             return
 
         self.is_recording = False
+        self._update_mini_panel_visibility()
         self._set_record_button_busy("Распознавание")
         self.stop_button.configure(state=tk.DISABLED)
 
@@ -5560,6 +6144,7 @@ class DictaApp:
                 self.backend_box.configure(state="readonly")
                 self.backend_benchmark_button.configure(state=tk.NORMAL)
                 self._update_audio_source_controls_state()
+                self._reset_mini_panel_levels()
                 messagebox.showwarning(
                     "Dicta",
                     self._format_problem_message(
@@ -5590,6 +6175,7 @@ class DictaApp:
             self.backend_box.configure(state="readonly")
             self.backend_benchmark_button.configure(state=tk.NORMAL)
             self._update_audio_source_controls_state()
+            self._reset_mini_panel_levels()
             if self.last_recording_source_key == "combined":
                 summary = "Запись пустая: Dicta не получила системный звук и микрофон."
                 steps = [
@@ -5690,6 +6276,7 @@ class DictaApp:
             "audio_gain_percent": clamp_audio_gain_percent(self.audio_gain_percent_var.get()),
             "backend": self._selected_backend_key(),
             "model_key": self._selected_model_key(),
+            "mini_panel_position": self._mini_panel_position_setting(),
         }
         try:
             save_user_settings(settings)
@@ -5713,6 +6300,7 @@ class DictaApp:
             "format_text": self.format_text_var.get(),
             "voice_punctuation": self.voice_punctuation_var.get(),
             "audio_gain_percent": clamp_audio_gain_percent(self.audio_gain_percent_var.get()),
+            "mini_panel_position": self._mini_panel_position_setting(),
         }
 
     def _restore_settings_state(self, state: dict[str, object]) -> None:
@@ -6395,6 +6983,11 @@ class DictaApp:
         self.root.after(5000, self.refresh_firewall_status)
 
     def on_close(self) -> None:
+        if self.is_closing:
+            return
+        self.is_closing = True
+        self._hide_mini_panel()
+        self._stop_tray_icon()
         self._stop_hotkey_listener()
         stop_argos_translation_worker()
         self.recognition_cancel_event.set()
@@ -6419,6 +7012,13 @@ class DictaApp:
             self.mic_test_stream = None
         self._close_recording_files()
         self._cleanup_recording_temp_files()
+        try:
+            info = json.loads(SINGLE_INSTANCE_INFO_PATH.read_text(encoding="utf-8"))
+            if int(info.get("pid", 0)) == os.getpid():
+                SINGLE_INSTANCE_INFO_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+        release_single_instance_mutex()
         self.root.destroy()
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
@@ -6493,12 +7093,19 @@ class DictaApp:
         value = max(0, min(100, int(value)))
         self.input_level_var.set(value)
         self.input_level_text_var.set(f"Уровень: {value}%")
+        if self.is_recording:
+            if self.last_recording_source_key == "system":
+                self._set_mini_panel_levels(value, 0)
+            elif self.last_recording_source_key == "microphone":
+                self._set_mini_panel_levels(0, value)
 
     def _set_combined_input_level(self, system_value: int, microphone_value: int) -> None:
         system_value = max(0, min(100, int(system_value)))
         microphone_value = max(0, min(100, int(microphone_value)))
         self.input_level_var.set(max(system_value, microphone_value))
         self.input_level_text_var.set(f"Уровень: система {system_value}%, микрофон {microphone_value}%")
+        if self.is_recording:
+            self._set_mini_panel_levels(system_value, microphone_value)
 
     def _set_recognition_progress(self, value: object) -> None:
         try:
@@ -6834,6 +7441,15 @@ class DictaApp:
                 self._handle_record_hotkey()
             elif event == "hotkey_status":
                 self.hotkey_status_var.set(str(value))
+            elif event == "tray_show":
+                self._show_main_window_from_tray()
+            elif event == "tray_toggle_recording":
+                self._mini_toggle_recording()
+            elif event == "tray_exit":
+                self.on_close()
+                return
+            elif event == "tray_error":
+                self._handle_tray_error(value if isinstance(value, Exception) else RuntimeError(str(value)))
             elif event == "recognized":
                 recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key = value[:7]
                 self._set_recognition_progress(100)
@@ -6908,7 +7524,8 @@ class DictaApp:
                         self._reset_translation_undo()
                         self._reset_postprocess_undo()
                     current = self.text.get("1.0", "end-1c").strip()
-                    insert_text = prepared if not current else "\n\n" + prepared
+                    protocol_text = format_protocol_chunk_text(chunk_index, prepared)
+                    insert_text = protocol_text if not current else "\n\n" + protocol_text
                     self.text.insert(tk.END, insert_text)
                     self.last_recognition_text = self.text.get("1.0", "end-1c").strip()
                     self.protocol_chunks_recognized += 1
@@ -6944,6 +7561,7 @@ class DictaApp:
                 self.backend_benchmark_button.configure(state=tk.NORMAL)
                 self._update_audio_source_controls_state()
                 self._cleanup_recording_temp_files()
+                self._reset_mini_panel_levels()
                 if cancelled:
                     self._set_status("Распознавание протокола прервано")
                     self.recognition_time_var.set("-")
@@ -7036,6 +7654,7 @@ class DictaApp:
                 self.backend_box.configure(state="readonly")
                 self.backend_benchmark_button.configure(state=tk.NORMAL)
                 self._update_audio_source_controls_state()
+                self._reset_mini_panel_levels()
             elif event == "benchmark_result":
                 profile = value
                 selected_model = profile.get("selected_model", FALLBACK_AUTO_MODEL_KEY)
@@ -7140,6 +7759,8 @@ class DictaApp:
             elapsed = int(time.perf_counter() - self.record_started_at)
             minutes, seconds = divmod(elapsed, 60)
             self.record_time_var.set(f"Запись: {minutes:02d}:{seconds:02d}")
+            if self.is_minimized_to_tray and self.mini_panel is not None:
+                self.mini_panel.lift()
         elif not self.is_recording and not self.is_recognizing:
             self.record_started_at = None
         self.root.after(250, self._update_record_timer)
@@ -7719,6 +8340,10 @@ def main() -> None:
         print(f"BACKEND_PROFILE={BACKEND_PROFILE_PATH}")
         print(f"USER_SETTINGS={USER_SETTINGS_PATH}")
         print(f"TRANSLATION_PACK={translation_pack_status_label(detect_translation_pack())}")
+        raise SystemExit(0)
+
+    if not acquire_single_instance_mutex():
+        request_existing_instance_restore()
         raise SystemExit(0)
 
     root = tk.Tk()
