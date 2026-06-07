@@ -184,6 +184,16 @@ SYSTEM_AUDIO_TEST_SECONDS = 1.5
 PROTOCOL_CHUNK_SECONDS = 60.0
 PROTOCOL_FINAL_CHUNK_MIN_SECONDS = 1.0
 PROTOCOL_PARAGRAPH_MAX_WORDS = 70
+PROTOCOL_SOURCE_LABELS = {
+    "system": "Системный звук",
+    "microphone": "Микрофон",
+    "mixed": "Системный звук + микрофон",
+}
+PROTOCOL_DIAGNOSTICS_ARTIFACT_PREFIX = "protocol_diagnostics"
+PROTOCOL_DIAGNOSTICS_LOG_NAME = "protocol_diagnostics.jsonl"
+PROTOCOL_DUPLICATE_FILTER_FRAME_MS = 100
+PROTOCOL_DUPLICATE_FILTER_PADDING_MS = 1200
+PROTOCOL_DUPLICATE_FILTER_MAX_GAP_MS = 600
 MICROPHONE_WORKING_PEAK_PERCENT = 1
 SILENCE_WINDOW_MS = 30
 SILENCE_PADDING_MS = 250
@@ -239,6 +249,7 @@ DEFAULT_USER_SETTINGS = {
     "model_key": FALLBACK_AUTO_MODEL_KEY,
     "audio_gain_percent": 0,
     "mini_panel_position": None,
+    "protocol_diagnostics": False,
 }
 
 
@@ -768,6 +779,156 @@ def mix_recording_sources(
     system_resampled = resample_pcm16_mono(system_audio, system_rate, target_rate)
     microphone_resampled = resample_pcm16_mono(microphone_audio, microphone_rate, target_rate)
     return mix_pcm16_mono(system_resampled, microphone_resampled)
+
+
+def pcm16_activity_spans(
+    audio: bytes,
+    sample_rate: int,
+    frame_ms: int = PROTOCOL_DUPLICATE_FILTER_FRAME_MS,
+    padding_ms: int = PROTOCOL_DUPLICATE_FILTER_PADDING_MS,
+    max_gap_ms: int = PROTOCOL_DUPLICATE_FILTER_MAX_GAP_MS,
+    min_rms: float = VAD_MIN_RMS,
+    min_peak: int = VAD_MIN_PEAK,
+) -> tuple[list[tuple[float, float]], dict]:
+    sample_rate = max(1, int(sample_rate or SAMPLE_RATE))
+    samples = pcm16_mono_to_array(audio)
+    stats = {
+        "frame_ms": frame_ms,
+        "padding_ms": padding_ms,
+        "max_gap_ms": max_gap_ms,
+        "original_ms": round(len(samples) / sample_rate * 1000, 1),
+        "active_ms": 0.0,
+        "segments": 0,
+        "threshold_rms": 0.0,
+        "noise_floor_rms": 0.0,
+    }
+    if not samples:
+        return [], stats
+
+    frame_samples = max(1, sample_rate * max(1, int(frame_ms)) // 1000)
+    frames: list[tuple[int, int, float, int]] = []
+    for start in range(0, len(samples), frame_samples):
+        end = min(start + frame_samples, len(samples))
+        window = samples[start:end]
+        if not window:
+            continue
+        peak = max(abs(int(sample)) for sample in window)
+        rms = math.sqrt(sum(int(sample) * int(sample) for sample in window) / len(window))
+        frames.append((start, end, rms, peak))
+
+    if not frames:
+        return [], stats
+
+    sorted_rms = sorted(frame[2] for frame in frames)
+    quiet_count = max(1, len(sorted_rms) // 5)
+    noise_floor = sum(sorted_rms[:quiet_count]) / quiet_count
+    threshold = max(float(min_rms), noise_floor * VAD_NOISE_MULTIPLIER)
+    stats["threshold_rms"] = round(threshold, 1)
+    stats["noise_floor_rms"] = round(noise_floor, 1)
+
+    raw_active = [(rms >= threshold or peak >= min_peak) for _start, _end, rms, peak in frames]
+    padding_frames = max(0, int(math.ceil(max(0, padding_ms) / max(1, frame_ms))))
+    active = raw_active[:]
+    if padding_frames:
+        for index, is_active in enumerate(raw_active):
+            if not is_active:
+                continue
+            left = max(0, index - padding_frames)
+            right = min(len(active), index + padding_frames + 1)
+            for padded_index in range(left, right):
+                active[padded_index] = True
+
+    segments: list[tuple[int, int]] = []
+    start_index: int | None = None
+    for index, is_active in enumerate(active):
+        if is_active and start_index is None:
+            start_index = index
+        elif not is_active and start_index is not None:
+            segments.append((start_index, index - 1))
+            start_index = None
+    if start_index is not None:
+        segments.append((start_index, len(active) - 1))
+
+    max_gap_frames = max(0, int(math.ceil(max(0, max_gap_ms) / max(1, frame_ms))))
+    merged: list[tuple[int, int]] = []
+    for segment_start, segment_end in segments:
+        if not merged:
+            merged.append((segment_start, segment_end))
+            continue
+        prev_start, prev_end = merged[-1]
+        if segment_start - prev_end - 1 <= max_gap_frames:
+            merged[-1] = (prev_start, segment_end)
+        else:
+            merged.append((segment_start, segment_end))
+
+    spans: list[tuple[float, float]] = []
+    for segment_start, segment_end in merged:
+        sample_start = frames[segment_start][0]
+        sample_end = frames[segment_end][1]
+        spans.append((sample_start / sample_rate, sample_end / sample_rate))
+
+    stats["segments"] = len(spans)
+    stats["active_ms"] = round(sum((end - start) * 1000 for start, end in spans), 1)
+    stats["spans"] = [
+        {"start_seconds": round(start, 3), "end_seconds": round(end, 3)}
+        for start, end in spans[:20]
+    ]
+    if len(spans) > 20:
+        stats["spans_truncated"] = len(spans) - 20
+    return spans, stats
+
+
+def mute_pcm16_spans(audio: bytes, sample_rate: int, spans: list[tuple[float, float]]) -> tuple[bytes, int]:
+    sample_rate = max(1, int(sample_rate or SAMPLE_RATE))
+    samples = pcm16_mono_to_array(audio)
+    if not samples or not spans:
+        return audio, 0
+
+    muted_samples = 0
+    for start_seconds, end_seconds in spans:
+        start = max(0, min(len(samples), int(math.floor(start_seconds * sample_rate))))
+        end = max(start, min(len(samples), int(math.ceil(end_seconds * sample_rate))))
+        muted_samples += end - start
+        for index in range(start, end):
+            samples[index] = 0
+
+    tail_start = len(samples) * SAMPLE_WIDTH_BYTES
+    return samples.tobytes() + audio[tail_start:], muted_samples
+
+
+def filter_protocol_microphone_duplicate_audio(
+    microphone_audio: bytes,
+    microphone_rate: int,
+    system_audio: bytes,
+    system_rate: int,
+) -> tuple[bytes, dict]:
+    microphone_rate = max(1, int(microphone_rate or SAMPLE_RATE))
+    system_rate = max(1, int(system_rate or SAMPLE_RATE))
+    stats = {
+        "enabled": False,
+        "muted_ms": 0.0,
+        "microphone_rate": microphone_rate,
+        "system_rate": system_rate,
+        "raw_peak_percent": audio_peak_percent(microphone_audio),
+        "filtered_peak_percent": audio_peak_percent(microphone_audio),
+    }
+    if not microphone_audio or not system_audio:
+        return microphone_audio, stats
+
+    spans, activity_stats = pcm16_activity_spans(system_audio, system_rate)
+    stats["system_activity"] = activity_stats
+    if not spans:
+        return microphone_audio, stats
+
+    filtered_audio, muted_samples = mute_pcm16_spans(microphone_audio, microphone_rate, spans)
+    stats.update(
+        {
+            "enabled": muted_samples > 0,
+            "muted_ms": round(muted_samples / microphone_rate * 1000, 1),
+            "filtered_peak_percent": audio_peak_percent(filtered_audio),
+        }
+    )
+    return filtered_audio, stats
 
 
 def wasapi_create_device_enumerator() -> IMMDeviceEnumerator:
@@ -2580,7 +2741,7 @@ def load_user_settings() -> dict:
         if USER_SETTINGS_PATH.exists():
             stored = json.loads(USER_SETTINGS_PATH.read_text(encoding="utf-8"))
             if isinstance(stored, dict):
-                for key in ("auto_copy", "format_text", "voice_punctuation"):
+                for key in ("auto_copy", "format_text", "voice_punctuation", "protocol_diagnostics"):
                     settings[key] = bool(stored.get(key, DEFAULT_USER_SETTINGS[key]))
                 settings["audio_source"] = sanitize_audio_source_key(
                     stored.get("audio_source", DEFAULT_USER_SETTINGS["audio_source"])
@@ -2619,6 +2780,9 @@ def save_user_settings(settings: dict) -> None:
         "auto_copy": bool(settings.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"])),
         "format_text": bool(settings.get("format_text", DEFAULT_USER_SETTINGS["format_text"])),
         "voice_punctuation": bool(settings.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])),
+        "protocol_diagnostics": bool(
+            settings.get("protocol_diagnostics", DEFAULT_USER_SETTINGS["protocol_diagnostics"])
+        ),
         "audio_source": sanitize_audio_source_key(settings.get("audio_source", DEFAULT_USER_SETTINGS["audio_source"])),
         "system_output_device_id": sanitize_system_output_device_id(
             settings.get("system_output_device_id", DEFAULT_USER_SETTINGS["system_output_device_id"])
@@ -2813,13 +2977,61 @@ def protocol_text_paragraphs(text: str, max_words: int = PROTOCOL_PARAGRAPH_MAX_
     return [paragraph for paragraph in paragraphs if paragraph]
 
 
-def format_protocol_chunk_text(chunk_index: object, text: str) -> str:
+def format_protocol_timestamp(seconds: object) -> str:
+    try:
+        total_seconds = max(0, int(round(float(seconds))))
+    except Exception:
+        total_seconds = 0
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_protocol_chunk_header(
+    chunk_index: object,
+    start_seconds: object | None = None,
+    end_seconds: object | None = None,
+) -> str:
     try:
         index = max(1, int(chunk_index))
     except (TypeError, ValueError):
         index = 1
+    if start_seconds is None or end_seconds is None:
+        return f"Фрагмент {index}"
+    return (
+        f"Фрагмент {index} "
+        f"({format_protocol_timestamp(start_seconds)}-{format_protocol_timestamp(end_seconds)})"
+    )
+
+
+def format_protocol_chunk_text(
+    chunk_index: object,
+    text: str,
+    start_seconds: object | None = None,
+    end_seconds: object | None = None,
+) -> str:
+    header = format_protocol_chunk_header(chunk_index, start_seconds, end_seconds)
     body = "\n\n".join(protocol_text_paragraphs(text))
-    return f"Фрагмент {index}\n{body}" if body else f"Фрагмент {index}"
+    return f"{header}\n{body}" if body else header
+
+
+def format_protocol_chunk_sources(
+    chunk_index: object,
+    sources: list[dict],
+    start_seconds: object | None = None,
+    end_seconds: object | None = None,
+) -> str:
+    header = format_protocol_chunk_header(chunk_index, start_seconds, end_seconds)
+    blocks: list[str] = []
+    for source in sources:
+        label = str(source.get("label", "")).strip() or "Источник"
+        body = "\n\n".join(protocol_text_paragraphs(str(source.get("text", ""))))
+        if body:
+            blocks.append(f"{label}:\n{body}")
+
+    return f"{header}\n\n" + "\n\n".join(blocks) if blocks else header
 
 
 @dataclass(frozen=True)
@@ -3396,6 +3608,47 @@ def run_text_cleanup_self_test() -> None:
         raise AssertionError(f"protocol chunk header failed: {protocol_text!r}")
     if "\n\n" not in protocol_text:
         raise AssertionError(f"protocol chunk paragraphs failed: {protocol_text!r}")
+    protocol_timed_text = format_protocol_chunk_text(4, "Текст.", start_seconds=60, end_seconds=125)
+    if not protocol_timed_text.startswith("Фрагмент 4 (01:00-02:05)\n"):
+        raise AssertionError(f"protocol chunk time range failed: {protocol_timed_text!r}")
+    protocol_sources_text = format_protocol_chunk_sources(
+        3,
+        [
+            {"label": PROTOCOL_SOURCE_LABELS["system"], "text": "Системный текст."},
+            {"label": PROTOCOL_SOURCE_LABELS["microphone"], "text": "Микрофонный текст."},
+        ],
+        start_seconds=0,
+        end_seconds=60,
+    )
+    if not protocol_sources_text.startswith("Фрагмент 3 (00:00-01:00)\n\n"):
+        raise AssertionError(f"protocol source header failed: {protocol_sources_text!r}")
+    if "Системный звук:\nСистемный текст." not in protocol_sources_text:
+        raise AssertionError(f"protocol system block failed: {protocol_sources_text!r}")
+    if "Микрофон:\nМикрофонный текст." not in protocol_sources_text:
+        raise AssertionError(f"protocol microphone block failed: {protocol_sources_text!r}")
+
+    filter_rate = SAMPLE_RATE
+
+    def tone(value: int, seconds: float) -> bytes:
+        return array("h", [value] * int(filter_rate * seconds)).tobytes()
+
+    system_audio = tone(1400, 1.0) + tone(0, 3.0)
+    microphone_audio = tone(450, 1.0) + tone(0, 2.0) + tone(1800, 1.0)
+    filtered_audio, filter_stats = filter_protocol_microphone_duplicate_audio(
+        microphone_audio,
+        filter_rate,
+        system_audio,
+        filter_rate,
+    )
+    filtered_samples = pcm16_mono_to_array(filtered_audio)
+    early_samples = filtered_samples[: int(filter_rate * 2.0)]
+    late_samples = filtered_samples[int(filter_rate * 3.0) :]
+    if not filter_stats.get("enabled") or float(filter_stats.get("muted_ms", 0.0)) < 1000:
+        raise AssertionError(f"protocol duplicate filter did not mute system span: {filter_stats!r}")
+    if max((abs(int(sample)) for sample in early_samples), default=0) != 0:
+        raise AssertionError("protocol duplicate filter left early microphone duplicate audio")
+    if max((abs(int(sample)) for sample in late_samples), default=0) < 1000:
+        raise AssertionError("protocol duplicate filter removed late microphone audio")
 
 
 def available_model_keys() -> list[str]:
@@ -3922,9 +4175,14 @@ class DictaApp:
         self.protocol_system_chunk_bytes = 0
         self.protocol_microphone_chunk_bytes = 0
         self.protocol_chunk_index = 0
+        self.protocol_elapsed_seconds = 0.0
         self.protocol_chunks_queued = 0
         self.protocol_chunks_recognized = 0
         self.protocol_text_started = False
+        self.protocol_diagnostics_enabled = False
+        self.protocol_diagnostics_dir: Path | None = None
+        self.protocol_diagnostics_log_path: Path | None = None
+        self.protocol_diagnostics_lock = threading.Lock()
         self.input_devices: dict[str, list[int]] = {}
         self.preferred_input_configs: dict[str, dict] = {}
         self.system_output_devices: dict[str, str] = {
@@ -4015,6 +4273,9 @@ class DictaApp:
         self.voice_punctuation_var = tk.BooleanVar(
             value=self.settings.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])
         )
+        self.protocol_diagnostics_var = tk.BooleanVar(
+            value=self.settings.get("protocol_diagnostics", DEFAULT_USER_SETTINGS["protocol_diagnostics"])
+        )
         self.audio_gain_percent_var = tk.DoubleVar(
             value=self.settings.get("audio_gain_percent", DEFAULT_USER_SETTINGS["audio_gain_percent"])
         )
@@ -4069,6 +4330,12 @@ class DictaApp:
         self.more_menu.add_command(label="Откатить автоисправления", command=self.undo_last_postprocess, state=tk.DISABLED)
         self.more_menu.add_separator()
         self.more_menu.add_command(label="Очистить", command=self.clear_text)
+        self.more_menu.add_separator()
+        self.more_menu.add_checkbutton(
+            label="Диагностика протокола",
+            variable=self.protocol_diagnostics_var,
+            command=self._on_protocol_diagnostics_toggled,
+        )
         self.more_button = ttk.Menubutton(toolbar, text="Еще", menu=self.more_menu)
 
         self.toolbar_recognition_mode_box = ttk.Combobox(
@@ -5006,6 +5273,20 @@ class DictaApp:
             self._set_status("Режим распознавания сохранен")
         except Exception as exc:
             self._set_status(f"Не удалось сохранить режим: {exc}")
+
+    def _on_protocol_diagnostics_toggled(self) -> None:
+        settings = dict(self.settings)
+        settings["protocol_diagnostics"] = self.protocol_diagnostics_var.get()
+        try:
+            save_user_settings(settings)
+            self.settings = load_user_settings()
+            self.settings_snapshot["protocol_diagnostics"] = settings["protocol_diagnostics"]
+            if self.protocol_diagnostics_var.get():
+                self._set_status("Диагностика протокола включена")
+            else:
+                self._set_status("Диагностика протокола выключена")
+        except Exception as exc:
+            self._set_status(f"Не удалось сохранить диагностику: {exc}")
 
     def _select_model_key(self, model_key: str) -> None:
         model_key = sanitize_model_key(model_key, require_available=True)
@@ -5951,6 +6232,84 @@ class DictaApp:
                 pass
         self.recording_temp_paths = []
 
+    def _protocol_audio_diagnostic_stats(self, audio: bytes, sample_rate: int) -> dict:
+        sample_rate = max(1, int(sample_rate or SAMPLE_RATE))
+        return {
+            "bytes": len(audio),
+            "seconds": round(len(audio) / (sample_rate * SAMPLE_WIDTH_BYTES), 3),
+            "sample_rate": sample_rate,
+            "channels": CHANNELS,
+            "sample_width_bytes": SAMPLE_WIDTH_BYTES,
+            "peak_percent": audio_peak_percent(audio),
+        }
+
+    def _start_protocol_diagnostics_session(self) -> None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        try:
+            diagnostics_dir = APP_DIR / "artifacts" / f"{PROTOCOL_DIAGNOSTICS_ARTIFACT_PREFIX}_{timestamp}"
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            self.protocol_diagnostics_dir = diagnostics_dir
+            self.protocol_diagnostics_log_path = diagnostics_dir / PROTOCOL_DIAGNOSTICS_LOG_NAME
+            self._write_protocol_diagnostic_event(
+                "session_start",
+                {
+                    "diagnostics_dir": str(diagnostics_dir),
+                    "audio_source": self._selected_audio_source_key(),
+                    "system_output_device_id": self._selected_system_output_device_id(),
+                    "recognition_mode_key": self._selected_recognition_mode_key(),
+                    "backend": self._selected_backend_key(),
+                    "model_key": self._selected_model_key(),
+                    "chunk_seconds": PROTOCOL_CHUNK_SECONDS,
+                },
+            )
+        except Exception as exc:
+            self.protocol_diagnostics_enabled = False
+            self.protocol_diagnostics_dir = None
+            self.protocol_diagnostics_log_path = None
+            self._set_status(f"Диагностика протокола недоступна: {exc}")
+
+    def _write_protocol_diagnostic_event(self, event: str, payload: dict | None = None) -> None:
+        log_path = self.protocol_diagnostics_log_path
+        if not self.protocol_diagnostics_enabled or log_path is None:
+            return
+        record = {
+            "event": event,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        }
+        if payload:
+            record.update(payload)
+        try:
+            with self.protocol_diagnostics_lock:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as file:
+                    file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
+    def _write_protocol_diagnostic_wav(self, chunk_index: int, source_key: str, audio: bytes, sample_rate: int) -> str | None:
+        diagnostics_dir = self.protocol_diagnostics_dir
+        if not self.protocol_diagnostics_enabled or diagnostics_dir is None or not audio:
+            return None
+        safe_source = re.sub(r"[^a-zA-Z0-9_-]+", "_", source_key).strip("_") or "source"
+        path = diagnostics_dir / f"chunk_{max(1, int(chunk_index)):03d}_{safe_source}.wav"
+        try:
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(CHANNELS)
+                wav.setsampwidth(SAMPLE_WIDTH_BYTES)
+                wav.setframerate(max(1, int(sample_rate or SAMPLE_RATE)))
+                wav.writeframes(audio)
+            return str(path)
+        except Exception as exc:
+            self._write_protocol_diagnostic_event(
+                "diagnostic_wav_error",
+                {
+                    "chunk_index": int(chunk_index),
+                    "source": source_key,
+                    "error": str(exc),
+                },
+            )
+            return None
+
     def _start_protocol_streaming(self) -> None:
         self._cancel_protocol_streaming(mark_cancelled=False)
         self.protocol_prepare_queue = queue.Queue()
@@ -5960,10 +6319,16 @@ class DictaApp:
         self.protocol_system_chunk_bytes = 0
         self.protocol_microphone_chunk_bytes = 0
         self.protocol_chunk_index = 0
+        self.protocol_elapsed_seconds = 0.0
         self.protocol_chunks_queued = 0
         self.protocol_chunks_recognized = 0
         self.protocol_text_started = False
         self.recording_temp_paths = []
+        self.protocol_diagnostics_enabled = bool(self.protocol_diagnostics_var.get())
+        self.protocol_diagnostics_dir = None
+        self.protocol_diagnostics_log_path = None
+        if self.protocol_diagnostics_enabled:
+            self._start_protocol_diagnostics_session()
         self.is_protocol_recognizing = True
         self.protocol_prepare_thread = threading.Thread(target=self._protocol_prepare_worker, daemon=True)
         self.protocol_recognition_thread = threading.Thread(target=self._protocol_recognition_worker, daemon=True)
@@ -5973,6 +6338,13 @@ class DictaApp:
     def _cancel_protocol_streaming(self, mark_cancelled: bool = True) -> None:
         if mark_cancelled:
             self.recognition_cancel_event.set()
+            self._write_protocol_diagnostic_event(
+                "session_cancelled",
+                {
+                    "queued_chunks": self.protocol_chunks_queued,
+                    "recognized_chunks": self.protocol_chunks_recognized,
+                },
+            )
         if self.protocol_prepare_queue is not None:
             try:
                 self.protocol_prepare_queue.put(None)
@@ -5984,6 +6356,7 @@ class DictaApp:
         self.protocol_microphone_chunk_parts = []
         self.protocol_system_chunk_bytes = 0
         self.protocol_microphone_chunk_bytes = 0
+        self.protocol_elapsed_seconds = 0.0
         self.is_protocol_recognizing = False
 
     def _protocol_chunk_seconds_locked(self) -> float:
@@ -6009,8 +6382,12 @@ class DictaApp:
             return None
 
         self.protocol_chunk_index += 1
+        start_seconds = self.protocol_elapsed_seconds
+        end_seconds = start_seconds + duration
         chunk = {
             "index": self.protocol_chunk_index,
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
             "system_audio": b"".join(self.protocol_system_chunk_parts),
             "system_rate": self.system_audio_sample_rate,
             "microphone_audio": b"".join(self.protocol_microphone_chunk_parts),
@@ -6021,6 +6398,7 @@ class DictaApp:
         self.protocol_microphone_chunk_parts = []
         self.protocol_system_chunk_bytes = 0
         self.protocol_microphone_chunk_bytes = 0
+        self.protocol_elapsed_seconds = end_seconds
         self.protocol_chunks_queued += 1
         return chunk
 
@@ -6054,19 +6432,121 @@ class DictaApp:
                     return
 
                 try:
-                    mixed_audio = mix_recording_sources(
-                        bytes(item.get("system_audio", b"")),
-                        int(item.get("system_rate", SAMPLE_RATE)),
-                        bytes(item.get("microphone_audio", b"")),
-                        int(item.get("microphone_rate", SAMPLE_RATE)),
+                    chunk_index = int(item.get("index", 0))
+                    start_seconds = float(item.get("start_seconds", 0.0))
+                    end_seconds = float(item.get("end_seconds", 0.0))
+                    system_audio = bytes(item.get("system_audio", b""))
+                    microphone_audio = bytes(item.get("microphone_audio", b""))
+                    system_rate = int(item.get("system_rate", SAMPLE_RATE))
+                    microphone_rate = int(item.get("microphone_rate", SAMPLE_RATE))
+                    microphone_recognition_audio = microphone_audio
+                    duplicate_filter_stats: dict | None = None
+                    if system_audio and microphone_audio:
+                        microphone_recognition_audio, duplicate_filter_stats = (
+                            filter_protocol_microphone_duplicate_audio(
+                                microphone_audio,
+                                microphone_rate,
+                                system_audio,
+                                system_rate,
+                            )
+                        )
+                    fallback_audio = mix_recording_sources(
+                        system_audio,
+                        system_rate,
+                        microphone_recognition_audio,
+                        microphone_rate,
                         SAMPLE_RATE,
                     )
-                    if mixed_audio:
+                    diagnostic_sources: dict[str, dict] = {}
+                    for source_key, source_audio, source_rate in (
+                        ("system", system_audio, system_rate),
+                        ("microphone", microphone_audio, microphone_rate),
+                    ):
+                        if not source_audio:
+                            continue
+                        source_stats = self._protocol_audio_diagnostic_stats(source_audio, source_rate)
+                        wav_path = self._write_protocol_diagnostic_wav(
+                            chunk_index,
+                            source_key,
+                            source_audio,
+                            source_rate,
+                        )
+                        if wav_path:
+                            source_stats["wav_path"] = wav_path
+                        diagnostic_sources[source_key] = source_stats
+
+                    if duplicate_filter_stats is not None:
+                        filtered_stats = self._protocol_audio_diagnostic_stats(
+                            microphone_recognition_audio,
+                            microphone_rate,
+                        )
+                        filtered_wav_path = self._write_protocol_diagnostic_wav(
+                            chunk_index,
+                            "microphone_filtered",
+                            microphone_recognition_audio,
+                            microphone_rate,
+                        )
+                        if filtered_wav_path:
+                            filtered_stats["wav_path"] = filtered_wav_path
+                        duplicate_filter_stats["filtered"] = filtered_stats
+                        self._write_protocol_diagnostic_event(
+                            "duplicate_filter",
+                            {
+                                "chunk_index": chunk_index,
+                                "start_seconds": round(start_seconds, 3),
+                                "end_seconds": round(end_seconds, 3),
+                                "stats": duplicate_filter_stats,
+                            },
+                        )
+
+                    if diagnostic_sources:
+                        payload: dict[str, object] = {
+                            "chunk_index": chunk_index,
+                            "start_seconds": round(start_seconds, 3),
+                            "end_seconds": round(end_seconds, 3),
+                            "range": (
+                                f"{format_protocol_timestamp(start_seconds)}-"
+                                f"{format_protocol_timestamp(end_seconds)}"
+                            ),
+                            "sources": diagnostic_sources,
+                        }
+                        if fallback_audio:
+                            payload["fallback_mixed"] = self._protocol_audio_diagnostic_stats(
+                                fallback_audio,
+                                SAMPLE_RATE,
+                            )
+                        self._write_protocol_diagnostic_event("chunk_queued", payload)
+
+                    sources: list[dict] = []
+                    if system_audio:
+                        sources.append(
+                            {
+                                "key": "system",
+                                "label": PROTOCOL_SOURCE_LABELS["system"],
+                                "audio": system_audio,
+                                "sample_rate": system_rate,
+                            }
+                        )
+                    if microphone_audio:
+                        sources.append(
+                            {
+                                "key": "microphone",
+                                "label": PROTOCOL_SOURCE_LABELS["microphone"],
+                                "audio": microphone_recognition_audio,
+                                "raw_audio": microphone_audio,
+                                "sample_rate": microphone_rate,
+                                "duplicate_filter": duplicate_filter_stats,
+                            }
+                        )
+                    if sources:
                         recognition_queue.put(
                             {
-                                "index": int(item.get("index", 0)),
-                                "audio": mixed_audio,
-                                "sample_rate": SAMPLE_RATE,
+                                "index": chunk_index,
+                                "start_seconds": start_seconds,
+                                "end_seconds": end_seconds,
+                                "sources": sources,
+                                "fallback_audio": fallback_audio,
+                                "fallback_rate": SAMPLE_RATE,
                                 "recognition_mode_key": item.get(
                                     "recognition_mode_key",
                                     self._selected_recognition_mode_key(),
@@ -6095,13 +6575,229 @@ class DictaApp:
                     break
 
                 try:
-                    result = self._recognize_pcm16_audio(
-                        bytes(item.get("audio", b"")),
-                        int(item.get("sample_rate", SAMPLE_RATE)),
-                        str(item.get("recognition_mode_key", self._selected_recognition_mode_key())),
-                    )
-                    if str(result.get("recognized", "")).strip():
-                        self.ui_queue.put(("protocol_chunk_recognized", (int(item.get("index", 0)), result)))
+                    chunk_index = int(item.get("index", 0))
+                    start_seconds = float(item.get("start_seconds", 0.0))
+                    end_seconds = float(item.get("end_seconds", 0.0))
+                    recognition_mode_key = str(item.get("recognition_mode_key", self._selected_recognition_mode_key()))
+                    source_results: list[dict] = []
+                    source_errors: list[Exception] = []
+                    elapsed_total = 0.0
+                    for source in item.get("sources", []):
+                        if self.recognition_cancel_event.is_set():
+                            raise RecognitionCancelled()
+                        if not isinstance(source, dict):
+                            continue
+                        source_key = str(source.get("key", ""))
+                        source_label = str(source.get("label", "")) or source_key
+                        source_audio = bytes(source.get("audio", b""))
+                        source_raw_audio = bytes(source.get("raw_audio", source_audio))
+                        source_sample_rate = int(source.get("sample_rate", SAMPLE_RATE))
+                        duplicate_filter_stats = source.get("duplicate_filter")
+                        try:
+                            source_result = self._recognize_pcm16_audio(
+                                source_audio,
+                                source_sample_rate,
+                                recognition_mode_key,
+                            )
+                        except RecognitionCancelled:
+                            raise
+                        except Exception as exc:
+                            if str(exc).strip() == "silent-or-short-recording":
+                                self._write_protocol_diagnostic_event(
+                                    "source_silent",
+                                    {
+                                        "chunk_index": chunk_index,
+                                        "start_seconds": round(start_seconds, 3),
+                                        "end_seconds": round(end_seconds, 3),
+                                        "source": source_key,
+                                        "label": source_label,
+                                        "input": self._protocol_audio_diagnostic_stats(
+                                            source_audio,
+                                            source_sample_rate,
+                                        ),
+                                        "raw_input": self._protocol_audio_diagnostic_stats(
+                                            source_raw_audio,
+                                            source_sample_rate,
+                                        ),
+                                        "duplicate_filter": duplicate_filter_stats,
+                                    },
+                                )
+                                continue
+                            self._write_protocol_diagnostic_event(
+                                "source_error",
+                                {
+                                    "chunk_index": chunk_index,
+                                    "start_seconds": round(start_seconds, 3),
+                                    "end_seconds": round(end_seconds, 3),
+                                    "source": source_key,
+                                    "label": source_label,
+                                    "error": str(exc),
+                                    "input": self._protocol_audio_diagnostic_stats(
+                                        source_audio,
+                                        source_sample_rate,
+                                    ),
+                                    "raw_input": self._protocol_audio_diagnostic_stats(
+                                        source_raw_audio,
+                                        source_sample_rate,
+                                    ),
+                                    "duplicate_filter": duplicate_filter_stats,
+                                },
+                            )
+                            source_errors.append(exc)
+                            continue
+
+                        elapsed_total += float(source_result.get("elapsed", 0.0))
+                        recognized_text = str(source_result.get("recognized", ""))
+                        trimmed_audio = bytes(source_result.get("audio_bytes", b"") or b"")
+                        diagnostic_payload = {
+                            "chunk_index": chunk_index,
+                            "start_seconds": round(start_seconds, 3),
+                            "end_seconds": round(end_seconds, 3),
+                            "source": source_key,
+                            "label": source_label,
+                            "recognized": recognized_text,
+                            "elapsed": round(float(source_result.get("elapsed", 0.0)), 3),
+                            "backend_name": str(source_result.get("backend_name", "")),
+                            "backend_threads": source_result.get("backend_threads"),
+                            "recognition_mode_key": recognition_mode_key,
+                            "vad_stats": source_result.get("vad_stats"),
+                            "audio_stats": source_result.get("audio_stats"),
+                            "input": self._protocol_audio_diagnostic_stats(source_audio, source_sample_rate),
+                            "trimmed": self._protocol_audio_diagnostic_stats(
+                                trimmed_audio,
+                                int(source_result.get("sample_rate", source_sample_rate)),
+                            ),
+                            "raw_input": self._protocol_audio_diagnostic_stats(
+                                source_raw_audio,
+                                source_sample_rate,
+                            ),
+                            "duplicate_filter": duplicate_filter_stats,
+                        }
+                        if recognized_text.strip():
+                            self._write_protocol_diagnostic_event("source_recognized", diagnostic_payload)
+                            source_results.append(
+                                {
+                                    "key": source_key,
+                                    "label": source_label,
+                                    "recognized": recognized_text,
+                                    "elapsed": float(source_result.get("elapsed", 0.0)),
+                                    "backend_name": str(source_result.get("backend_name", "")),
+                                    "backend_threads": source_result.get("backend_threads"),
+                                    "vad_stats": source_result.get("vad_stats"),
+                                    "audio_stats": source_result.get("audio_stats"),
+                                    "recognition_mode_key": recognition_mode_key,
+                                }
+                            )
+                        else:
+                            self._write_protocol_diagnostic_event("source_empty_result", diagnostic_payload)
+
+                    if not source_results and source_errors and bytes(item.get("fallback_audio", b"")):
+                        fallback_audio = bytes(item.get("fallback_audio", b""))
+                        fallback_rate = int(item.get("fallback_rate", SAMPLE_RATE))
+                        try:
+                            fallback_result = self._recognize_pcm16_audio(
+                                fallback_audio,
+                                fallback_rate,
+                                recognition_mode_key,
+                            )
+                        except RecognitionCancelled:
+                            raise
+                        except Exception as exc:
+                            if str(exc).strip() == "silent-or-short-recording":
+                                self._write_protocol_diagnostic_event(
+                                    "fallback_silent",
+                                    {
+                                        "chunk_index": chunk_index,
+                                        "start_seconds": round(start_seconds, 3),
+                                        "end_seconds": round(end_seconds, 3),
+                                        "source_errors": [str(error) for error in source_errors],
+                                        "input": self._protocol_audio_diagnostic_stats(fallback_audio, fallback_rate),
+                                    },
+                                )
+                            else:
+                                self._write_protocol_diagnostic_event(
+                                    "fallback_error",
+                                    {
+                                        "chunk_index": chunk_index,
+                                        "start_seconds": round(start_seconds, 3),
+                                        "end_seconds": round(end_seconds, 3),
+                                        "source_errors": [str(error) for error in source_errors],
+                                        "error": str(exc),
+                                    },
+                                )
+                                raise
+                            fallback_result = None
+                        if fallback_result is None:
+                            pass
+                        else:
+                            fallback_recognized = str(fallback_result.get("recognized", ""))
+                            fallback_trimmed_audio = bytes(fallback_result.get("audio_bytes", b"") or b"")
+                            fallback_payload = {
+                                "chunk_index": chunk_index,
+                                "start_seconds": round(start_seconds, 3),
+                                "end_seconds": round(end_seconds, 3),
+                                "source": "mixed",
+                                "label": PROTOCOL_SOURCE_LABELS["mixed"],
+                                "recognized": fallback_recognized,
+                                "elapsed": round(float(fallback_result.get("elapsed", 0.0)), 3),
+                                "backend_name": str(fallback_result.get("backend_name", "")),
+                                "backend_threads": fallback_result.get("backend_threads"),
+                                "recognition_mode_key": recognition_mode_key,
+                                "source_errors": [str(error) for error in source_errors],
+                                "vad_stats": fallback_result.get("vad_stats"),
+                                "audio_stats": fallback_result.get("audio_stats"),
+                                "input": self._protocol_audio_diagnostic_stats(fallback_audio, fallback_rate),
+                                "trimmed": self._protocol_audio_diagnostic_stats(
+                                    fallback_trimmed_audio,
+                                    int(fallback_result.get("sample_rate", fallback_rate)),
+                                ),
+                            }
+                            if fallback_recognized.strip():
+                                self._write_protocol_diagnostic_event("fallback_recognized", fallback_payload)
+                                source_results.append(
+                                    {
+                                        "key": "mixed",
+                                        "label": PROTOCOL_SOURCE_LABELS["mixed"],
+                                        "recognized": fallback_recognized,
+                                        "elapsed": float(fallback_result.get("elapsed", 0.0)),
+                                        "backend_name": str(fallback_result.get("backend_name", "")),
+                                        "backend_threads": fallback_result.get("backend_threads"),
+                                        "vad_stats": fallback_result.get("vad_stats"),
+                                        "audio_stats": fallback_result.get("audio_stats"),
+                                        "recognition_mode_key": recognition_mode_key,
+                                    }
+                                )
+                            else:
+                                self._write_protocol_diagnostic_event("fallback_empty_result", fallback_payload)
+                            elapsed_total += float(fallback_result.get("elapsed", 0.0))
+
+                    if source_results:
+                        self.ui_queue.put(
+                            (
+                                "protocol_chunk_recognized",
+                                (
+                                    chunk_index,
+                                    {
+                                        "sources": source_results,
+                                        "elapsed": elapsed_total,
+                                        "start_seconds": start_seconds,
+                                        "end_seconds": end_seconds,
+                                        "recognition_mode_key": recognition_mode_key,
+                                    },
+                                ),
+                            )
+                        )
+                    else:
+                        self._write_protocol_diagnostic_event(
+                            "chunk_no_text",
+                            {
+                                "chunk_index": chunk_index,
+                                "start_seconds": round(start_seconds, 3),
+                                "end_seconds": round(end_seconds, 3),
+                                "recognition_mode_key": recognition_mode_key,
+                                "source_errors": [str(error) for error in source_errors],
+                            },
+                        )
                 except RecognitionCancelled:
                     cancelled = True
                     break
@@ -6112,6 +6808,14 @@ class DictaApp:
                     cancelled = True
                     break
         finally:
+            self._write_protocol_diagnostic_event(
+                "session_done",
+                {
+                    "cancelled": cancelled,
+                    "queued_chunks": self.protocol_chunks_queued,
+                    "recognized_chunks": self.protocol_chunks_recognized,
+                },
+            )
             self.ui_queue.put(("protocol_recognition_done", {"cancelled": cancelled}))
 
     def stop_recording(self) -> None:
@@ -6277,6 +6981,7 @@ class DictaApp:
             "backend": self._selected_backend_key(),
             "model_key": self._selected_model_key(),
             "mini_panel_position": self._mini_panel_position_setting(),
+            "protocol_diagnostics": self.protocol_diagnostics_var.get(),
         }
         try:
             save_user_settings(settings)
@@ -6301,6 +7006,7 @@ class DictaApp:
             "voice_punctuation": self.voice_punctuation_var.get(),
             "audio_gain_percent": clamp_audio_gain_percent(self.audio_gain_percent_var.get()),
             "mini_panel_position": self._mini_panel_position_setting(),
+            "protocol_diagnostics": self.protocol_diagnostics_var.get(),
         }
 
     def _restore_settings_state(self, state: dict[str, object]) -> None:
@@ -6318,6 +7024,9 @@ class DictaApp:
         self.auto_copy_var.set(bool(state.get("auto_copy", DEFAULT_USER_SETTINGS["auto_copy"])))
         self.format_text_var.set(bool(state.get("format_text", DEFAULT_USER_SETTINGS["format_text"])))
         self.voice_punctuation_var.set(bool(state.get("voice_punctuation", DEFAULT_USER_SETTINGS["voice_punctuation"])))
+        self.protocol_diagnostics_var.set(
+            bool(state.get("protocol_diagnostics", DEFAULT_USER_SETTINGS["protocol_diagnostics"]))
+        )
         self.audio_gain_percent_var.set(
             clamp_audio_gain_percent(state.get("audio_gain_percent", DEFAULT_USER_SETTINGS["audio_gain_percent"]))
         )
@@ -7503,19 +8212,55 @@ class DictaApp:
             elif event == "protocol_chunk_recognized":
                 chunk_index, result = value
                 recognition_mode_key = str(result.get("recognition_mode_key", self._selected_recognition_mode_key()))
-                self._set_text_spellcheck_language_from_mode(recognition_mode_key)
-                prepared = prepare_recognized_text(
-                    str(result.get("recognized", "")),
-                    use_formatting=self.format_text_var.get(),
-                    use_voice_punctuation=self.voice_punctuation_var.get()
-                    and recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY,
-                )
-                if recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY:
-                    try:
-                        prepared = apply_ru_recognition_postprocess(prepared).text
-                    except Exception:
-                        pass
-                if prepared:
+                start_seconds = result.get("start_seconds") if isinstance(result, dict) else None
+                end_seconds = result.get("end_seconds") if isinstance(result, dict) else None
+                source_items = result.get("sources") if isinstance(result, dict) else None
+                prepared_sources: list[dict] = []
+                primary_source: dict | None = None
+
+                if isinstance(source_items, list):
+                    for source in source_items:
+                        if not isinstance(source, dict):
+                            continue
+                        source_mode_key = str(source.get("recognition_mode_key", recognition_mode_key))
+                        self._set_text_spellcheck_language_from_mode(source_mode_key)
+                        prepared = prepare_recognized_text(
+                            str(source.get("recognized", "")),
+                            use_formatting=self.format_text_var.get(),
+                            use_voice_punctuation=self.voice_punctuation_var.get()
+                            and source_mode_key == RUSSIAN_RECOGNITION_MODE_KEY,
+                        )
+                        if source_mode_key == RUSSIAN_RECOGNITION_MODE_KEY:
+                            try:
+                                prepared = apply_ru_recognition_postprocess(prepared).text
+                            except Exception:
+                                pass
+                        if prepared:
+                            prepared_sources.append(
+                                {
+                                    "label": str(source.get("label", "Источник")),
+                                    "text": prepared,
+                                }
+                            )
+                            primary_source = source
+                else:
+                    self._set_text_spellcheck_language_from_mode(recognition_mode_key)
+                    prepared = prepare_recognized_text(
+                        str(result.get("recognized", "")),
+                        use_formatting=self.format_text_var.get(),
+                        use_voice_punctuation=self.voice_punctuation_var.get()
+                        and recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY,
+                    )
+                    if recognition_mode_key == RUSSIAN_RECOGNITION_MODE_KEY:
+                        try:
+                            prepared = apply_ru_recognition_postprocess(prepared).text
+                        except Exception:
+                            pass
+                    if prepared:
+                        prepared_sources.append({"label": "", "text": prepared})
+                        primary_source = result
+
+                if prepared_sources:
                     if not self.protocol_text_started:
                         self.text.delete("1.0", tk.END)
                         self.protocol_text_started = True
@@ -7524,19 +8269,41 @@ class DictaApp:
                         self._reset_translation_undo()
                         self._reset_postprocess_undo()
                     current = self.text.get("1.0", "end-1c").strip()
-                    protocol_text = format_protocol_chunk_text(chunk_index, prepared)
+                    if isinstance(source_items, list):
+                        protocol_text = format_protocol_chunk_sources(
+                            chunk_index,
+                            prepared_sources,
+                            start_seconds=start_seconds,
+                            end_seconds=end_seconds,
+                        )
+                    else:
+                        protocol_text = format_protocol_chunk_text(
+                            chunk_index,
+                            prepared_sources[0]["text"],
+                            start_seconds=start_seconds,
+                            end_seconds=end_seconds,
+                        )
                     insert_text = protocol_text if not current else "\n\n" + protocol_text
                     self.text.insert(tk.END, insert_text)
                     self.last_recognition_text = self.text.get("1.0", "end-1c").strip()
                     self.protocol_chunks_recognized += 1
                     self.recognition_time_var.set(f"{float(result.get('elapsed', 0.0)):.1f} с")
                     self._update_speed_status(
-                        vad_stats=result.get("vad_stats"),
-                        audio_stats=result.get("audio_stats"),
-                        backend_name=str(result.get("backend_name", "")),
-                        backend_threads=parse_positive_int(result.get("backend_threads")),
+                        vad_stats=primary_source.get("vad_stats") if isinstance(primary_source, dict) else None,
+                        audio_stats=primary_source.get("audio_stats") if isinstance(primary_source, dict) else None,
+                        backend_name=str(primary_source.get("backend_name", "")) if isinstance(primary_source, dict) else "",
+                        backend_threads=parse_positive_int(primary_source.get("backend_threads"))
+                        if isinstance(primary_source, dict)
+                        else None,
                     )
-                    self._set_status(f"Протокол: фрагмент {int(chunk_index)} готов")
+                    if start_seconds is not None and end_seconds is not None:
+                        self._set_status(
+                            "Протокол: "
+                            f"фрагмент {int(chunk_index)} "
+                            f"{format_protocol_timestamp(start_seconds)}-{format_protocol_timestamp(end_seconds)} готов"
+                        )
+                    else:
+                        self._set_status(f"Протокол: фрагмент {int(chunk_index)} готов")
                     self._schedule_spellcheck(delay_ms=250)
                     self._update_translation_button_state()
             elif event == "protocol_recognition_error":
