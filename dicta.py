@@ -231,7 +231,7 @@ HOTKEY_MOD_NOREPEAT = 0x4000
 HOTKEY_VK_SPACE = 0x20
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
-MINI_RECORDER_WIDTH = 360
+MINI_RECORDER_WIDTH = 430
 ERROR_ALREADY_EXISTS = 183
 SW_RESTORE = 9
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\DictaSingleInstance"
@@ -3048,6 +3048,83 @@ class RecognitionPostprocessResult:
     corrections: tuple[RecognitionCorrection, ...]
 
 
+RU_LATIN_ABBREVIATION_PATTERN = re.compile(r"(?<![\w@:/\\])(?:[A-Z]\.?(?:[ \t]+)?){2,10}(?![\w@:/\\])")
+RU_LATIN_ABBREVIATION_CONTEXT_CHARS = 48
+RU_LATIN_ABBREVIATION_LETTERS = {
+    "A": "А",
+    "B": "Б",
+    "C": "С",
+    "D": "Д",
+    "E": "Е",
+    "F": "Ф",
+    "G": "Г",
+    "H": "Х",
+    "I": "И",
+    "J": "ДЖ",
+    "K": "К",
+    "L": "Л",
+    "M": "М",
+    "N": "Н",
+    "O": "О",
+    "P": "П",
+    "Q": "К",
+    "R": "Р",
+    "S": "С",
+    "T": "Т",
+    "U": "У",
+    "V": "В",
+    "W": "В",
+    "X": "Х",
+    "Y": "Й",
+    "Z": "З",
+}
+RU_LATIN_ABBREVIATION_OVERRIDES = {
+    "CASCO": "КАСКО",
+}
+RU_LATIN_ABBREVIATION_STOP_WORDS = frozenset(
+    {
+        "AI",
+        "API",
+        "BIOS",
+        "CPU",
+        "CSV",
+        "DNS",
+        "DOC",
+        "DOCX",
+        "EXE",
+        "GPU",
+        "GPS",
+        "HDD",
+        "HDMI",
+        "HTML",
+        "HTTP",
+        "HTTPS",
+        "IP",
+        "IT",
+        "JSON",
+        "PDF",
+        "RAM",
+        "RAR",
+        "ROM",
+        "SQL",
+        "SSD",
+        "TCP",
+        "UDP",
+        "UI",
+        "URL",
+        "USB",
+        "UX",
+        "VGA",
+        "WIFI",
+        "WWW",
+        "XLS",
+        "XLSX",
+        "XML",
+        "ZIP",
+    }
+)
+
+
 @dataclass(frozen=True)
 class RuRecognitionDictionary:
     replacements: dict[str, str]
@@ -3354,6 +3431,82 @@ def dictionary_phrase_pattern(source: str) -> re.Pattern[str]:
     return re.compile(rf"(?iu)(?<!\w){body}(?!\w)")
 
 
+def has_cyrillic_context(text: str, start: int, end: int, window: int = RU_LATIN_ABBREVIATION_CONTEXT_CHARS) -> bool:
+    left = max(0, start - max(1, int(window)))
+    right = min(len(text), end + max(1, int(window)))
+    return any("а" <= char.lower() <= "я" or char.lower() == "ё" for char in text[left:start] + text[end:right])
+
+
+def normalize_latin_abbreviation_key(value: str) -> str:
+    return "".join(char.upper() for char in value if "A" <= char.upper() <= "Z")
+
+
+def cyrillic_latin_abbreviation_replacement(value: str, text: str, start: int, end: int) -> str | None:
+    key = normalize_latin_abbreviation_key(value)
+    if len(key) < 2 or len(key) > 10:
+        return None
+    if key in RU_LATIN_ABBREVIATION_STOP_WORDS:
+        return None
+    if not has_cyrillic_context(text, start, end):
+        return None
+
+    override = RU_LATIN_ABBREVIATION_OVERRIDES.get(key)
+    if override:
+        return override
+
+    letters: list[str] = []
+    for char in key:
+        replacement = RU_LATIN_ABBREVIATION_LETTERS.get(char)
+        if not replacement:
+            return None
+        letters.append(replacement)
+    return "".join(letters)
+
+
+def apply_ru_latin_abbreviation_replacements(text: str) -> RecognitionPostprocessResult:
+    matches: list[tuple[int, int, str, str]] = []
+    for match in RU_LATIN_ABBREVIATION_PATTERN.finditer(text):
+        source_text = match.group(0).strip()
+        if not source_text:
+            continue
+        start = match.start() + (len(match.group(0)) - len(match.group(0).lstrip()))
+        end = start + len(source_text)
+        replacement = cyrillic_latin_abbreviation_replacement(source_text, text, start, end)
+        if not replacement or source_text.casefold() == replacement.casefold():
+            continue
+        matches.append((start, end, source_text, replacement))
+
+    if not matches:
+        return RecognitionPostprocessResult(text, ())
+
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    selected: list[tuple[int, int, str, str]] = []
+    last_end = -1
+    for start, end, source_text, replacement in matches:
+        if start < last_end:
+            continue
+        selected.append((start, end, source_text, replacement))
+        last_end = end
+
+    if not selected:
+        return RecognitionPostprocessResult(text, ())
+
+    result = text
+    corrections: list[RecognitionCorrection] = []
+    for start, end, source_text, replacement in reversed(selected):
+        result = result[:start] + replacement + result[end:]
+        corrections.append(
+            RecognitionCorrection(
+                start=start,
+                end=end,
+                source=source_text,
+                replacement=replacement,
+            )
+        )
+    corrections.sort(key=lambda item: item.start)
+    return RecognitionPostprocessResult(result, tuple(corrections))
+
+
 def apply_ru_dictionary_phrase_replacements(
     text: str,
     dictionary: RuRecognitionDictionary,
@@ -3445,7 +3598,8 @@ def apply_ru_recognition_postprocess(text: str) -> RecognitionPostprocessResult:
 
     dictionary = load_ru_recognition_dictionary()
     phrase_result = apply_ru_dictionary_phrase_replacements(text, dictionary)
-    working_text = phrase_result.text
+    abbreviation_result = apply_ru_latin_abbreviation_replacements(phrase_result.text)
+    working_text = abbreviation_result.text
     issues = check_text(working_text, language_tag="ru-RU")
     word_corrections: list[RecognitionCorrection] = []
     for issue in issues:
@@ -3461,13 +3615,16 @@ def apply_ru_recognition_postprocess(text: str) -> RecognitionPostprocessResult:
             )
         )
 
-    if not phrase_result.corrections and not word_corrections:
+    if not phrase_result.corrections and not abbreviation_result.corrections and not word_corrections:
         return RecognitionPostprocessResult(text, ())
 
     result = working_text
     for correction in sorted(word_corrections, key=lambda item: item.start, reverse=True):
         result = result[: correction.start] + correction.replacement + result[correction.end :]
-    return RecognitionPostprocessResult(result, phrase_result.corrections + tuple(word_corrections))
+    return RecognitionPostprocessResult(
+        result,
+        phrase_result.corrections + abbreviation_result.corrections + tuple(word_corrections),
+    )
 
 
 def log_ru_recognition_corrections(corrections: tuple[RecognitionCorrection, ...]) -> None:
@@ -3611,6 +3768,16 @@ def run_text_cleanup_self_test() -> None:
     protocol_timed_text = format_protocol_chunk_text(4, "Текст.", start_seconds=60, end_seconds=125)
     if not protocol_timed_text.startswith("Фрагмент 4 (01:00-02:05)\n"):
         raise AssertionError(f"protocol chunk time range failed: {protocol_timed_text!r}")
+    abbreviation_text = apply_ru_latin_abbreviation_replacements(
+        "Инспектор DPS проверяет PDD после D.T.P.; D P S рядом. GPS, USB и API остаются."
+    ).text
+    if "Инспектор ДПС проверяет ПДД после ДТП; ДПС рядом." not in abbreviation_text:
+        raise AssertionError(f"latin abbreviation replacement failed: {abbreviation_text!r}")
+    if "GPS, USB и API остаются" not in abbreviation_text:
+        raise AssertionError(f"latin abbreviation stop-list failed: {abbreviation_text!r}")
+    english_abbreviation_text = apply_ru_latin_abbreviation_replacements("DPS checks PDD.").text
+    if english_abbreviation_text != "DPS checks PDD.":
+        raise AssertionError(f"latin abbreviation context guard failed: {english_abbreviation_text!r}")
     protocol_sources_text = format_protocol_chunk_sources(
         3,
         [
@@ -4223,6 +4390,7 @@ class DictaApp:
         self.mini_panel_drag_offset: tuple[int, int] | None = None
         self.mini_panel_drag_start: tuple[int, int, int, int] | None = None
         self.mini_panel_position = self._loaded_mini_panel_position()
+        self.mini_panel_hidden_by_user = False
         self.main_window_restore_state = "normal"
         self.restore_request_mtime = 0.0
 
@@ -4441,9 +4609,30 @@ class DictaApp:
         frame.columnconfigure(1, weight=1)
 
         time_label = ttk.Label(frame, textvariable=self.record_time_var, width=14)
-        time_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        self.mini_record_button = ttk.Button(frame, text="Записать", command=self._mini_toggle_recording, width=10)
-        self.mini_record_button.grid(row=0, column=2, sticky="e", padx=(10, 0), pady=(0, 6))
+        time_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        mini_window_buttons = ttk.Frame(frame)
+        mini_window_buttons.grid(row=0, column=3, sticky="e", pady=(0, 6))
+        self.mini_minimize_button = ttk.Button(
+            mini_window_buttons,
+            text="-",
+            command=self._minimize_mini_panel,
+            width=3,
+        )
+        self.mini_minimize_button.grid(row=0, column=0, padx=(0, 2))
+        self.mini_restore_button = ttk.Button(
+            mini_window_buttons,
+            text="□",
+            command=self._restore_from_mini_panel,
+            width=3,
+        )
+        self.mini_restore_button.grid(row=0, column=1, padx=(0, 2))
+        self.mini_close_button = ttk.Button(
+            mini_window_buttons,
+            text="×",
+            command=self._close_from_mini_panel,
+            width=3,
+        )
+        self.mini_close_button.grid(row=0, column=2)
 
         system_label = ttk.Label(frame, text="Сист.", width=6)
         system_label.grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(0, 4))
@@ -4454,7 +4643,7 @@ class DictaApp:
             mode="determinate",
             length=220,
         )
-        system_level_bar.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(0, 4))
+        system_level_bar.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(0, 4))
 
         microphone_label = ttk.Label(frame, text="Микр.", width=6)
         microphone_label.grid(row=2, column=0, sticky="w", padx=(0, 6))
@@ -4465,10 +4654,12 @@ class DictaApp:
             mode="determinate",
             length=220,
         )
-        microphone_level_bar.grid(row=2, column=1, columnspan=2, sticky="ew")
+        microphone_level_bar.grid(row=2, column=1, columnspan=3, sticky="ew")
 
         level_label = ttk.Label(frame, textvariable=self.mini_level_text_var)
         level_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        self.mini_record_button = ttk.Button(frame, text="Записать", command=self._mini_toggle_recording, width=10)
+        self.mini_record_button.grid(row=3, column=3, sticky="e", padx=(10, 0), pady=(5, 0))
 
         for widget in (
             panel,
@@ -4796,6 +4987,7 @@ class DictaApp:
             return
 
         self.is_minimized_to_tray = True
+        self.mini_panel_hidden_by_user = False
         try:
             self.root.withdraw()
         except tk.TclError:
@@ -4806,6 +4998,7 @@ class DictaApp:
         if self.is_closing:
             return
         self.is_minimized_to_tray = False
+        self.mini_panel_hidden_by_user = False
         self._hide_mini_panel()
         try:
             self.root.deiconify()
@@ -4914,9 +5107,23 @@ class DictaApp:
         else:
             button.configure(text=self.record_button.cget("text"), command=self._mini_toggle_recording, state=tk.DISABLED)
 
+    def _minimize_mini_panel(self) -> None:
+        self._finish_mini_panel_drag()
+        self.mini_panel_hidden_by_user = True
+        if self.mini_panel is not None:
+            try:
+                self.mini_panel.withdraw()
+            except tk.TclError:
+                pass
+        self._set_status("Dicta свернута в лоток")
+
     def _restore_from_mini_panel(self, event=None) -> None:
         self._finish_mini_panel_drag()
         self._show_main_window_from_tray()
+
+    def _close_from_mini_panel(self) -> None:
+        self._finish_mini_panel_drag()
+        self.on_close()
 
     def _loaded_mini_panel_position(self) -> tuple[int, int] | None:
         position = self.settings.get("mini_panel_position")
@@ -5024,6 +5231,8 @@ class DictaApp:
 
     def _show_mini_panel(self) -> None:
         if self.mini_panel is None:
+            return
+        if self.mini_panel_hidden_by_user:
             return
         self._position_mini_panel()
         self._update_mini_record_button_state()
@@ -7691,9 +7900,46 @@ class DictaApp:
         self.firewall_status_var.set("Сеть: ожидает подтверждения Windows")
         self.root.after(5000, self.refresh_firewall_status)
 
-    def on_close(self) -> None:
+    def _close_confirmation_parent(self):
+        try:
+            if self.mini_panel is not None and self.mini_panel.winfo_viewable():
+                return self.mini_panel
+        except tk.TclError:
+            pass
+        return self.root
+
+    def _confirm_close_program(self) -> bool:
+        if self.is_recording:
+            return bool(
+                messagebox.askyesno(
+                    "Dicta",
+                    (
+                        "Идет запись.\n\n"
+                        "Если закрыть Dicta сейчас, текущая запись будет остановлена и может быть потеряна.\n\n"
+                        "Закрыть программу?"
+                    ),
+                    parent=self._close_confirmation_parent(),
+                )
+            )
+        if self.is_recognizing or self.is_protocol_recognizing:
+            return bool(
+                messagebox.askyesno(
+                    "Dicta",
+                    (
+                        "Идет распознавание.\n\n"
+                        "Если закрыть Dicta сейчас, обработка текущей записи будет прервана.\n\n"
+                        "Закрыть программу?"
+                    ),
+                    parent=self._close_confirmation_parent(),
+                )
+            )
+        return True
+
+    def on_close(self) -> bool:
         if self.is_closing:
-            return
+            return True
+        if not self._confirm_close_program():
+            return False
         self.is_closing = True
         self._hide_mini_panel()
         self._stop_tray_icon()
@@ -7729,6 +7975,7 @@ class DictaApp:
             pass
         release_single_instance_mutex()
         self.root.destroy()
+        return True
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if status:
@@ -8155,8 +8402,8 @@ class DictaApp:
             elif event == "tray_toggle_recording":
                 self._mini_toggle_recording()
             elif event == "tray_exit":
-                self.on_close()
-                return
+                if self.on_close():
+                    return
             elif event == "tray_error":
                 self._handle_tray_error(value if isinstance(value, Exception) else RuntimeError(str(value)))
             elif event == "recognized":
@@ -8526,7 +8773,7 @@ class DictaApp:
             elapsed = int(time.perf_counter() - self.record_started_at)
             minutes, seconds = divmod(elapsed, 60)
             self.record_time_var.set(f"Запись: {minutes:02d}:{seconds:02d}")
-            if self.is_minimized_to_tray and self.mini_panel is not None:
+            if self.is_minimized_to_tray and self.mini_panel is not None and not self.mini_panel_hidden_by_user:
                 self.mini_panel.lift()
         elif not self.is_recording and not self.is_recognizing:
             self.record_started_at = None
@@ -8993,6 +9240,9 @@ def main() -> None:
         pelmeni = apply_ru_recognition_postprocess("Племень готов.")
         phrase = apply_ru_recognition_postprocess("Это общество с ограниченной ответственностью.")
         domain = apply_ru_recognition_postprocess("Сайт example точка ру работает.")
+        abbreviations = apply_ru_recognition_postprocess(
+            "DPS оформил D.T.P. из-за нарушения PDD. D P S проверил KASKO, GPS и USB."
+        )
         known_dictionary = RuRecognitionDictionary(
             replacements={},
             protected_words=frozenset(),
@@ -9014,6 +9264,14 @@ def main() -> None:
             raise SystemExit(1)
         if "example.ru" not in domain.text:
             print("Dicta postprocess-test failed. Expected phrase replacement for domain.")
+            raise SystemExit(1)
+        if (
+            "ДПС оформил ДТП" not in abbreviations.text
+            or "ПДД" not in abbreviations.text
+            or "ДПС проверил КАСКО" not in abbreviations.text
+            or "GPS и USB" not in abbreviations.text
+        ):
+            print("Dicta postprocess-test failed. Expected Latin abbreviations -> Cyrillic.")
             raise SystemExit(1)
         if choose_conservative_suggestion(known_issue, known_issue.word, known_dictionary) is not None:
             print("Dicta postprocess-test failed. known_words must block corrections.")
