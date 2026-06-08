@@ -1,11 +1,60 @@
 param(
     [switch]$SkipModels,
-    [string]$PackageVersion = "1.1-pilot"
+    [string]$PackageVersion = "1.1-pilot",
+    [string]$DistRoot = "dist\Dicta"
 )
 
 $ErrorActionPreference = "Stop"
 
 Set-Location -LiteralPath (Join-Path $PSScriptRoot "..")
+
+$repoRoot = (Resolve-Path -LiteralPath ".").Path
+$repoDistRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "dist"))
+if ([System.IO.Path]::IsPathRooted($DistRoot)) {
+    $dist = [System.IO.Path]::GetFullPath($DistRoot)
+} else {
+    $dist = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $DistRoot))
+}
+
+$comparison = [StringComparison]::OrdinalIgnoreCase
+$repoDistRootTrimmed = $repoDistRoot.TrimEnd(
+    [System.IO.Path]::DirectorySeparatorChar,
+    [System.IO.Path]::AltDirectorySeparatorChar
+)
+$repoDistPrefix = $repoDistRootTrimmed + [System.IO.Path]::DirectorySeparatorChar
+$distTrimmed = $dist.TrimEnd(
+    [System.IO.Path]::DirectorySeparatorChar,
+    [System.IO.Path]::AltDirectorySeparatorChar
+)
+if ($distTrimmed -eq $repoDistRootTrimmed -or -not $distTrimmed.StartsWith($repoDistPrefix, $comparison)) {
+    throw "DistRoot must resolve to a package folder under $repoDistRoot."
+}
+
+function Clear-PackageDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $fullPathTrimmed = $fullPath.TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    if ($fullPathTrimmed -eq $repoDistRootTrimmed -or -not $fullPathTrimmed.StartsWith($repoDistPrefix, $comparison)) {
+        throw "Refusing to clear unsafe package path: $fullPath"
+    }
+
+    if (Test-Path -LiteralPath $fullPath) {
+        $item = Get-Item -LiteralPath $fullPath
+        if (-not $item.PSIsContainer) {
+            throw "DistRoot must be a directory: $fullPath"
+        }
+        Get-ChildItem -LiteralPath $fullPath -Force | Remove-Item -Recurse -Force
+    } else {
+        New-Item -ItemType Directory -Force -Path $fullPath | Out-Null
+    }
+}
 
 function Invoke-NativeCommand {
     param(
@@ -29,9 +78,36 @@ Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "pip", "install", 
 Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "pip", "install", "pyinstaller")
 Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "pip", "install", "pillow")
 Invoke-NativeCommand -FilePath "python" -ArgumentList @("scripts\generate_app_icon.py")
-Invoke-NativeCommand -FilePath "python" -ArgumentList @("-m", "PyInstaller", "--noconfirm", "--clean", "--windowed", "--icon", "assets\app_icon.ico", "--name", "Dicta", "dicta.py")
 
-$dist = "dist\Dicta"
+$pyinstallerDistRoot = Join-Path $repoRoot "build\pyinstaller-dist"
+$pyinstallerWorkRoot = Join-Path $repoRoot "build\pyinstaller-work"
+$pyinstallerAppRoot = Join-Path $pyinstallerDistRoot "Dicta"
+if (Test-Path -LiteralPath $pyinstallerAppRoot) {
+    Remove-Item -LiteralPath $pyinstallerAppRoot -Recurse -Force
+}
+Invoke-NativeCommand -FilePath "python" -ArgumentList @(
+    "-m",
+    "PyInstaller",
+    "--noconfirm",
+    "--clean",
+    "--windowed",
+    "--distpath",
+    $pyinstallerDistRoot,
+    "--workpath",
+    $pyinstallerWorkRoot,
+    "--icon",
+    "assets\app_icon.ico",
+    "--name",
+    "Dicta",
+    "dicta.py"
+)
+
+if (-not (Test-Path -LiteralPath (Join-Path $pyinstallerAppRoot "Dicta.exe") -PathType Leaf)) {
+    throw "PyInstaller did not create Dicta.exe in $pyinstallerAppRoot."
+}
+
+Clear-PackageDirectory -Path $dist
+Get-ChildItem -LiteralPath $pyinstallerAppRoot -Force | Copy-Item -Destination $dist -Recurse -Force
 New-Item -ItemType Directory -Force -Path "$dist\models", "$dist\.tools\whisper.cpp-build-compat\bin", "$dist\assets", "$dist\docs", "$dist\scripts", "$dist\translation" | Out-Null
 
 if ($SkipModels) {

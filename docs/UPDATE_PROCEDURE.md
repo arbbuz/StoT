@@ -76,6 +76,14 @@ Dicta-windows-code-only.zip
 .\scripts\build_dicta_exe.ps1 -SkipModels -PackageVersion "1.1-pilot-code-only"
 ```
 
+For a branch-specific local package, pass an explicit package folder under `dist`:
+
+```powershell
+.\scripts\build_dicta_exe.ps1 -PackageVersion "1.1-pilot-protocol" -DistRoot "dist\DictaProtocol"
+```
+
+`-DistRoot` defaults to `dist\Dicta`. The build script stages PyInstaller output under `build\pyinstaller-dist`, then clears and repopulates only the selected package folder under `dist`.
+
 Результат появится в:
 
 ```text

@@ -1,6 +1,6 @@
 # Dicta Plans
 
-Last updated: 2026-06-07
+Last updated: 2026-06-08
 
 This file is the Dicta-specific project plan. Global Codex operating rules belong in `C:\Users\Olga\.codex\AGENTS.md`.
 
@@ -8,7 +8,8 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
 
 - Branch: `DictaProtocol`.
 - Packaged EXE for manual checks: `C:\Users\Olga\Documents\VoiceHelper\dist\DictaProtocol\Dicta.exe`.
-- Latest pushed protocol commit: `e883b06 Add protocol microphone duplicate filter`.
+- Latest pushed protocol commit: `a055042 Improve mini panel controls and abbreviation normalization`.
+- Current local work after that commit contains stage 3.3 chunk stitching, `-DistRoot` build-script support, stage 3.4 draft protocol formatting, and restored stage 3.5/3.6 planning; commit/push is still pending.
 - Do not commit or push unless the user explicitly asks.
 
 ## Active Plan
@@ -41,18 +42,59 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
    - Success signal: common Russian abbreviations appear in Cyrillic through a general rule, while technical/international abbreviations from the stop-list stay Latin.
 
 5. Stage 3.3: chunk stitching and repeated tails
-   - Status: next planned work.
+   - Status: implemented in code and fresh packaged build.
    - Problem: Whisper can repeat phrases at chunk boundaries, and the issue becomes more visible on long recordings.
-   - Planned: compare the end of the previous fragment with the beginning of the next fragment.
-   - Planned: remove obvious repeated tails.
-   - Planned: avoid aggressive smart rewriting so meaningful text is not lost.
-   - Planned: add tests for repeated boundary phrases.
+   - Implemented: compare the end of the previous fragment with the beginning of the next fragment per source.
+   - Implemented: remove obvious repeated tails only when the overlap is exact, long enough, and ends at a clear phrase boundary.
+   - Implemented: avoid aggressive smart rewriting so meaningful text is not lost.
+   - Implemented: tests for repeated boundary phrases, duplicate-only chunks, and conservative non-removal.
    - Success signal: long recordings do not contain obvious repetitions at fragment boundaries.
 
 6. Stage 3.4: protocol quality polish
-   - Status: pending after 3.3.
-   - Planned: collect more manual protocol examples, tune chunking/source labels if needed, and decide whether diagnostic mode remains visible or moves behind a support-only option.
-   - Success signal: long meeting transcripts stay readable, source attribution is stable, and support diagnostics remain available when needed.
+   - Status: implemented in code and fresh packaged build.
+   - Implemented: protocol output starts with the neutral document title `Черновик протокола`.
+   - Implemented: fragment headers use neutral draft formatting, for example `Фрагмент 1 · 00:00-01:00`.
+   - Implemented: no invented sections such as decisions or tasks are generated.
+   - Implemented: the full draft remains plain editable/copyable text.
+   - Constraint: ordinary dictation output is unchanged.
+   - Success signal: protocol output looks like a draft protocol, not a recognition log.
+
+7. Stage 3.5: long-recording UI
+   - Status: next planned work after 3.4.
+   - Problem: during long recognition the user must understand that Dicta is working and has not frozen.
+   - Planned: show a counter such as `Фрагментов готово: 2/5`.
+   - Planned: show clear states: `Запись`, `Обработка фрагмента`, `Протокол готов`.
+   - Planned: keep the interface responsive or at least visibly busy with an understandable status.
+   - Planned: preserve tray and mini-panel behavior without regressions.
+   - Success signal: during a long recording it is clear that Dicta has not frozen.
+
+8. Stage 3.6: reliability and manual verification
+   - Status: planned after 3.5.
+   - Planned check: short microphone-only recording.
+   - Planned check: short system-audio-only recording.
+   - Planned check: combined recording with system audio and microphone.
+   - Planned check: 3-5 minute recording.
+   - Planned check: recording with silence in one source.
+   - Planned check: minimize to tray during recording.
+   - Planned check: stop recording from the mini-panel.
+   - Planned check: launch a second app instance and verify the existing window opens.
+   - Success signal: stage 3 behavior passes the minimum manual verification set in the packaged EXE.
+
+## Stage 3 Work Order
+
+1. First implement separate recognition of system audio and microphone.
+2. Then add fragment time ranges.
+3. Then remove repeated text at fragment boundaries.
+4. Then improve UI statuses.
+5. Finally build the EXE and run manual verification.
+
+## Stage 3 Out Of Scope
+
+- Do not identify speakers.
+- Do not generate automatic decisions or tasks.
+- Do not build a complex AI protocol.
+- Do not add cloud services.
+- Do not break existing ordinary dictation.
 
 ## Maintenance Notes
 
@@ -60,3 +102,5 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
 - Keep long verification output in `artifacts`.
 - Keep user-facing procedure updates in `docs\USER_CHECKLIST.md`.
 - Keep architecture and behavioral decisions in `docs\decision-log.md`.
+- Build this branch with `.\scripts\build_dicta_exe.ps1 -PackageVersion "1.1-pilot-protocol" -DistRoot "dist\DictaProtocol"`.
+- When reporting the ready EXE for manual checks, use a clickable Markdown file link to the absolute path.

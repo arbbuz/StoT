@@ -1,6 +1,6 @@
 # Dicta Decision Log
 
-Last updated: 2026-05-26
+Last updated: 2026-06-08
 
 This file records Dicta-specific decisions. Global Codex rules belong in `C:\Users\Olga\.codex\AGENTS.md`.
 
@@ -119,3 +119,61 @@ Reason:
 - Some Windows/USB audio stacks deliver quiet PCM even when the system input level is high.
 - Automatic gain can make already-good recordings worse, so the user needs explicit manual control.
 - Applying gain inside the app is reproducible, package-local, and easier to diagnose than relying on driver-specific microphone boost controls.
+
+## 2026-06-07: Build Script Uses Explicit DistRoot
+
+Decision:
+
+- Add `-DistRoot` to `scripts\build_dicta_exe.ps1`, with `dist\Dicta` as the default package folder.
+- Build DictaProtocol branch packages with `-DistRoot "dist\DictaProtocol"`.
+- Stage PyInstaller output under `build\pyinstaller-dist`, then clear and repopulate only the selected package folder under `dist`.
+- Reject `-DistRoot` values that resolve outside `dist` or to the `dist` root itself.
+
+Reason:
+
+- DictaProtocol manual checks use `dist\DictaProtocol\Dicta.exe`, while the old build script hardcoded `dist\Dicta`.
+- A first-class parameter removes the need for ad hoc post-build package synchronization.
+- Restricting the target path keeps package rebuilds scoped to one intended distributable folder.
+
+## 2026-06-07: Ready EXE Link Must Be Clickable
+
+Decision:
+
+- In user-facing final responses, report the ready manual-check EXE as a clickable Markdown file link to the absolute path.
+- Keep the DictaProtocol manual-check target at `C:\Users\Olga\Documents\VoiceHelper\dist\DictaProtocol\Dicta.exe`.
+
+Reason:
+
+- The user needs to open the rebuilt package directly from the response.
+- A raw path is easy to miss or inconvenient to use inside the Codex desktop app.
+
+## 2026-06-07: Protocol Stitching Stays Conservative
+
+Decision:
+
+- Remove repeated text only at protocol chunk boundaries.
+- Compare the end of the previous protocol text with the beginning of the next protocol text per source.
+- Require an exact, sufficiently long word overlap that ends at a clear phrase boundary.
+- Remove duplicate-only chunks, but keep near matches and short ambiguous overlaps unchanged.
+
+Reason:
+
+- Whisper can repeat a phrase at chunk boundaries during long recordings.
+- Aggressive semantic rewriting could remove meaningful meeting text, so the rule must be predictable and easy to test.
+- Per-source stitching avoids mixing system-audio context with microphone context.
+
+## 2026-06-08: Protocol Output Is A Draft
+
+Decision:
+
+- Start protocol output with the neutral document title `Черновик протокола`.
+- Format fragment headers as `Фрагмент N · start-end`.
+- Do not invent semantic sections such as decisions or tasks.
+- Keep the protocol draft as plain editable/copyable text.
+- Do not change ordinary dictation formatting.
+
+Reason:
+
+- The user needs a draft protocol, not a recognition log.
+- Neutral formatting improves readability without pretending to understand meeting decisions.
+- Ordinary dictation and protocol mode have different output expectations.

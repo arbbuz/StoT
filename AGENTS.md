@@ -5,7 +5,9 @@ Common Codex rules live in `C:\Users\Olga\.codex\AGENTS.md`. Do not duplicate th
 - Working folder: `C:\Users\Olga\Documents\VoiceHelper`.
 - The product name is Dicta; the repository folder may still be named `VoiceHelper`.
 - Main GUI source: `dicta.py`.
-- Packaged executable for manual verification: `C:\Users\Olga\Documents\VoiceHelper\dist\Dicta\Dicta.exe`.
+- Packaged executable for DictaProtocol manual verification: `C:\Users\Olga\Documents\VoiceHelper\dist\DictaProtocol\Dicta.exe`.
+- When reporting the ready EXE for manual verification, provide it as a clickable Markdown file link to the absolute path.
+- `scripts\build_dicta_exe.ps1` defaults to `dist\Dicta`; build this branch with `.\scripts\build_dicta_exe.ps1 -PackageVersion "1.1-pilot-protocol" -DistRoot "dist\DictaProtocol"`.
 - Do not commit or push unless the user explicitly asks.
 - Before code, packaging, or documentation changes, check `git status --short` and the relevant diff.
 - Preserve the local package layout: `models`, `.tools`, `assets`, `docs`, and `scripts` must stay next to `Dicta.exe` in the packaged folder.

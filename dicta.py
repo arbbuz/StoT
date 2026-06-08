@@ -184,6 +184,10 @@ SYSTEM_AUDIO_TEST_SECONDS = 1.5
 PROTOCOL_CHUNK_SECONDS = 60.0
 PROTOCOL_FINAL_CHUNK_MIN_SECONDS = 1.0
 PROTOCOL_PARAGRAPH_MAX_WORDS = 70
+PROTOCOL_DRAFT_TITLE = "Черновик протокола"
+PROTOCOL_STITCH_MIN_OVERLAP_WORDS = 4
+PROTOCOL_STITCH_MAX_OVERLAP_WORDS = 32
+PROTOCOL_STITCH_MIN_OVERLAP_CHARS = 18
 PROTOCOL_SOURCE_LABELS = {
     "system": "Системный звук",
     "microphone": "Микрофон",
@@ -2977,6 +2981,59 @@ def protocol_text_paragraphs(text: str, max_words: int = PROTOCOL_PARAGRAPH_MAX_
     return [paragraph for paragraph in paragraphs if paragraph]
 
 
+def protocol_stitch_words(text: str) -> list[tuple[str, int, int]]:
+    return [
+        (match.group(0).casefold().replace("ё", "е"), match.start(), match.end())
+        for match in re.finditer(r"[0-9A-Za-zА-Яа-яЁё]+", text)
+    ]
+
+
+def protocol_repeated_prefix_has_boundary(text: str, prefix_end: int) -> bool:
+    tail = text[prefix_end:]
+    if not tail.strip():
+        return True
+    return bool(re.match(r'^\s*(?:["»”)\]]\s*)*[.!?…]', tail))
+
+
+def protocol_repeated_prefix_end(previous_text: str, current_text: str) -> int:
+    previous_words = protocol_stitch_words(previous_text)
+    current_words = protocol_stitch_words(current_text)
+    max_overlap = min(
+        len(previous_words),
+        len(current_words),
+        PROTOCOL_STITCH_MAX_OVERLAP_WORDS,
+    )
+    if max_overlap < PROTOCOL_STITCH_MIN_OVERLAP_WORDS:
+        return 0
+
+    previous_normalized = [word for word, _start, _end in previous_words]
+    current_normalized = [word for word, _start, _end in current_words]
+    for word_count in range(max_overlap, PROTOCOL_STITCH_MIN_OVERLAP_WORDS - 1, -1):
+        if previous_normalized[-word_count:] != current_normalized[:word_count]:
+            continue
+        overlap_start = current_words[0][1]
+        overlap_end = current_words[word_count - 1][2]
+        overlap_chars = overlap_end - overlap_start
+        normalized_chars = sum(len(word) for word in current_normalized[:word_count])
+        if overlap_chars < PROTOCOL_STITCH_MIN_OVERLAP_CHARS and normalized_chars < PROTOCOL_STITCH_MIN_OVERLAP_CHARS:
+            continue
+        if protocol_repeated_prefix_has_boundary(current_text, overlap_end):
+            return overlap_end
+    return 0
+
+
+def stitch_protocol_chunk_text(previous_text: str, current_text: str) -> str:
+    current = str(current_text or "").strip()
+    if not current:
+        return ""
+    prefix_end = protocol_repeated_prefix_end(str(previous_text or ""), current)
+    if prefix_end <= 0:
+        return current
+    trimmed = re.sub(r'^[\s,.;:!?…"»“”)\]\-]+', "", current[prefix_end:])
+    trimmed = normalize_punctuation_spacing(trimmed)
+    return capitalize_text(trimmed) if trimmed else ""
+
+
 def format_protocol_timestamp(seconds: object) -> str:
     try:
         total_seconds = max(0, int(round(float(seconds))))
@@ -2987,6 +3044,10 @@ def format_protocol_timestamp(seconds: object) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_protocol_document_title() -> str:
+    return PROTOCOL_DRAFT_TITLE
 
 
 def format_protocol_chunk_header(
@@ -3002,7 +3063,7 @@ def format_protocol_chunk_header(
         return f"Фрагмент {index}"
     return (
         f"Фрагмент {index} "
-        f"({format_protocol_timestamp(start_seconds)}-{format_protocol_timestamp(end_seconds)})"
+        f"· {format_protocol_timestamp(start_seconds)}-{format_protocol_timestamp(end_seconds)}"
     )
 
 
@@ -3766,8 +3827,11 @@ def run_text_cleanup_self_test() -> None:
     if "\n\n" not in protocol_text:
         raise AssertionError(f"protocol chunk paragraphs failed: {protocol_text!r}")
     protocol_timed_text = format_protocol_chunk_text(4, "Текст.", start_seconds=60, end_seconds=125)
-    if not protocol_timed_text.startswith("Фрагмент 4 (01:00-02:05)\n"):
+    if not protocol_timed_text.startswith("Фрагмент 4 · 01:00-02:05\n"):
         raise AssertionError(f"protocol chunk time range failed: {protocol_timed_text!r}")
+    protocol_document = f"{format_protocol_document_title()}\n\n{protocol_timed_text}"
+    if not protocol_document.startswith("Черновик протокола\n\nФрагмент 4 · 01:00-02:05\n"):
+        raise AssertionError(f"protocol draft title failed: {protocol_document!r}")
     abbreviation_text = apply_ru_latin_abbreviation_replacements(
         "Инспектор DPS проверяет PDD после D.T.P.; D P S рядом. GPS, USB и API остаются."
     ).text
@@ -3787,12 +3851,30 @@ def run_text_cleanup_self_test() -> None:
         start_seconds=0,
         end_seconds=60,
     )
-    if not protocol_sources_text.startswith("Фрагмент 3 (00:00-01:00)\n\n"):
+    if not protocol_sources_text.startswith("Фрагмент 3 · 00:00-01:00\n\n"):
         raise AssertionError(f"protocol source header failed: {protocol_sources_text!r}")
     if "Системный звук:\nСистемный текст." not in protocol_sources_text:
         raise AssertionError(f"protocol system block failed: {protocol_sources_text!r}")
     if "Микрофон:\nМикрофонный текст." not in protocol_sources_text:
         raise AssertionError(f"protocol microphone block failed: {protocol_sources_text!r}")
+    stitched_protocol_text = stitch_protocol_chunk_text(
+        "По итогам встречи команда согласовала сроки проекта.",
+        "Команда согласовала сроки проекта. Затем перешли к рискам.",
+    )
+    if stitched_protocol_text != "Затем перешли к рискам.":
+        raise AssertionError(f"protocol repeated boundary was not stitched: {stitched_protocol_text!r}")
+    duplicate_protocol_text = stitch_protocol_chunk_text(
+        "Нужно подготовить отчет до пятницы.",
+        "Нужно подготовить отчет до пятницы.",
+    )
+    if duplicate_protocol_text:
+        raise AssertionError(f"protocol duplicate-only chunk was not removed: {duplicate_protocol_text!r}")
+    conservative_protocol_text = stitch_protocol_chunk_text(
+        "Нам нужен новый план.",
+        "Нам нужен новый план закупок.",
+    )
+    if conservative_protocol_text != "Нам нужен новый план закупок.":
+        raise AssertionError(f"protocol stitching was too aggressive: {conservative_protocol_text!r}")
 
     filter_rate = SAMPLE_RATE
 
@@ -4346,6 +4428,7 @@ class DictaApp:
         self.protocol_chunks_queued = 0
         self.protocol_chunks_recognized = 0
         self.protocol_text_started = False
+        self.protocol_previous_text_by_label: dict[str, str] = {}
         self.protocol_diagnostics_enabled = False
         self.protocol_diagnostics_dir: Path | None = None
         self.protocol_diagnostics_log_path: Path | None = None
@@ -6532,6 +6615,7 @@ class DictaApp:
         self.protocol_chunks_queued = 0
         self.protocol_chunks_recognized = 0
         self.protocol_text_started = False
+        self.protocol_previous_text_by_label = {}
         self.recording_temp_paths = []
         self.protocol_diagnostics_enabled = bool(self.protocol_diagnostics_var.get())
         self.protocol_diagnostics_dir = None
@@ -6566,6 +6650,7 @@ class DictaApp:
         self.protocol_system_chunk_bytes = 0
         self.protocol_microphone_chunk_bytes = 0
         self.protocol_elapsed_seconds = 0.0
+        self.protocol_previous_text_by_label = {}
         self.is_protocol_recognizing = False
 
     def _protocol_chunk_seconds_locked(self) -> float:
@@ -8482,13 +8567,21 @@ class DictaApp:
                                 prepared = apply_ru_recognition_postprocess(prepared).text
                             except Exception:
                                 pass
+                        source_label = str(source.get("label", "Источник"))
+                        source_state_key = str(source.get("key", source_label)).strip() or source_label or "source"
+                        prepared = stitch_protocol_chunk_text(
+                            self.protocol_previous_text_by_label.get(source_state_key, ""),
+                            prepared,
+                        )
                         if prepared:
                             prepared_sources.append(
                                 {
-                                    "label": str(source.get("label", "Источник")),
+                                    "key": source_state_key,
+                                    "label": source_label,
                                     "text": prepared,
                                 }
                             )
+                            self.protocol_previous_text_by_label[source_state_key] = prepared
                             primary_source = source
                 else:
                     self._set_text_spellcheck_language_from_mode(recognition_mode_key)
@@ -8503,13 +8596,19 @@ class DictaApp:
                             prepared = apply_ru_recognition_postprocess(prepared).text
                         except Exception:
                             pass
+                    prepared = stitch_protocol_chunk_text(
+                        self.protocol_previous_text_by_label.get("single", ""),
+                        prepared,
+                    )
                     if prepared:
-                        prepared_sources.append({"label": "", "text": prepared})
+                        prepared_sources.append({"key": "single", "label": "", "text": prepared})
+                        self.protocol_previous_text_by_label["single"] = prepared
                         primary_source = result
 
                 if prepared_sources:
                     if not self.protocol_text_started:
                         self.text.delete("1.0", tk.END)
+                        self.text.insert(tk.END, format_protocol_document_title())
                         self.protocol_text_started = True
                         self.format_undo_snapshot = None
                         self._set_format_action_label("Автоформат")
