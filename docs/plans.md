@@ -8,8 +8,8 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
 
 - Branch: `DictaProtocol`.
 - Packaged EXE for manual checks: `C:\Users\Olga\Documents\VoiceHelper\dist\DictaProtocol\Dicta.exe`.
-- Latest pushed protocol commit: `a055042 Improve mini panel controls and abbreviation normalization`.
-- Current local work after that commit contains stage 3.3 chunk stitching, `-DistRoot` build-script support, stage 3.4 draft protocol formatting, and restored stage 3.5/3.6 planning; commit/push is still pending.
+- Latest pushed protocol commit: `ccfab8f Complete protocol stitching and draft output`.
+- Current local work after that commit contains implemented stage 3.5 long-recording UI and a fresh packaged build; commit/push is still pending.
 - Do not commit or push unless the user explicitly asks.
 
 ## Active Plan
@@ -60,25 +60,63 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
    - Success signal: protocol output looks like a draft protocol, not a recognition log.
 
 7. Stage 3.5: long-recording UI
-   - Status: next planned work after 3.4.
+   - Status: implemented in code and fresh packaged build.
    - Problem: during long recognition the user must understand that Dicta is working and has not frozen.
-   - Planned: show a counter such as `Фрагментов готово: 2/5`.
-   - Planned: show clear states: `Запись`, `Обработка фрагмента`, `Протокол готов`.
-   - Planned: keep the interface responsive or at least visibly busy with an understandable status.
-   - Planned: preserve tray and mini-panel behavior without regressions.
+   - Implemented: show a compact counter on the right side of the lower status bar.
+   - Implemented: keep the protocol status empty while Dicta is idle, instead of showing `Протокол: -`.
+   - Implemented: show clear states: `Запись`, `Обработка фрагмента`, `Протокол готов`.
+   - Implemented: count silent/no-text chunks as processed so long recognition does not look stuck.
+   - Implemented: keep the protocol status readable in windowed mode by moving it to a second lower-bar row when the window is too narrow.
+   - Implemented: show real system clock time in visible protocol fragment headers instead of only technical offsets from recording start.
+   - Implemented: filter long same-fragment system-audio repeats out of the microphone block while preserving short unique microphone phrases.
+   - Implemented: mark clearly low-quality protocol sentences as `[неразборчиво]` when Windows spellcheck sees a dense cluster of invalid words.
+   - Implemented: keep mini-panel and tray code paths unchanged except existing recognition cancel behavior.
+   - Validation: quick tests and packaged EXE tests passed; full manual regression remains in stage 3.6.
    - Success signal: during a long recording it is clear that Dicta has not frozen.
 
 8. Stage 3.6: reliability and manual verification
-   - Status: planned after 3.5.
-   - Planned check: short microphone-only recording.
-   - Planned check: short system-audio-only recording.
-   - Planned check: combined recording with system audio and microphone.
-   - Planned check: 3-5 minute recording.
-   - Planned check: recording with silence in one source.
-   - Planned check: minimize to tray during recording.
-   - Planned check: stop recording from the mini-panel.
-   - Planned check: launch a second app instance and verify the existing window opens.
-   - Success signal: stage 3 behavior passes the minimum manual verification set in the packaged EXE.
+   - Status: automated/package verification executed; real audio manual checks remain before closing the stage.
+   - Passed: source quick tests and packaged EXE quick tests for formatting and post-processing.
+   - Passed: packaged `dist\DictaProtocol` verification; manifest and SHA256 checks completed.
+   - Passed: packaged diagnostic completed with zero blocking failures.
+   - Passed: packaged EXE launches, a second instance exits and restores the existing window, and minimizing shows the tray mini-panel.
+   - Passed: a short silent recording can be started, minimized, and stopped from the mini-panel; the mini-panel returns to the record state.
+   - Warning: microphone diagnostics opened devices but measured 0% peak, so microphone speech recognition cannot be accepted from automation alone.
+   - Warning: packaged diagnostic reported no Dicta firewall rule and temporary Dicta files in `%TEMP%`; network audit was intentionally skipped.
+   - Pending manual check: short microphone-only recording with real speech.
+   - Pending manual check: short system-audio-only recording with real playback.
+   - Pending manual check: combined recording with system audio and microphone.
+   - Pending manual check: 3-5 minute recording.
+   - Pending manual check: recording with one real source silent while the other has audio.
+   - Success signal: stage 3 behavior passes the full manual verification set in the packaged EXE.
+
+9. Stage 4: source separation quality
+   - Status: approved plan after stage 3.6.
+   - Goal: improve the practical separation of `Системный звук` and `Микрофон` in protocol mode without requiring a heavier model or cloud services.
+   - Principle: if a microphone block is mostly leaked system audio or recognition garbage, do not show it as microphone speech.
+   - Constraint: keep ordinary dictation unchanged.
+
+10. Stage 4.1: separation diagnostics
+    - Planned: write per-fragment diagnostics for system activity duration, microphone activity duration, muted microphone duration, and text similarity between sources.
+    - Planned: include enough data to explain why a microphone block was kept, removed, or marked unclear.
+    - Success signal: after a bad combined recording, diagnostics show whether the microphone block was real speech, leaked system audio, or unclear audio.
+
+11. Stage 4.2: delayed system-audio leakage
+    - Planned: account for small delay between system audio playback and the same sound reaching the microphone.
+    - Planned: test several conservative offsets around system activity before muting microphone spans.
+    - Constraint: do not remove independent microphone phrases that happen shortly before or after system speech.
+    - Success signal: microphone blocks contain fewer delayed copies of system audio.
+
+12. Stage 4.3: hide non-microphone blocks
+    - Planned: if the microphone result is mostly the system-audio text, hide the microphone block entirely instead of showing duplicate text or `[неразборчиво]`.
+    - Planned: keep short unique microphone phrases when they are separable from the system repeat.
+    - Success signal: the protocol does not present leaked system audio as microphone speech.
+
+13. Stage 4.4: source-quality manual regression
+    - Planned: check YouTube/system playback with short microphone comments.
+    - Planned: check pauses, one-source silence, and simultaneous speech.
+    - Planned: confirm that useful microphone phrases remain visible and leaked/mixed blocks are removed or marked unclear.
+    - Success signal: the protocol is cleaner in the known bad cases without hiding real microphone comments.
 
 ## Stage 3 Work Order
 

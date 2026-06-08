@@ -188,6 +188,12 @@ PROTOCOL_DRAFT_TITLE = "Черновик протокола"
 PROTOCOL_STITCH_MIN_OVERLAP_WORDS = 4
 PROTOCOL_STITCH_MAX_OVERLAP_WORDS = 32
 PROTOCOL_STITCH_MIN_OVERLAP_CHARS = 18
+PROTOCOL_CROSS_SOURCE_MIN_OVERLAP_WORDS = 8
+PROTOCOL_CROSS_SOURCE_MAX_OVERLAP_WORDS = 80
+PROTOCOL_UNCLEAR_MARKER = "[неразборчиво]"
+PROTOCOL_UNCLEAR_MIN_WORDS = 4
+PROTOCOL_UNCLEAR_MIN_ERRORS = 3
+PROTOCOL_UNCLEAR_ERROR_RATIO = 0.3
 PROTOCOL_SOURCE_LABELS = {
     "system": "Системный звук",
     "microphone": "Микрофон",
@@ -2946,11 +2952,7 @@ def protocol_text_paragraphs(text: str, max_words: int = PROTOCOL_PARAGRAPH_MAX_
     if not normalized:
         return []
 
-    sentences = [
-        match.group(0).strip()
-        for match in re.finditer(r'[^.!?…]+[.!?…]+["»“”]?|[^.!?…]+$', normalized)
-        if match.group(0).strip()
-    ]
+    sentences = [sentence for _start, _end, sentence in protocol_sentence_spans(normalized)]
     if not sentences:
         return split_long_protocol_sentence(normalized, max_words=max_words)
 
@@ -2979,6 +2981,14 @@ def protocol_text_paragraphs(text: str, max_words: int = PROTOCOL_PARAGRAPH_MAX_
     if current:
         paragraphs.append(" ".join(current).strip())
     return [paragraph for paragraph in paragraphs if paragraph]
+
+
+def protocol_sentence_spans(text: str) -> list[tuple[int, int, str]]:
+    return [
+        (match.start(), match.end(), match.group(0).strip())
+        for match in re.finditer(r'[^.!?…]+[.!?…]+["»“”]?|[^.!?…]+$', str(text or ""))
+        if match.group(0).strip()
+    ]
 
 
 def protocol_stitch_words(text: str) -> list[tuple[str, int, int]]:
@@ -3034,6 +3044,168 @@ def stitch_protocol_chunk_text(previous_text: str, current_text: str) -> str:
     return capitalize_text(trimmed) if trimmed else ""
 
 
+def protocol_longest_cross_source_overlap(reference_text: str, candidate_text: str) -> tuple[int, int] | None:
+    reference_words = protocol_stitch_words(reference_text)
+    candidate_words = protocol_stitch_words(candidate_text)
+    max_words = min(
+        len(reference_words),
+        len(candidate_words),
+        PROTOCOL_CROSS_SOURCE_MAX_OVERLAP_WORDS,
+    )
+    if max_words < PROTOCOL_CROSS_SOURCE_MIN_OVERLAP_WORDS:
+        return None
+
+    reference_normalized = [word for word, _start, _end in reference_words]
+    candidate_normalized = [word for word, _start, _end in candidate_words]
+    for word_count in range(max_words, PROTOCOL_CROSS_SOURCE_MIN_OVERLAP_WORDS - 1, -1):
+        reference_sequences = {
+            tuple(reference_normalized[start : start + word_count])
+            for start in range(0, len(reference_normalized) - word_count + 1)
+        }
+        for start in range(0, len(candidate_normalized) - word_count + 1):
+            sequence = tuple(candidate_normalized[start : start + word_count])
+            if sequence not in reference_sequences:
+                continue
+            char_start = candidate_words[start][1]
+            char_end = candidate_words[start + word_count - 1][2]
+            if char_end - char_start >= PROTOCOL_STITCH_MIN_OVERLAP_CHARS:
+                return char_start, char_end
+    return None
+
+
+def remove_protocol_cross_source_overlap(reference_text: str, candidate_text: str) -> str:
+    result = str(candidate_text or "").strip()
+    reference = str(reference_text or "").strip()
+    if not result or not reference:
+        return result
+
+    for _ in range(4):
+        overlap = protocol_longest_cross_source_overlap(reference, result)
+        if overlap is None:
+            break
+        start, end = overlap
+        before = result[:start].rstrip()
+        after = result[end:].lstrip(" \t\r\n,.;:!?…-—")
+        if before and after:
+            result = f"{before.rstrip(' \t\r\n,;:-—')} {after}"
+        else:
+            result = before.strip() or after.strip()
+        result = normalize_punctuation_spacing(result.strip())
+        if not result:
+            break
+    return result
+
+
+def filter_protocol_source_text_overlaps(sources: list[dict]) -> list[dict]:
+    system_text = " ".join(
+        str(source.get("text", "")).strip()
+        for source in sources
+        if str(source.get("key", "")).strip() == "system" and str(source.get("text", "")).strip()
+    )
+    if not system_text:
+        return sources
+
+    filtered: list[dict] = []
+    for source in sources:
+        item = dict(source)
+        if str(item.get("key", "")).strip() == "microphone":
+            item["text"] = remove_protocol_cross_source_overlap(system_text, str(item.get("text", "")))
+        if str(item.get("text", "")).strip():
+            filtered.append(item)
+    return filtered
+
+
+def protocol_effective_spelling_issues(
+    text: str,
+    issues: list[SpellingIssue],
+    dictionary: "RuRecognitionDictionary",
+) -> list[SpellingIssue]:
+    effective: list[SpellingIssue] = []
+    for issue in issues:
+        word = str(issue.word or "").strip()
+        if not word:
+            continue
+        word_key = word.casefold()
+        if word_key in dictionary.known_words or word_key in dictionary.protected_words:
+            continue
+        if is_protected_spellcheck_word(word) or is_protected_spellcheck_context(
+            text,
+            int(issue.start),
+            int(issue.start) + int(issue.length),
+        ):
+            continue
+        effective.append(issue)
+    return effective
+
+
+def protocol_sentence_is_unclear(
+    sentence: str,
+    sentence_start: int,
+    sentence_end: int,
+    issues: list[SpellingIssue],
+) -> bool:
+    words = protocol_stitch_words(sentence)
+    word_count = len(words)
+    if word_count < PROTOCOL_UNCLEAR_MIN_WORDS:
+        return False
+
+    issue_count = 0
+    for issue in issues:
+        issue_start = int(issue.start)
+        issue_end = issue_start + int(issue.length)
+        if sentence_start <= issue_start and issue_end <= sentence_end:
+            issue_count += 1
+
+    if issue_count < PROTOCOL_UNCLEAR_MIN_ERRORS:
+        return False
+    return issue_count / max(1, word_count) >= PROTOCOL_UNCLEAR_ERROR_RATIO
+
+
+def mark_unclear_protocol_text(text: str, recognition_mode_key: object = RUSSIAN_RECOGNITION_MODE_KEY) -> str:
+    value = normalize_punctuation_spacing(str(text or ""))
+    if not value.strip() or str(recognition_mode_key) != RUSSIAN_RECOGNITION_MODE_KEY:
+        return value.strip()
+    if PROTOCOL_UNCLEAR_MARKER in value:
+        return value.strip()
+
+    spans = protocol_sentence_spans(value)
+    if not spans:
+        return value.strip()
+
+    try:
+        dictionary = load_ru_recognition_dictionary()
+        issues = protocol_effective_spelling_issues(value, check_text(value, language_tag="ru-RU"), dictionary)
+    except Exception:
+        return value.strip()
+
+    replacements: list[tuple[int, int]] = []
+    for start, end, sentence in spans:
+        if protocol_sentence_is_unclear(sentence, start, end, issues):
+            replacements.append((start, end))
+
+    if not replacements:
+        return value.strip()
+
+    result = value
+    replacement = f"{PROTOCOL_UNCLEAR_MARKER}."
+    for start, end in reversed(replacements):
+        result = result[:start] + replacement + result[end:]
+    return normalize_punctuation_spacing(result).strip()
+
+
+def mark_unclear_protocol_sources(sources: list[dict]) -> list[dict]:
+    filtered: list[dict] = []
+    for source in sources:
+        item = dict(source)
+        item["text"] = mark_unclear_protocol_text(
+            str(item.get("text", "")),
+            recognition_mode_key=item.get("recognition_mode_key", RUSSIAN_RECOGNITION_MODE_KEY),
+        )
+        if str(item.get("text", "")).strip():
+            filtered.append(item)
+    return filtered
+
+
 def format_protocol_timestamp(seconds: object) -> str:
     try:
         total_seconds = max(0, int(round(float(seconds))))
@@ -3046,6 +3218,25 @@ def format_protocol_timestamp(seconds: object) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def format_protocol_clock_timestamp(timestamp: object) -> str:
+    try:
+        value = float(timestamp)
+    except Exception:
+        return ""
+    try:
+        return time.strftime("%H:%M", time.localtime(value))
+    except Exception:
+        return ""
+
+
+def format_protocol_clock_range(start_timestamp: object, end_timestamp: object) -> str:
+    start = format_protocol_clock_timestamp(start_timestamp)
+    end = format_protocol_clock_timestamp(end_timestamp)
+    if start and end:
+        return f"{start}-{end}"
+    return ""
+
+
 def format_protocol_document_title() -> str:
     return PROTOCOL_DRAFT_TITLE
 
@@ -3054,11 +3245,17 @@ def format_protocol_chunk_header(
     chunk_index: object,
     start_seconds: object | None = None,
     end_seconds: object | None = None,
+    start_timestamp: object | None = None,
+    end_timestamp: object | None = None,
 ) -> str:
     try:
         index = max(1, int(chunk_index))
     except (TypeError, ValueError):
         index = 1
+    if start_timestamp is not None and end_timestamp is not None:
+        clock_range = format_protocol_clock_range(start_timestamp, end_timestamp)
+        if clock_range:
+            return f"Фрагмент {index} · {clock_range}"
     if start_seconds is None or end_seconds is None:
         return f"Фрагмент {index}"
     return (
@@ -3072,8 +3269,16 @@ def format_protocol_chunk_text(
     text: str,
     start_seconds: object | None = None,
     end_seconds: object | None = None,
+    start_timestamp: object | None = None,
+    end_timestamp: object | None = None,
 ) -> str:
-    header = format_protocol_chunk_header(chunk_index, start_seconds, end_seconds)
+    header = format_protocol_chunk_header(
+        chunk_index,
+        start_seconds,
+        end_seconds,
+        start_timestamp=start_timestamp,
+        end_timestamp=end_timestamp,
+    )
     body = "\n\n".join(protocol_text_paragraphs(text))
     return f"{header}\n{body}" if body else header
 
@@ -3083,8 +3288,16 @@ def format_protocol_chunk_sources(
     sources: list[dict],
     start_seconds: object | None = None,
     end_seconds: object | None = None,
+    start_timestamp: object | None = None,
+    end_timestamp: object | None = None,
 ) -> str:
-    header = format_protocol_chunk_header(chunk_index, start_seconds, end_seconds)
+    header = format_protocol_chunk_header(
+        chunk_index,
+        start_seconds,
+        end_seconds,
+        start_timestamp=start_timestamp,
+        end_timestamp=end_timestamp,
+    )
     blocks: list[str] = []
     for source in sources:
         label = str(source.get("label", "")).strip() or "Источник"
@@ -3093,6 +3306,41 @@ def format_protocol_chunk_sources(
             blocks.append(f"{label}:\n{body}")
 
     return f"{header}\n\n" + "\n\n".join(blocks) if blocks else header
+
+
+def format_protocol_progress_status(
+    state: object,
+    done: object = 0,
+    total: object = 0,
+    active_chunk_index: object | None = None,
+) -> str:
+    state_text = str(state or "").strip()
+    if not state_text:
+        return ""
+    try:
+        done_count = max(0, int(done))
+    except Exception:
+        done_count = 0
+    try:
+        total_count = max(0, int(total))
+    except Exception:
+        total_count = 0
+    try:
+        active_index = max(0, int(active_chunk_index)) if active_chunk_index is not None else 0
+    except Exception:
+        active_index = 0
+
+    total_count = max(total_count, done_count, active_index)
+    done_count = min(done_count, total_count) if total_count else 0
+    counter = f"готово {done_count}/{total_count}" if total_count else ""
+
+    if state_text == "Запись":
+        return f"Запись встречи · {counter}" if counter else "Запись встречи"
+    if state_text == "Обработка фрагмента" and active_index:
+        return f"Обработка фрагмента {active_index}/{total_count} · {counter}"
+    if state_text == "Протокол готов":
+        return f"Протокол готов · фрагментов {done_count}/{total_count}"
+    return f"{state_text} · {counter}" if counter else state_text
 
 
 @dataclass(frozen=True)
@@ -3829,6 +4077,17 @@ def run_text_cleanup_self_test() -> None:
     protocol_timed_text = format_protocol_chunk_text(4, "Текст.", start_seconds=60, end_seconds=125)
     if not protocol_timed_text.startswith("Фрагмент 4 · 01:00-02:05\n"):
         raise AssertionError(f"protocol chunk time range failed: {protocol_timed_text!r}")
+    protocol_clock_text = format_protocol_chunk_text(
+        4,
+        "Текст.",
+        start_seconds=60,
+        end_seconds=125,
+        start_timestamp=1_700_000_000,
+        end_timestamp=1_700_000_060,
+    )
+    expected_clock_range = format_protocol_clock_range(1_700_000_000, 1_700_000_060)
+    if not protocol_clock_text.startswith(f"Фрагмент 4 · {expected_clock_range}\n"):
+        raise AssertionError(f"protocol chunk clock range failed: {protocol_clock_text!r}")
     protocol_document = f"{format_protocol_document_title()}\n\n{protocol_timed_text}"
     if not protocol_document.startswith("Черновик протокола\n\nФрагмент 4 · 01:00-02:05\n"):
         raise AssertionError(f"protocol draft title failed: {protocol_document!r}")
@@ -3857,6 +4116,17 @@ def run_text_cleanup_self_test() -> None:
         raise AssertionError(f"protocol system block failed: {protocol_sources_text!r}")
     if "Микрофон:\nМикрофонный текст." not in protocol_sources_text:
         raise AssertionError(f"protocol microphone block failed: {protocol_sources_text!r}")
+    protocol_progress_text = format_protocol_progress_status(
+        "Обработка фрагмента",
+        done=2,
+        total=5,
+        active_chunk_index=3,
+    )
+    if protocol_progress_text != "Обработка фрагмента 3/5 · готово 2/5":
+        raise AssertionError(f"protocol progress status failed: {protocol_progress_text!r}")
+    protocol_ready_text = format_protocol_progress_status("Протокол готов", done=5, total=5)
+    if protocol_ready_text != "Протокол готов · фрагментов 5/5":
+        raise AssertionError(f"protocol ready status failed: {protocol_ready_text!r}")
     stitched_protocol_text = stitch_protocol_chunk_text(
         "По итогам встречи команда согласовала сроки проекта.",
         "Команда согласовала сроки проекта. Затем перешли к рискам.",
@@ -3875,6 +4145,40 @@ def run_text_cleanup_self_test() -> None:
     )
     if conservative_protocol_text != "Нам нужен новый план закупок.":
         raise AssertionError(f"protocol stitching was too aggressive: {conservative_protocol_text!r}")
+
+    filtered_sources = filter_protocol_source_text_overlaps(
+        [
+            {
+                "key": "system",
+                "label": PROTOCOL_SOURCE_LABELS["system"],
+                "text": (
+                    "За то расскажу вам малоизвестный лайфхак, когда выезжать можно "
+                    "на встречную полосу, даже несмотря на знак запрета обгона."
+                ),
+            },
+            {
+                "key": "microphone",
+                "label": PROTOCOL_SOURCE_LABELS["microphone"],
+                "text": (
+                    "Ужас. Сегодня разберем. За то расскажу вам малоизвестный лайфхак, "
+                    "когда выезжать можно на встречную полосу, даже несмотря на знак запрета обгона."
+                ),
+            },
+        ]
+    )
+    microphone_filtered_text = next(
+        source["text"] for source in filtered_sources if source.get("key") == "microphone"
+    )
+    if microphone_filtered_text != "Ужас. Сегодня разберем.":
+        raise AssertionError(f"protocol cross-source filtering failed: {microphone_filtered_text!r}")
+    unclear_text = mark_unclear_protocol_text(
+        "И шумски, сегодня один из самых полезных фускудлей Пайдзарай и Продвинд Гитры."
+    )
+    if unclear_text != f"{PROTOCOL_UNCLEAR_MARKER}.":
+        raise AssertionError(f"protocol unclear marker failed: {unclear_text!r}")
+    rare_name_text = mark_unclear_protocol_text("Пайдзарай выступил.")
+    if rare_name_text != "Пайдзарай выступил.":
+        raise AssertionError(f"protocol unclear marker is too aggressive: {rare_name_text!r}")
 
     filter_rate = SAMPLE_RATE
 
@@ -4401,6 +4705,7 @@ class DictaApp:
         self.is_translating = False
         self.is_protocol_recognizing = False
         self.record_started_at: float | None = None
+        self.record_wall_started_at: float | None = None
         self.record_sample_rate = SAMPLE_RATE
         self.recognition_progress_started_at = 0.0
         self.recognition_progress_estimate_seconds = 90.0
@@ -4427,6 +4732,9 @@ class DictaApp:
         self.protocol_elapsed_seconds = 0.0
         self.protocol_chunks_queued = 0
         self.protocol_chunks_recognized = 0
+        self.protocol_chunks_processed = 0
+        self.protocol_active_chunk_index = 0
+        self.protocol_chunks_finalized = False
         self.protocol_text_started = False
         self.protocol_previous_text_by_label: dict[str, str] = {}
         self.protocol_diagnostics_enabled = False
@@ -4482,6 +4790,10 @@ class DictaApp:
         self.recognition_time_var = tk.StringVar(value="-")
         self.recognition_progress_var = tk.DoubleVar(value=0)
         self.recognition_progress_text_var = tk.StringVar(value="0%")
+        self.protocol_status_var = tk.StringVar(value="")
+        self.protocol_status_layout_after_id: str | None = None
+        self.protocol_status_is_wrapped = False
+        self.status_bar_primary_widgets: list[tk.Widget] = []
         self.firewall_status_var = tk.StringVar(value="Сеть: проверка...")
         initial_model_key = sanitize_model_key(
             self.settings.get("model_key", FALLBACK_AUTO_MODEL_KEY),
@@ -4633,11 +4945,14 @@ class DictaApp:
 
         ttk.Separator(self.root, orient="horizontal").grid(row=2, column=0, sticky="ew")
         status_bar = ttk.Frame(self.root, padding=(12, 4, 12, 6))
+        self.status_bar = status_bar
         status_bar.grid(row=3, column=0, sticky="ew")
-        status_bar.columnconfigure(9, weight=1)
+        status_bar.columnconfigure(8, weight=1)
 
-        ttk.Label(status_bar, text="Статус:").grid(row=0, column=0, sticky="w", padx=(0, 4))
-        ttk.Label(status_bar, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        status_caption_label = ttk.Label(status_bar, text="Статус:")
+        status_caption_label.grid(row=0, column=0, sticky="w", padx=(0, 4))
+        status_value_label = ttk.Label(status_bar, textvariable=self.status_var)
+        status_value_label.grid(row=0, column=1, sticky="w", padx=(0, 8))
         self.recognition_progress_bar = ttk.Progressbar(
             status_bar,
             variable=self.recognition_progress_var,
@@ -4646,7 +4961,8 @@ class DictaApp:
             length=110,
         )
         self.recognition_progress_bar.grid(row=0, column=2, sticky="w", padx=(0, 4))
-        ttk.Label(status_bar, textvariable=self.recognition_progress_text_var, width=5).grid(
+        recognition_progress_label = ttk.Label(status_bar, textvariable=self.recognition_progress_text_var, width=5)
+        recognition_progress_label.grid(
             row=0,
             column=3,
             sticky="w",
@@ -4659,10 +4975,33 @@ class DictaApp:
             mode="determinate",
             length=90,
         )
-        ttk.Label(status_bar, textvariable=self.input_level_text_var).grid(row=0, column=4, sticky="w", padx=(0, 6))
+        input_level_label = ttk.Label(status_bar, textvariable=self.input_level_text_var)
+        input_level_label.grid(row=0, column=4, sticky="w", padx=(0, 6))
         self.input_level_bar.grid(row=0, column=5, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.record_time_var).grid(row=0, column=6, sticky="w", padx=(0, 18))
-        ttk.Label(status_bar, textvariable=self.recognition_time_var).grid(row=0, column=7, sticky="w", padx=(0, 18))
+        record_time_label = ttk.Label(status_bar, textvariable=self.record_time_var)
+        record_time_label.grid(row=0, column=6, sticky="w", padx=(0, 18))
+        recognition_time_label = ttk.Label(status_bar, textvariable=self.recognition_time_var)
+        recognition_time_label.grid(row=0, column=7, sticky="w", padx=(0, 12))
+        self.protocol_status_label = ttk.Label(
+            status_bar,
+            textvariable=self.protocol_status_var,
+            anchor="e",
+            width=36,
+        )
+        self.protocol_status_label.grid(row=0, column=8, sticky="e")
+        self.status_bar_primary_widgets = [
+            status_caption_label,
+            status_value_label,
+            self.recognition_progress_bar,
+            recognition_progress_label,
+            input_level_label,
+            self.input_level_bar,
+            record_time_label,
+            recognition_time_label,
+        ]
+        self.protocol_status_var.trace_add("write", self._schedule_protocol_status_layout)
+        status_bar.bind("<Configure>", self._schedule_protocol_status_layout, add="+")
+        self.root.after_idle(self._layout_protocol_status_label)
 
         self._build_mini_panel()
         self._build_settings_window()
@@ -6372,6 +6711,7 @@ class DictaApp:
         self.recognition_cancel_event.clear()
         self._set_input_level(0)
         self._reset_mini_panel_levels()
+        self._reset_protocol_progress_status()
 
         try:
             self.stream = self._open_recording_stream()
@@ -6402,8 +6742,10 @@ class DictaApp:
 
         self.is_recording = True
         self.record_started_at = time.perf_counter()
+        self.record_wall_started_at = time.time()
         if self.last_recording_source_key == "combined":
             self._set_status("Запись системного звука и микрофона")
+            self._set_protocol_progress_status("Запись")
         elif self.last_recording_source_key == "system":
             self._set_status("Запись системного звука")
         else:
@@ -6614,6 +6956,9 @@ class DictaApp:
         self.protocol_elapsed_seconds = 0.0
         self.protocol_chunks_queued = 0
         self.protocol_chunks_recognized = 0
+        self.protocol_chunks_processed = 0
+        self.protocol_active_chunk_index = 0
+        self.protocol_chunks_finalized = False
         self.protocol_text_started = False
         self.protocol_previous_text_by_label = {}
         self.recording_temp_paths = []
@@ -6651,6 +6996,8 @@ class DictaApp:
         self.protocol_microphone_chunk_bytes = 0
         self.protocol_elapsed_seconds = 0.0
         self.protocol_previous_text_by_label = {}
+        self.protocol_active_chunk_index = 0
+        self.protocol_chunks_finalized = False
         self.is_protocol_recognizing = False
 
     def _protocol_chunk_seconds_locked(self) -> float:
@@ -6678,10 +7025,22 @@ class DictaApp:
         self.protocol_chunk_index += 1
         start_seconds = self.protocol_elapsed_seconds
         end_seconds = start_seconds + duration
+        start_timestamp = (
+            self.record_wall_started_at + start_seconds
+            if self.record_wall_started_at is not None
+            else None
+        )
+        end_timestamp = (
+            self.record_wall_started_at + end_seconds
+            if self.record_wall_started_at is not None
+            else None
+        )
         chunk = {
             "index": self.protocol_chunk_index,
             "start_seconds": start_seconds,
             "end_seconds": end_seconds,
+            "start_timestamp": start_timestamp,
+            "end_timestamp": end_timestamp,
             "system_audio": b"".join(self.protocol_system_chunk_parts),
             "system_rate": self.system_audio_sample_rate,
             "microphone_audio": b"".join(self.protocol_microphone_chunk_parts),
@@ -6700,6 +7059,7 @@ class DictaApp:
         if chunk is None or self.protocol_prepare_queue is None:
             return
         self.protocol_prepare_queue.put(chunk)
+        self.ui_queue.put(("protocol_progress", {"state": "Запись"}))
 
     def _finish_combined_recording_streaming(self) -> bool:
         final_chunk: dict | None = None
@@ -6709,6 +7069,15 @@ class DictaApp:
         self._close_recording_files()
         if self.protocol_prepare_queue is not None:
             self.protocol_prepare_queue.put(None)
+        self.protocol_chunks_finalized = True
+        if self.protocol_chunks_queued:
+            active_index = self._next_protocol_chunk_index() or 1
+            self.ui_queue.put(
+                (
+                    "protocol_progress",
+                    {"state": "Обработка фрагмента", "active_chunk_index": active_index},
+                )
+            )
         self.record_sample_rate = SAMPLE_RATE
         return self.protocol_chunks_queued > 0
 
@@ -6729,6 +7098,8 @@ class DictaApp:
                     chunk_index = int(item.get("index", 0))
                     start_seconds = float(item.get("start_seconds", 0.0))
                     end_seconds = float(item.get("end_seconds", 0.0))
+                    start_timestamp = item.get("start_timestamp")
+                    end_timestamp = item.get("end_timestamp")
                     system_audio = bytes(item.get("system_audio", b""))
                     microphone_audio = bytes(item.get("microphone_audio", b""))
                     system_rate = int(item.get("system_rate", SAMPLE_RATE))
@@ -6789,6 +7160,8 @@ class DictaApp:
                                 "chunk_index": chunk_index,
                                 "start_seconds": round(start_seconds, 3),
                                 "end_seconds": round(end_seconds, 3),
+                                "start_timestamp": start_timestamp,
+                                "end_timestamp": end_timestamp,
                                 "stats": duplicate_filter_stats,
                             },
                         )
@@ -6798,6 +7171,8 @@ class DictaApp:
                             "chunk_index": chunk_index,
                             "start_seconds": round(start_seconds, 3),
                             "end_seconds": round(end_seconds, 3),
+                            "start_timestamp": start_timestamp,
+                            "end_timestamp": end_timestamp,
                             "range": (
                                 f"{format_protocol_timestamp(start_seconds)}-"
                                 f"{format_protocol_timestamp(end_seconds)}"
@@ -6838,6 +7213,8 @@ class DictaApp:
                                 "index": chunk_index,
                                 "start_seconds": start_seconds,
                                 "end_seconds": end_seconds,
+                                "start_timestamp": start_timestamp,
+                                "end_timestamp": end_timestamp,
                                 "sources": sources,
                                 "fallback_audio": fallback_audio,
                                 "fallback_rate": SAMPLE_RATE,
@@ -6872,7 +7249,15 @@ class DictaApp:
                     chunk_index = int(item.get("index", 0))
                     start_seconds = float(item.get("start_seconds", 0.0))
                     end_seconds = float(item.get("end_seconds", 0.0))
+                    start_timestamp = item.get("start_timestamp")
+                    end_timestamp = item.get("end_timestamp")
                     recognition_mode_key = str(item.get("recognition_mode_key", self._selected_recognition_mode_key()))
+                    self.ui_queue.put(
+                        (
+                            "protocol_progress",
+                            {"state": "Обработка фрагмента", "active_chunk_index": chunk_index},
+                        )
+                    )
                     source_results: list[dict] = []
                     source_errors: list[Exception] = []
                     elapsed_total = 0.0
@@ -6903,6 +7288,8 @@ class DictaApp:
                                         "chunk_index": chunk_index,
                                         "start_seconds": round(start_seconds, 3),
                                         "end_seconds": round(end_seconds, 3),
+                                        "start_timestamp": start_timestamp,
+                                        "end_timestamp": end_timestamp,
                                         "source": source_key,
                                         "label": source_label,
                                         "input": self._protocol_audio_diagnostic_stats(
@@ -6923,6 +7310,8 @@ class DictaApp:
                                     "chunk_index": chunk_index,
                                     "start_seconds": round(start_seconds, 3),
                                     "end_seconds": round(end_seconds, 3),
+                                    "start_timestamp": start_timestamp,
+                                    "end_timestamp": end_timestamp,
                                     "source": source_key,
                                     "label": source_label,
                                     "error": str(exc),
@@ -6947,6 +7336,8 @@ class DictaApp:
                             "chunk_index": chunk_index,
                             "start_seconds": round(start_seconds, 3),
                             "end_seconds": round(end_seconds, 3),
+                            "start_timestamp": start_timestamp,
+                            "end_timestamp": end_timestamp,
                             "source": source_key,
                             "label": source_label,
                             "recognized": recognized_text,
@@ -7004,6 +7395,8 @@ class DictaApp:
                                         "chunk_index": chunk_index,
                                         "start_seconds": round(start_seconds, 3),
                                         "end_seconds": round(end_seconds, 3),
+                                        "start_timestamp": start_timestamp,
+                                        "end_timestamp": end_timestamp,
                                         "source_errors": [str(error) for error in source_errors],
                                         "input": self._protocol_audio_diagnostic_stats(fallback_audio, fallback_rate),
                                     },
@@ -7015,6 +7408,8 @@ class DictaApp:
                                         "chunk_index": chunk_index,
                                         "start_seconds": round(start_seconds, 3),
                                         "end_seconds": round(end_seconds, 3),
+                                        "start_timestamp": start_timestamp,
+                                        "end_timestamp": end_timestamp,
                                         "source_errors": [str(error) for error in source_errors],
                                         "error": str(exc),
                                     },
@@ -7030,6 +7425,8 @@ class DictaApp:
                                 "chunk_index": chunk_index,
                                 "start_seconds": round(start_seconds, 3),
                                 "end_seconds": round(end_seconds, 3),
+                                "start_timestamp": start_timestamp,
+                                "end_timestamp": end_timestamp,
                                 "source": "mixed",
                                 "label": PROTOCOL_SOURCE_LABELS["mixed"],
                                 "recognized": fallback_recognized,
@@ -7076,6 +7473,8 @@ class DictaApp:
                                         "elapsed": elapsed_total,
                                         "start_seconds": start_seconds,
                                         "end_seconds": end_seconds,
+                                        "start_timestamp": start_timestamp,
+                                        "end_timestamp": end_timestamp,
                                         "recognition_mode_key": recognition_mode_key,
                                     },
                                 ),
@@ -7088,9 +7487,26 @@ class DictaApp:
                                 "chunk_index": chunk_index,
                                 "start_seconds": round(start_seconds, 3),
                                 "end_seconds": round(end_seconds, 3),
+                                "start_timestamp": start_timestamp,
+                                "end_timestamp": end_timestamp,
                                 "recognition_mode_key": recognition_mode_key,
                                 "source_errors": [str(error) for error in source_errors],
                             },
+                        )
+                        self.ui_queue.put(
+                            (
+                                "protocol_chunk_processed",
+                                (
+                                    chunk_index,
+                                    {
+                                        "start_seconds": start_seconds,
+                                        "end_seconds": end_seconds,
+                                        "start_timestamp": start_timestamp,
+                                        "end_timestamp": end_timestamp,
+                                        "recognition_mode_key": recognition_mode_key,
+                                    },
+                                ),
+                            )
                         )
                 except RecognitionCancelled:
                     cancelled = True
@@ -7132,6 +7548,7 @@ class DictaApp:
             has_protocol_chunks = self._finish_combined_recording_streaming()
             if not has_protocol_chunks:
                 self.record_started_at = None
+                self.record_wall_started_at = None
                 self.record_time_var.set("Запись: 00:00")
                 self.is_protocol_recognizing = False
                 self._set_status("Готово")
@@ -7165,6 +7582,7 @@ class DictaApp:
 
         if not self.audio_chunks:
             self.record_started_at = None
+            self.record_wall_started_at = None
             self.record_time_var.set("Запись: 00:00")
             self._set_status("Готово")
             self._set_record_button_idle()
@@ -7219,6 +7637,8 @@ class DictaApp:
 
         self.recognition_cancel_event.set()
         self._set_status("Прерывание распознавания")
+        if self.is_protocol_recognizing:
+            self._set_protocol_progress_status("Прерывание")
         self._set_record_button_busy("Прерывание")
         with self.recognition_process_lock:
             process = self.recognition_process
@@ -7783,8 +8203,7 @@ class DictaApp:
                 menu.add_command(label="Нет вариантов", state=tk.DISABLED)
 
             menu.add_separator()
-            menu.add_command(label="Считать словом Dicta", command=lambda tag=issue_tag: self._add_dicta_known_word(tag))
-            menu.add_command(label="Добавить в словарь Windows", command=lambda tag=issue_tag: self._add_spelling_word(tag))
+            menu.add_command(label="Больше не считать ошибкой", command=lambda tag=issue_tag: self._add_dicta_known_word(tag))
             menu.add_command(label="Пропустить", command=lambda tag=issue_tag: self._ignore_spelling_issue(tag))
             menu.add_separator()
 
@@ -7839,9 +8258,9 @@ class DictaApp:
 
         if add_ru_dictionary_known_word(issue.word):
             self._ignore_spelling_issue(tag_name)
-            self._set_status(f"Добавлено в словарь Dicta: {issue.word}")
+            self._set_status(f"Больше не считается ошибкой: {issue.word}")
         else:
-            self._set_status("Слово уже есть в словаре Dicta")
+            self._set_status("Слово уже не считается ошибкой")
 
     def _add_selected_dicta_known_words(self) -> None:
         if not self._has_text_selection():
@@ -8147,6 +8566,117 @@ class DictaApp:
         self.input_level_text_var.set(f"Уровень: система {system_value}%, микрофон {microphone_value}%")
         if self.is_recording:
             self._set_mini_panel_levels(system_value, microphone_value)
+
+    def _reset_protocol_progress_status(self) -> None:
+        self.protocol_active_chunk_index = 0
+        self.protocol_chunks_finalized = False
+        self.protocol_chunks_processed = 0
+        self.protocol_status_var.set("")
+
+    def _grid_pad_width(self, widget: tk.Widget) -> int:
+        info = widget.grid_info()
+        padx = info.get("padx", 0)
+        if isinstance(padx, tuple):
+            parts = padx
+        else:
+            parts = str(padx).replace("{", "").replace("}", "").split()
+        values: list[int] = []
+        for part in parts:
+            try:
+                values.append(int(float(part)))
+            except Exception:
+                pass
+        if not values:
+            return 0
+        if len(values) == 1:
+            return values[0] * 2
+        return values[0] + values[1]
+
+    def _widget_outer_reqwidth(self, widget: tk.Widget) -> int:
+        return widget.winfo_reqwidth() + self._grid_pad_width(widget)
+
+    def _schedule_protocol_status_layout(self, *_args: object) -> None:
+        if self.protocol_status_layout_after_id is not None:
+            return
+        self.protocol_status_layout_after_id = self.root.after_idle(self._layout_protocol_status_label)
+
+    def _layout_protocol_status_label(self) -> None:
+        self.protocol_status_layout_after_id = None
+        label = getattr(self, "protocol_status_label", None)
+        status_bar = getattr(self, "status_bar", None)
+        if label is None or status_bar is None:
+            return
+
+        text = self.protocol_status_var.get().strip()
+        if not text:
+            label.grid_remove()
+            self.protocol_status_is_wrapped = False
+            return
+
+        available_width = max(0, status_bar.winfo_width())
+        primary_width = sum(self._widget_outer_reqwidth(widget) for widget in self.status_bar_primary_widgets)
+        protocol_width = label.winfo_reqwidth() + 16
+        single_row_min_width = 1280
+        should_wrap = available_width > 1 and (
+            available_width < single_row_min_width
+            or available_width < primary_width + protocol_width + 24
+        )
+
+        if should_wrap:
+            label.configure(anchor="e", width=0)
+            label.grid(row=1, column=0, columnspan=9, sticky="ew", pady=(3, 0))
+            self.protocol_status_is_wrapped = True
+            return
+
+        label.configure(anchor="e", width=36)
+        label.grid(row=0, column=8, columnspan=1, sticky="e", pady=0)
+        self.protocol_status_is_wrapped = False
+
+    def _mark_protocol_chunk_processed(self, chunk_index: object | None = None) -> None:
+        try:
+            index = max(0, int(chunk_index)) if chunk_index is not None else 0
+        except Exception:
+            index = 0
+        self.protocol_chunks_processed = max(
+            self.protocol_chunks_processed + 1,
+            min(index, max(index, self.protocol_chunks_queued)),
+        )
+        if self.protocol_chunks_queued:
+            self.protocol_chunks_processed = min(self.protocol_chunks_processed, self.protocol_chunks_queued)
+
+    def _next_protocol_chunk_index(self) -> int:
+        if self.protocol_chunks_processed < self.protocol_chunks_queued:
+            return self.protocol_chunks_processed + 1
+        return 0
+
+    def _set_protocol_progress_status(self, state: object, active_chunk_index: object | None = None) -> None:
+        self.protocol_active_chunk_index = 0
+        try:
+            if active_chunk_index is not None:
+                self.protocol_active_chunk_index = max(0, int(active_chunk_index))
+        except Exception:
+            self.protocol_active_chunk_index = 0
+        self.protocol_status_var.set(
+            format_protocol_progress_status(
+                state,
+                done=self.protocol_chunks_processed,
+                total=self.protocol_chunks_queued,
+                active_chunk_index=self.protocol_active_chunk_index or None,
+            )
+        )
+        if self.protocol_chunks_finalized and self.protocol_chunks_queued > 0:
+            self.recognition_progress_has_real_update = True
+            percent = self.protocol_chunks_processed * 100 / max(1, self.protocol_chunks_queued)
+            self._set_recognition_progress(percent)
+
+    def _set_protocol_progress_after_processed_chunk(self) -> None:
+        next_index = self._next_protocol_chunk_index()
+        if next_index:
+            self._set_protocol_progress_status("Обработка фрагмента", active_chunk_index=next_index)
+        elif self.is_recording:
+            self._set_protocol_progress_status("Запись")
+        else:
+            self._set_protocol_progress_status("Обработка фрагмента")
 
     def _set_recognition_progress(self, value: object) -> None:
         try:
@@ -8491,6 +9021,12 @@ class DictaApp:
                     return
             elif event == "tray_error":
                 self._handle_tray_error(value if isinstance(value, Exception) else RuntimeError(str(value)))
+            elif event == "protocol_progress":
+                if isinstance(value, dict):
+                    self._set_protocol_progress_status(
+                        value.get("state", ""),
+                        active_chunk_index=value.get("active_chunk_index"),
+                    )
             elif event == "recognized":
                 recognized, elapsed, backend_name, backend_threads, vad_stats, audio_stats, recognition_mode_key = value[:7]
                 self._set_recognition_progress(100)
@@ -8541,11 +9077,32 @@ class DictaApp:
                 self._start_translation_warmup_after_recognition(str(recognition_mode_key))
                 self._schedule_spellcheck(delay_ms=100)
                 self._update_translation_button_state()
+            elif event == "protocol_chunk_processed":
+                chunk_index, result = value
+                self._mark_protocol_chunk_processed(chunk_index)
+                if isinstance(result, dict):
+                    start_seconds = result.get("start_seconds")
+                    end_seconds = result.get("end_seconds")
+                else:
+                    start_seconds = None
+                    end_seconds = None
+                if start_seconds is not None and end_seconds is not None:
+                    self._set_status(
+                        "Протокол: "
+                        f"фрагмент {int(chunk_index)} "
+                        f"{format_protocol_timestamp(start_seconds)}-{format_protocol_timestamp(end_seconds)} без текста"
+                    )
+                else:
+                    self._set_status(f"Протокол: фрагмент {int(chunk_index)} без текста")
+                self._set_protocol_progress_after_processed_chunk()
             elif event == "protocol_chunk_recognized":
                 chunk_index, result = value
+                self._mark_protocol_chunk_processed(chunk_index)
                 recognition_mode_key = str(result.get("recognition_mode_key", self._selected_recognition_mode_key()))
                 start_seconds = result.get("start_seconds") if isinstance(result, dict) else None
                 end_seconds = result.get("end_seconds") if isinstance(result, dict) else None
+                start_timestamp = result.get("start_timestamp") if isinstance(result, dict) else None
+                end_timestamp = result.get("end_timestamp") if isinstance(result, dict) else None
                 source_items = result.get("sources") if isinstance(result, dict) else None
                 prepared_sources: list[dict] = []
                 primary_source: dict | None = None
@@ -8579,9 +9136,9 @@ class DictaApp:
                                     "key": source_state_key,
                                     "label": source_label,
                                     "text": prepared,
+                                    "recognition_mode_key": source_mode_key,
                                 }
                             )
-                            self.protocol_previous_text_by_label[source_state_key] = prepared
                             primary_source = source
                 else:
                     self._set_text_spellcheck_language_from_mode(recognition_mode_key)
@@ -8601,9 +9158,21 @@ class DictaApp:
                         prepared,
                     )
                     if prepared:
-                        prepared_sources.append({"key": "single", "label": "", "text": prepared})
-                        self.protocol_previous_text_by_label["single"] = prepared
+                        prepared_sources.append(
+                            {
+                                "key": "single",
+                                "label": "",
+                                "text": prepared,
+                                "recognition_mode_key": recognition_mode_key,
+                            }
+                        )
                         primary_source = result
+
+                prepared_sources = filter_protocol_source_text_overlaps(prepared_sources)
+                prepared_sources = mark_unclear_protocol_sources(prepared_sources)
+                for source in prepared_sources:
+                    source_key = str(source.get("key", "")).strip() or "source"
+                    self.protocol_previous_text_by_label[source_key] = str(source.get("text", ""))
 
                 if prepared_sources:
                     if not self.protocol_text_started:
@@ -8621,6 +9190,8 @@ class DictaApp:
                             prepared_sources,
                             start_seconds=start_seconds,
                             end_seconds=end_seconds,
+                            start_timestamp=start_timestamp,
+                            end_timestamp=end_timestamp,
                         )
                     else:
                         protocol_text = format_protocol_chunk_text(
@@ -8628,6 +9199,8 @@ class DictaApp:
                             prepared_sources[0]["text"],
                             start_seconds=start_seconds,
                             end_seconds=end_seconds,
+                            start_timestamp=start_timestamp,
+                            end_timestamp=end_timestamp,
                         )
                     insert_text = protocol_text if not current else "\n\n" + protocol_text
                     self.text.insert(tk.END, insert_text)
@@ -8652,6 +9225,7 @@ class DictaApp:
                         self._set_status(f"Протокол: фрагмент {int(chunk_index)} готов")
                     self._schedule_spellcheck(delay_ms=250)
                     self._update_translation_button_state()
+                self._set_protocol_progress_after_processed_chunk()
             elif event == "protocol_recognition_error":
                 self.recognition_cancel_event.set()
                 self._set_status("Ошибка распознавания протокола")
@@ -8665,6 +9239,7 @@ class DictaApp:
                 self._set_recognition_process(None)
                 self._set_recognition_progress(0 if cancelled else 100)
                 self.record_started_at = None
+                self.record_wall_started_at = None
                 self.record_time_var.set("Запись: 00:00")
                 self._set_record_button_idle()
                 self.stop_button.configure(state=tk.DISABLED)
@@ -8677,6 +9252,7 @@ class DictaApp:
                 self._reset_mini_panel_levels()
                 if cancelled:
                     self._set_status("Распознавание протокола прервано")
+                    self._set_protocol_progress_status("Прервано")
                     self.recognition_time_var.set("-")
                 else:
                     text_value = self.text.get("1.0", "end-1c").strip()
@@ -8685,6 +9261,7 @@ class DictaApp:
                         self._set_status("Протокол готов и скопирован")
                     else:
                         self._set_status("Протокол готов")
+                    self._set_protocol_progress_status("Протокол готов")
                     self._start_translation_warmup_after_recognition(self._selected_recognition_mode_key())
                     self._update_translation_button_state()
             elif event == "translation_to_ru_result":
@@ -8876,6 +9453,8 @@ class DictaApp:
                 self.mini_panel.lift()
         elif not self.is_recording and not self.is_recognizing:
             self.record_started_at = None
+            if not self.is_protocol_recognizing:
+                self.record_wall_started_at = None
         self.root.after(250, self._update_record_timer)
 
     def _format_problem_message(

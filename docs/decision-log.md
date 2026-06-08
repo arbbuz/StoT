@@ -177,3 +177,107 @@ Reason:
 - The user needs a draft protocol, not a recognition log.
 - Neutral formatting improves readability without pretending to understand meeting decisions.
 - Ordinary dictation and protocol mode have different output expectations.
+
+## 2026-06-08: Long Protocol Recognition Shows Fragment Progress
+
+Decision:
+
+- Add a compact protocol status field on the right side of the lower status bar.
+- Show `Запись`, `Обработка фрагмента`, and `Протокол готов` states during combined protocol recording and recognition.
+- Show an explicit processed-fragment counter during protocol work.
+- Count silent/no-text chunks as processed for UI progress, even though they do not add text to the draft protocol.
+- Keep mini-panel and tray behavior unchanged except for the existing `Прервать` button state during recognition.
+
+Reason:
+
+- Long recordings can spend minutes in recognition, and the user needs visible evidence that Dicta has not frozen.
+- Counting only chunks that produce text would make silence look like a stuck recognizer.
+- Keeping the field empty while idle avoids technical noise such as `Протокол: -`.
+- Placing it in the existing lower bar avoids adding a permanent second row for users who are not currently processing a protocol.
+
+## 2026-06-08: Protocol Progress Wraps In Narrow Windows
+
+Decision:
+
+- Keep the full protocol progress text, for example `Обработка фрагмента 1/3 · готово 0/3`.
+- In wide windows, show it on the right side of the lower status bar.
+- In narrow windows, move it to a second lower-bar row instead of clipping or shortening it.
+- Keep the second row hidden while the protocol progress text is empty.
+
+Reason:
+
+- The text is useful during long recognition and should not disappear behind the window edge.
+- Shortening the text would make the status less clear.
+- A conditional second row affects only narrow/busy states and preserves the compact full-screen layout.
+
+## 2026-06-08: Spellcheck Accept Word Action Is User-Facing
+
+Decision:
+
+- Remove `Добавить в словарь Windows` from the main spelling context menu.
+- Rename the Dicta word action to `Больше не считать ошибкой`.
+- Keep the behavior local to Dicta recognition/spellcheck memory from the user's point of view.
+
+Reason:
+
+- The user should not decide between Dicta and Windows dictionaries during normal correction.
+- The expected outcome is simple: the marked word should stop being treated as an error in Dicta.
+- Avoid writing to the broader Windows dictionary unless a separate advanced workflow is explicitly needed later.
+
+## 2026-06-08: Protocol Fragment Headers Use Real Clock Time
+
+Decision:
+
+- Visible protocol fragment headers use system clock time from the recording start, for example `Фрагмент 2 · 20:35-20:36`.
+- Technical offsets from the beginning of the recording remain available internally and in diagnostics.
+- The protocol keeps fragment numbers for navigation, but avoids making the user interpret `01:00-02:00` as a useful meeting timestamp.
+
+Reason:
+
+- A protocol reader needs to tie text to the real meeting timeline, not to the duration of internal audio chunks.
+- Clock time is more useful for discussing "when this was said" after the meeting.
+- Offsets are still useful for debugging, but they should not be the primary visible protocol signal.
+
+## 2026-06-08: Microphone Blocks Drop Long System Repeats
+
+Decision:
+
+- When a microphone block contains a long same-fragment text span that already appears in the system-audio block, remove that repeated span from the microphone block.
+- Preserve short unique microphone phrases before or after the repeated span.
+- Keep the rule conservative: it requires a long word overlap and does not try to infer speaker meaning.
+
+Reason:
+
+- In combined recording, system audio can leak into the microphone channel or Whisper can continue a system phrase from a mostly silent microphone chunk.
+- The user expects the microphone block to contain microphone speech, not a second copy of the system-audio transcript.
+- A conservative overlap filter reduces obvious bad output without deleting short legitimate microphone comments.
+
+## 2026-06-08: Obvious Recognition Garbage Is Marked Unclear
+
+Decision:
+
+- In protocol mode, replace clearly low-quality Russian sentences with `[неразборчиво]`.
+- Use Windows Spell Checker as a quality signal: the rule requires a dense cluster of invalid words in one sentence.
+- Do not remove a sentence for one or two rare words, names, or terms.
+- Keep ordinary dictation unchanged.
+
+Reason:
+
+- On a weak PC, moving to a heavier model is not a reliable primary path.
+- Whisper can produce invented words when audio is mixed, noisy, or unclear.
+- A protocol should honestly mark unclear audio instead of presenting invented words as real speech.
+
+## 2026-06-08: Stage 4 Prioritizes Hiding Leaked Microphone Blocks
+
+Decision:
+
+- Plan stage 4 around practical separation quality for system audio and microphone.
+- If a microphone block is mostly leaked system audio, hide that microphone block entirely.
+- Use `[неразборчиво]` for unclear real audio, but do not fill the protocol with unclear markers for blocks that are not useful microphone speech.
+- Improve diagnostics first, then delayed leakage handling, then source-quality filtering.
+
+Reason:
+
+- The user needs a cleaner protocol, not a technically exhaustive transcript of every bad microphone artifact.
+- Repeating system audio under `Микрофон` is misleading.
+- Hiding non-microphone blocks is more readable than showing many noisy placeholders.
