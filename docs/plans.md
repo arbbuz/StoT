@@ -91,31 +91,35 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
    - Success signal: stage 3 behavior passes the full manual verification set in the packaged EXE.
 
 9. Stage 4: source separation quality
-   - Status: approved plan after stage 3.6.
+   - Status: 4.1-4.3 are implemented and packaged in `dist\DictaProtocol`; 4.4 real-audio manual verification is pending.
    - Goal: improve the practical separation of `Системный звук` and `Микрофон` in protocol mode without requiring a heavier model or cloud services.
    - Principle: if a microphone block is mostly leaked system audio or recognition garbage, do not show it as microphone speech.
    - Constraint: keep ordinary dictation unchanged.
 
 10. Stage 4.1: separation diagnostics
-    - Planned: write per-fragment diagnostics for system activity duration, microphone activity duration, muted microphone duration, and text similarity between sources.
-    - Planned: include enough data to explain why a microphone block was kept, removed, or marked unclear.
+    - Implemented: per-fragment duplicate-filter diagnostics now include system activity, microphone activity, filtered microphone activity, muted duration, delay offsets, and mute spans.
+    - Implemented: text filtering writes source similarity, removed-overlap stats, and the reason why a microphone block was kept or hidden.
     - Success signal: after a bad combined recording, diagnostics show whether the microphone block was real speech, leaked system audio, or unclear audio.
 
 11. Stage 4.2: delayed system-audio leakage
-    - Planned: account for small delay between system audio playback and the same sound reaching the microphone.
-    - Planned: test several conservative offsets around system activity before muting microphone spans.
+    - Implemented: microphone muting uses conservative delayed activity windows around system-audio activity instead of only the exact system span.
+    - Implemented: the old wide padding was reduced, and explicit delay offsets are recorded in diagnostics.
     - Constraint: do not remove independent microphone phrases that happen shortly before or after system speech.
     - Success signal: microphone blocks contain fewer delayed copies of system audio.
 
 12. Stage 4.3: hide non-microphone blocks
-    - Planned: if the microphone result is mostly the system-audio text, hide the microphone block entirely instead of showing duplicate text or `[неразборчиво]`.
-    - Planned: keep short unique microphone phrases when they are separable from the system repeat.
+    - Implemented: if the microphone result is mostly system-audio text and the remaining unique tail is too long to trust, the microphone block is hidden.
+    - Implemented: short unique microphone phrases remain visible when they are separable from the system repeat.
+    - Implemented: when a long system duplicate is removed from the middle of a microphone block, obvious fragment tails after that duplicate are dropped instead of being glued to real microphone speech.
+    - Implemented: short connector prefixes such as a leftover system fragment before real microphone speech can be dropped, while first-person microphone remarks are kept.
+    - Implemented: diagnostics now record `removed_middle`, `dropped_prefix`, `dropped_tail`, and `kept_microphone`.
     - Success signal: the protocol does not present leaked system audio as microphone speech.
 
 13. Stage 4.4: source-quality manual regression
-    - Planned: check YouTube/system playback with short microphone comments.
-    - Planned: check pauses, one-source silence, and simultaneous speech.
-    - Planned: confirm that useful microphone phrases remain visible and leaked/mixed blocks are removed or marked unclear.
+    - Status: refined packaged EXE quick checks passed on 2026-06-09; real audio manual verification is pending.
+    - Pending: check YouTube/system playback with short microphone comments.
+    - Pending: check pauses, one-source silence, and simultaneous speech.
+    - Pending: confirm that useful microphone phrases remain visible and leaked/mixed blocks are removed or marked unclear.
     - Success signal: the protocol is cleaner in the known bad cases without hiding real microphone comments.
 
 ## Stage 3 Work Order

@@ -55,11 +55,15 @@ Packaged app for DictaProtocol manual checks: `C:\Users\Olga\Documents\VoiceHelp
 - Stage 3.2.1 is implemented, built, committed, and pushed: Russian abbreviation normalization with a general Latin-CAPS-to-Cyrillic rule and a stop-list.
 - Stage 3.3 is implemented, built, committed, and pushed: conservative chunk stitching removes obvious repeated text at fragment boundaries per source.
 - Stage 3.4 is implemented, built, committed, and pushed: protocol output is formatted as `Черновик протокола` with neutral fragment headers.
-- Stage 3.5 is implemented in the current uncommitted working tree and fresh packaged build: long-recording UI with fragment progress, clear recording/processing/ready states, readable protocol status in narrow windows, visible protocol fragment headers by real system time, reduced microphone/system duplicate text in the same fragment, and conservative `[неразборчиво]` marking for obvious recognition garbage.
-- Stage 3.6 automated/package verification was executed in the current uncommitted working tree. Source and packaged quick tests passed, package verification passed, packaged diagnostic completed with zero blocking failures, second-instance restore passed, minimize-to-tray mini-panel passed, and a short silent recording could be stopped from the mini-panel.
+- Stage 3.5 was committed and pushed in `d5ba167`: long-recording UI with fragment progress, clear recording/processing/ready states, readable protocol status in narrow windows, visible protocol fragment headers by real system time, reduced microphone/system duplicate text in the same fragment, and conservative `[неразборчиво]` marking for obvious recognition garbage.
+- Stage 3.6 automated/package verification was committed and pushed in `d5ba167`. Source and packaged quick tests passed, package verification passed, packaged diagnostic completed with zero blocking failures, second-instance restore passed, minimize-to-tray mini-panel passed, and a short silent recording could be stopped from the mini-panel.
 - Stage 3.6 is not fully closed until real audio manual checks are run: microphone-only speech, system-audio-only playback, combined system audio plus microphone, 3-5 minute recording, and one-source-silent recording.
 - Stage 3.6 warnings to keep visible: microphone diagnostics opened devices but measured 0% peak, packaged diagnostic reported no Dicta firewall rule, `%TEMP%` has Dicta temporary leftovers, and network audit was skipped by parameter.
-- Stage 4 source-separation quality plan is approved: start with 4.1 diagnostics, then delayed system-audio leakage handling, then hide non-microphone blocks, then manual source-quality regression.
+- Stage 4 source-separation quality implementation is complete through 4.3: 4.1 diagnostics, 4.2 delayed leakage handling, and 4.3 hiding/cleaning leaked microphone blocks are implemented in code and packaged in `dist\DictaProtocol`; 4.4 manual source-quality regression is still pending.
+- Stage 4 initial build log: `artifacts\build_protocol_stage4_20260608_221444.log`. Package verification passed; packaged `--format-test`, `--postprocess-test`, `--dictionary-test`, and `--self-test --allow-missing-models` returned exit code 0.
+- After analyzing `dist\DictaProtocol\artifacts\protocol_diagnostics_20260608_224905`, extra 4.3 cleanup was added: do not glue text before and after a removed system duplicate, drop obvious lowercase tails, drop short connector prefixes after a system duplicate, keep first-person microphone remarks, and log `removed_middle`, `dropped_prefix`, `dropped_tail`, `kept_microphone`.
+- Source validation after that refinement passed: `python -m py_compile dicta.py`, `python dicta.py --format-test`, `python dicta.py --postprocess-test`, `python dicta.py --dictionary-test`, and `python dicta.py --self-test --allow-missing-models`.
+- Refined stage 4 package was rebuilt after the app was closed: `artifacts\build_protocol_stage4_refine_20260609_070901.log`. Package verification passed; packaged `--format-test`, `--postprocess-test`, `--dictionary-test`, and `--self-test --allow-missing-models` returned exit code 0. Ready EXE: `dist\DictaProtocol\Dicta.exe`.
 
 ## Long Command Visibility Rule
 
@@ -70,5 +74,4 @@ Packaged app for DictaProtocol manual checks: `C:\Users\Olga\Documents\VoiceHelp
 
 ## Next Action
 
-- If the user accepts the current build, commit/push only with explicit permission.
-- Next implementation work after acceptance: stage 4.1 separation diagnostics.
+- Next required work: manual-check 4.4 with real combined recordings from the rebuilt `dist\DictaProtocol\Dicta.exe`.

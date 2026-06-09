@@ -281,3 +281,35 @@ Reason:
 - The user needs a cleaner protocol, not a technically exhaustive transcript of every bad microphone artifact.
 - Repeating system audio under `Микрофон` is misleading.
 - Hiding non-microphone blocks is more readable than showing many noisy placeholders.
+
+## 2026-06-08: Stage 4 Uses Conservative Leak Decisions
+
+Decision:
+
+- Use delayed system-audio activity windows when muting the microphone copy of system playback.
+- Reduce the old broad audio padding and record the exact delay offsets and mute spans in diagnostics.
+- For recognized text, compare system and microphone blocks by source similarity and removed-overlap ratio.
+- Hide a microphone block only when it is mostly system-audio text and the remaining unique tail is too long to trust.
+- Keep short unique microphone remarks after removing the repeated system span.
+
+Reason:
+
+- The main bad case is not a true speaker-label problem; it is system playback leaking into the microphone channel or Whisper continuing a system phrase from microphone audio.
+- Showing that leaked text under `Микрофон` is worse than hiding it.
+- Short human comments such as "Ужас. Сегодня разберем." still need to survive the filter.
+
+## 2026-06-08: Do Not Glue Fragment Tails After System Duplicates
+
+Decision:
+
+- When a long system-audio duplicate is removed from the middle of a microphone block, do not blindly join the text before and after the duplicate.
+- Drop a short lowercase tail after the removed duplicate as a likely leftover system fragment.
+- Drop a short connector-style prefix before real microphone speech only after a system duplicate was found.
+- Keep first-person microphone remarks such as "И я согласен.".
+- Record `removed_middle`, `dropped_prefix`, `dropped_tail`, and `kept_microphone` in protocol diagnostics.
+
+Reason:
+
+- The 2026-06-08 diagnostic recording showed a good microphone phrase followed by a leftover system-text fragment after the duplicate was removed.
+- Blindly joining both sides made the protocol look worse and mixed real microphone speech with system leakage.
+- The rule must remain conservative so short real microphone comments are not removed.

@@ -202,8 +202,27 @@ PROTOCOL_SOURCE_LABELS = {
 PROTOCOL_DIAGNOSTICS_ARTIFACT_PREFIX = "protocol_diagnostics"
 PROTOCOL_DIAGNOSTICS_LOG_NAME = "protocol_diagnostics.jsonl"
 PROTOCOL_DUPLICATE_FILTER_FRAME_MS = 100
-PROTOCOL_DUPLICATE_FILTER_PADDING_MS = 1200
+PROTOCOL_DUPLICATE_FILTER_PADDING_MS = 500
 PROTOCOL_DUPLICATE_FILTER_MAX_GAP_MS = 600
+PROTOCOL_DUPLICATE_FILTER_DELAY_OFFSETS_MS = (-200, 0, 250, 500)
+PROTOCOL_MICROPHONE_LEAK_HIDE_MIN_WORDS = 14
+PROTOCOL_MICROPHONE_LEAK_KEEP_MAX_WORDS = 12
+PROTOCOL_MICROPHONE_LEAK_HIDE_RATIO = 0.68
+PROTOCOL_MICROPHONE_LEAK_DROP_TAIL_MAX_WORDS = 18
+PROTOCOL_MICROPHONE_LEAK_DROP_PREFIX_MAX_WORDS = 4
+PROTOCOL_MICROPHONE_LEAK_PREFIX_CONNECTORS = {"и", "а", "но"}
+PROTOCOL_MICROPHONE_LEAK_PREFIX_KEEP_WORDS = {
+    "я",
+    "мы",
+    "мне",
+    "нам",
+    "меня",
+    "нас",
+    "микрофон",
+    "запись",
+    "пауза",
+}
+PROTOCOL_TEXT_FILTER_PREVIEW_CHARS = 180
 MICROPHONE_WORKING_PEAK_PERCENT = 1
 SILENCE_WINDOW_MS = 30
 SILENCE_PADDING_MS = 250
@@ -906,6 +925,51 @@ def mute_pcm16_spans(audio: bytes, sample_rate: int, spans: list[tuple[float, fl
     return samples.tobytes() + audio[tail_start:], muted_samples
 
 
+def merge_time_spans(spans: list[tuple[float, float]], max_gap_seconds: float = 0.0) -> list[tuple[float, float]]:
+    normalized = sorted(
+        (max(0.0, float(start)), max(0.0, float(end)))
+        for start, end in spans
+        if float(end) > float(start)
+    )
+    if not normalized:
+        return []
+
+    merged: list[tuple[float, float]] = []
+    gap = max(0.0, float(max_gap_seconds))
+    for start, end in normalized:
+        if not merged:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        if start - previous_end <= gap:
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def delayed_activity_spans(
+    spans: list[tuple[float, float]],
+    offsets_ms: tuple[int, ...] = PROTOCOL_DUPLICATE_FILTER_DELAY_OFFSETS_MS,
+) -> list[tuple[float, float]]:
+    delayed: list[tuple[float, float]] = []
+    for start, end in spans:
+        for offset_ms in offsets_ms:
+            offset_seconds = float(offset_ms) / 1000.0
+            shifted_start = max(0.0, start + offset_seconds)
+            shifted_end = max(0.0, end + offset_seconds)
+            if shifted_end > shifted_start:
+                delayed.append((shifted_start, shifted_end))
+    return merge_time_spans(delayed, max_gap_seconds=PROTOCOL_DUPLICATE_FILTER_MAX_GAP_MS / 1000.0)
+
+
+def protocol_diagnostic_spans(spans: list[tuple[float, float]], limit: int = 20) -> list[dict]:
+    return [
+        {"start_seconds": round(start, 3), "end_seconds": round(end, 3)}
+        for start, end in spans[: max(0, int(limit))]
+    ]
+
+
 def filter_protocol_microphone_duplicate_audio(
     microphone_audio: bytes,
     microphone_rate: int,
@@ -927,15 +991,23 @@ def filter_protocol_microphone_duplicate_audio(
 
     spans, activity_stats = pcm16_activity_spans(system_audio, system_rate)
     stats["system_activity"] = activity_stats
+    _microphone_spans, microphone_activity_stats = pcm16_activity_spans(microphone_audio, microphone_rate)
+    stats["microphone_activity"] = microphone_activity_stats
     if not spans:
         return microphone_audio, stats
 
-    filtered_audio, muted_samples = mute_pcm16_spans(microphone_audio, microphone_rate, spans)
+    mute_spans = delayed_activity_spans(spans)
+    filtered_audio, muted_samples = mute_pcm16_spans(microphone_audio, microphone_rate, mute_spans)
+    _filtered_spans, filtered_activity_stats = pcm16_activity_spans(filtered_audio, microphone_rate)
     stats.update(
         {
             "enabled": muted_samples > 0,
             "muted_ms": round(muted_samples / microphone_rate * 1000, 1),
             "filtered_peak_percent": audio_peak_percent(filtered_audio),
+            "delay_offsets_ms": list(PROTOCOL_DUPLICATE_FILTER_DELAY_OFFSETS_MS),
+            "mute_spans": protocol_diagnostic_spans(mute_spans),
+            "mute_spans_truncated": max(0, len(mute_spans) - 20),
+            "filtered_microphone_activity": filtered_activity_stats,
         }
     )
     return filtered_audio, stats
@@ -3073,30 +3145,196 @@ def protocol_longest_cross_source_overlap(reference_text: str, candidate_text: s
     return None
 
 
-def remove_protocol_cross_source_overlap(reference_text: str, candidate_text: str) -> str:
+def protocol_text_preview(text: str, limit: int = PROTOCOL_TEXT_FILTER_PREVIEW_CHARS) -> str:
+    value = normalize_punctuation_spacing(str(text or ""))
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)].rstrip() + "..."
+
+
+def protocol_lcs_length(left: list[str], right: list[str]) -> int:
+    if not left or not right:
+        return 0
+    previous = [0] * (len(right) + 1)
+    for left_word in left:
+        current = [0]
+        for index, right_word in enumerate(right, start=1):
+            if left_word == right_word:
+                current.append(previous[index - 1] + 1)
+            else:
+                current.append(max(previous[index], current[-1]))
+        previous = current
+    return previous[-1]
+
+
+def protocol_source_similarity_stats(reference_text: str, candidate_text: str) -> dict:
+    reference_words = [word for word, _start, _end in protocol_stitch_words(reference_text)]
+    candidate_words = [word for word, _start, _end in protocol_stitch_words(candidate_text)]
+    lcs_count = protocol_lcs_length(reference_words[:240], candidate_words[:240])
+    candidate_word_count = len(candidate_words)
+    reference_word_count = len(reference_words)
+    return {
+        "reference_words": reference_word_count,
+        "candidate_words": candidate_word_count,
+        "lcs_words": lcs_count,
+        "candidate_lcs_ratio": round(lcs_count / max(1, candidate_word_count), 3),
+        "reference_lcs_ratio": round(lcs_count / max(1, reference_word_count), 3),
+        "truncated": reference_word_count > 240 or candidate_word_count > 240,
+    }
+
+
+def protocol_first_alpha_is_lower(text: str) -> bool:
+    match = re.search(r"[A-Za-zА-Яа-яЁё]", str(text or ""))
+    return bool(match and match.group(0).islower())
+
+
+def protocol_should_drop_cross_source_tail(before: str, after: str) -> bool:
+    before_words = len(protocol_stitch_words(before))
+    after_words = len(protocol_stitch_words(after))
+    if before_words < 4 or after_words <= 0:
+        return False
+    if after_words > PROTOCOL_MICROPHONE_LEAK_DROP_TAIL_MAX_WORDS:
+        return False
+    return protocol_first_alpha_is_lower(after)
+
+
+def protocol_drop_short_cross_source_prefix(text: str) -> tuple[str, dict | None]:
+    result = normalize_punctuation_spacing(str(text or ""))
+    spans = protocol_sentence_spans(result)
+    if len(spans) < 2:
+        return result, None
+
+    start, end, sentence = spans[0]
+    if start != 0:
+        return result, None
+
+    words = [word for word, _start, _end in protocol_stitch_words(sentence)]
+    if not words or len(words) > PROTOCOL_MICROPHONE_LEAK_DROP_PREFIX_MAX_WORDS:
+        return result, None
+    if words[0] not in PROTOCOL_MICROPHONE_LEAK_PREFIX_CONNECTORS:
+        return result, None
+    if any(word in PROTOCOL_MICROPHONE_LEAK_PREFIX_KEEP_WORDS for word in words):
+        return result, None
+
+    remaining = result[end:].lstrip(" \t\r\n,.;:!?…-—")
+    if len(protocol_stitch_words(remaining)) < 4:
+        return result, None
+
+    normalized = normalize_punctuation_spacing(capitalize_text(remaining))
+    return normalized, {
+        "chars": len(result[:end]),
+        "words": len(words),
+        "preview": protocol_text_preview(result[:end], limit=120),
+        "reason": "short_connector_prefix_after_system_overlap",
+    }
+
+
+def remove_protocol_cross_source_overlap_with_stats(reference_text: str, candidate_text: str) -> tuple[str, dict]:
     result = str(candidate_text or "").strip()
     reference = str(reference_text or "").strip()
+    before_words = len(protocol_stitch_words(result))
+    similarity = protocol_source_similarity_stats(reference, result)
+    stats = {
+        "before_chars": len(result),
+        "before_words": before_words,
+        "after_chars": len(result),
+        "after_words": before_words,
+        "removed_chars": 0,
+        "removed_words": 0,
+        "removed_word_ratio": 0.0,
+        "overlaps": [],
+        "similarity": similarity,
+        "removed_middle": False,
+        "dropped_prefix": [],
+        "dropped_tail": [],
+        "kept_microphone": bool(result),
+        "decision": "kept",
+        "before_preview": protocol_text_preview(result),
+        "after_preview": protocol_text_preview(result),
+    }
     if not result or not reference:
-        return result
+        return result, stats
 
     for _ in range(4):
         overlap = protocol_longest_cross_source_overlap(reference, result)
         if overlap is None:
             break
         start, end = overlap
+        overlap_text = result[start:end]
+        overlap_words = len(protocol_stitch_words(overlap_text))
+        stats["removed_chars"] = int(stats["removed_chars"]) + len(overlap_text)
+        stats["removed_words"] = int(stats["removed_words"]) + overlap_words
+        overlaps = stats.get("overlaps")
+        if isinstance(overlaps, list) and len(overlaps) < 10:
+            overlaps.append(
+                {
+                    "chars": len(overlap_text),
+                    "words": overlap_words,
+                    "preview": protocol_text_preview(overlap_text, limit=120),
+                }
+            )
         before = result[:start].rstrip()
         after = result[end:].lstrip(" \t\r\n,.;:!?…-—")
         if before and after:
-            result = f"{before.rstrip(' \t\r\n,;:-—')} {after}"
+            stats["removed_middle"] = True
+            if protocol_should_drop_cross_source_tail(before, after):
+                tail_words = len(protocol_stitch_words(after))
+                stats["removed_chars"] = int(stats["removed_chars"]) + len(after)
+                stats["removed_words"] = int(stats["removed_words"]) + tail_words
+                dropped_tail = stats.get("dropped_tail")
+                if isinstance(dropped_tail, list) and len(dropped_tail) < 10:
+                    dropped_tail.append(
+                        {
+                            "chars": len(after),
+                            "words": tail_words,
+                            "preview": protocol_text_preview(after, limit=120),
+                            "reason": "lowercase_fragment_after_system_overlap",
+                        }
+                    )
+                result = before.strip()
+            else:
+                trimmed_before = before.rstrip(" \t\r\n,;:-—")
+                result = f"{trimmed_before} {after}"
         else:
             result = before.strip() or after.strip()
         result = normalize_punctuation_spacing(result.strip())
         if not result:
             break
+    if int(stats["removed_words"]) > 0 and result:
+        trimmed_result, prefix_stats = protocol_drop_short_cross_source_prefix(result)
+        if prefix_stats is not None:
+            stats["removed_chars"] = int(stats["removed_chars"]) + int(prefix_stats.get("chars", 0))
+            stats["removed_words"] = int(stats["removed_words"]) + int(prefix_stats.get("words", 0))
+            dropped_prefix = stats.get("dropped_prefix")
+            if isinstance(dropped_prefix, list):
+                dropped_prefix.append(prefix_stats)
+            result = trimmed_result
+    after_words = len(protocol_stitch_words(result))
+    removed_words = int(stats["removed_words"])
+    stats.update(
+        {
+            "after_chars": len(result),
+            "after_words": after_words,
+            "removed_word_ratio": round(removed_words / max(1, before_words), 3),
+            "kept_microphone": bool(result.strip()),
+            "after_preview": protocol_text_preview(result),
+        }
+    )
+    if removed_words and not result:
+        stats["decision"] = "removed_duplicate"
+    elif stats.get("dropped_prefix") or stats.get("dropped_tail"):
+        stats["decision"] = "removed_overlap_fragments"
+    elif removed_words:
+        stats["decision"] = "removed_overlap"
+    return result, stats
+
+
+def remove_protocol_cross_source_overlap(reference_text: str, candidate_text: str) -> str:
+    result, _stats = remove_protocol_cross_source_overlap_with_stats(reference_text, candidate_text)
     return result
 
 
-def filter_protocol_source_text_overlaps(sources: list[dict]) -> list[dict]:
+def filter_protocol_source_text_overlaps(sources: list[dict], keep_hidden: bool = False) -> list[dict]:
     system_text = " ".join(
         str(source.get("text", "")).strip()
         for source in sources
@@ -3109,8 +3347,32 @@ def filter_protocol_source_text_overlaps(sources: list[dict]) -> list[dict]:
     for source in sources:
         item = dict(source)
         if str(item.get("key", "")).strip() == "microphone":
-            item["text"] = remove_protocol_cross_source_overlap(system_text, str(item.get("text", "")))
-        if str(item.get("text", "")).strip():
+            filtered_text, filter_stats = remove_protocol_cross_source_overlap_with_stats(
+                system_text,
+                str(item.get("text", "")),
+            )
+            similarity = filter_stats.get("similarity") if isinstance(filter_stats, dict) else {}
+            candidate_lcs_ratio = (
+                float(similarity.get("candidate_lcs_ratio", 0.0))
+                if isinstance(similarity, dict)
+                else 0.0
+            )
+            removed_word_ratio = float(filter_stats.get("removed_word_ratio", 0.0))
+            after_words = int(filter_stats.get("after_words", 0))
+            before_words = int(filter_stats.get("before_words", 0))
+            likely_leaked_system = (
+                before_words >= PROTOCOL_MICROPHONE_LEAK_HIDE_MIN_WORDS
+                and max(candidate_lcs_ratio, removed_word_ratio) >= PROTOCOL_MICROPHONE_LEAK_HIDE_RATIO
+            )
+            if likely_leaked_system and after_words > PROTOCOL_MICROPHONE_LEAK_KEEP_MAX_WORDS:
+                filter_stats["decision"] = "hidden_leaked_microphone"
+                item["hidden"] = True
+                item["hide_reason"] = "microphone_matches_system_audio"
+                item["text"] = ""
+            else:
+                item["text"] = filtered_text
+            item["text_filter"] = filter_stats
+        if str(item.get("text", "")).strip() or (keep_hidden and item.get("hidden")):
             filtered.append(item)
     return filtered
 
@@ -4171,6 +4433,102 @@ def run_text_cleanup_self_test() -> None:
     )
     if microphone_filtered_text != "Ужас. Сегодня разберем.":
         raise AssertionError(f"protocol cross-source filtering failed: {microphone_filtered_text!r}")
+    diagnostic_case_sources = filter_protocol_source_text_overlaps(
+        [
+            {
+                "key": "system",
+                "label": PROTOCOL_SOURCE_LABELS["system"],
+                "text": (
+                    "После временного знака стоит знак начала новой полосы. "
+                    "Разметки во время ремонта нет, но знак указывает на наличие "
+                    "как минимум двух полос движения."
+                ),
+            },
+            {
+                "key": "microphone",
+                "label": PROTOCOL_SOURCE_LABELS["microphone"],
+                "text": (
+                    "И правила движения. Теперь все на паузе, только микрофон. "
+                    "Дальше будет только системный. Знака стоит знак начала новой полосы. "
+                    "Разметки во время ремонта нет, но знак указывает на наличие как минимум двух "
+                    "полот движения для вот соответственно водителей среди складных. Интересно."
+                ),
+            },
+        ],
+        keep_hidden=True,
+    )
+    diagnostic_microphone = next(
+        source for source in diagnostic_case_sources if source.get("key") == "microphone"
+    )
+    expected_diagnostic_microphone = (
+        "Теперь все на паузе, только микрофон. Дальше будет только системный."
+    )
+    if diagnostic_microphone.get("text") != expected_diagnostic_microphone:
+        raise AssertionError(f"protocol diagnostic-case filtering failed: {diagnostic_microphone!r}")
+    diagnostic_filter = diagnostic_microphone.get("text_filter", {})
+    if diagnostic_filter.get("decision") != "removed_overlap_fragments":
+        raise AssertionError(f"protocol diagnostic-case decision failed: {diagnostic_filter!r}")
+    if not diagnostic_filter.get("dropped_prefix") or not diagnostic_filter.get("dropped_tail"):
+        raise AssertionError(f"protocol diagnostic-case fragments were not logged: {diagnostic_filter!r}")
+    real_prefix_sources = filter_protocol_source_text_overlaps(
+        [
+            {
+                "key": "system",
+                "label": PROTOCOL_SOURCE_LABELS["system"],
+                "text": "Нужно согласовать проект бюджета и сроки запуска рабочей группы.",
+            },
+            {
+                "key": "microphone",
+                "label": PROTOCOL_SOURCE_LABELS["microphone"],
+                "text": "И я согласен. Нужно согласовать проект бюджета и сроки запуска рабочей группы.",
+            },
+        ]
+    )
+    real_prefix_microphone = next(
+        source["text"] for source in real_prefix_sources if source.get("key") == "microphone"
+    )
+    if real_prefix_microphone != "И я согласен.":
+        raise AssertionError(f"protocol real microphone prefix was removed: {real_prefix_microphone!r}")
+    long_system_text = (
+        " ".join(f"системный{i}" for i in range(40))
+        + "."
+    )
+    leaked_sources = filter_protocol_source_text_overlaps(
+        [
+            {
+                "key": "system",
+                "label": PROTOCOL_SOURCE_LABELS["system"],
+                "text": long_system_text,
+            },
+            {
+                "key": "microphone",
+                "label": PROTOCOL_SOURCE_LABELS["microphone"],
+                "text": long_system_text + " " + " ".join(f"мусор{i}" for i in range(13)) + ".",
+            },
+        ]
+    )
+    if any(source.get("key") == "microphone" for source in leaked_sources):
+        raise AssertionError(f"protocol leaked microphone block was not hidden: {leaked_sources!r}")
+    leaked_sources_with_diagnostics = filter_protocol_source_text_overlaps(
+        [
+            {
+                "key": "system",
+                "label": PROTOCOL_SOURCE_LABELS["system"],
+                "text": long_system_text,
+            },
+            {
+                "key": "microphone",
+                "label": PROTOCOL_SOURCE_LABELS["microphone"],
+                "text": long_system_text + " " + " ".join(f"мусор{i}" for i in range(13)) + ".",
+            },
+        ],
+        keep_hidden=True,
+    )
+    leaked_microphone_source = next(
+        source for source in leaked_sources_with_diagnostics if source.get("key") == "microphone"
+    )
+    if not leaked_microphone_source.get("hidden"):
+        raise AssertionError(f"protocol leaked microphone diagnostics missing: {leaked_microphone_source!r}")
     unclear_text = mark_unclear_protocol_text(
         "И шумски, сегодня один из самых полезных фускудлей Пайдзарай и Продвинд Гитры."
     )
@@ -4198,6 +4556,8 @@ def run_text_cleanup_self_test() -> None:
     late_samples = filtered_samples[int(filter_rate * 3.0) :]
     if not filter_stats.get("enabled") or float(filter_stats.get("muted_ms", 0.0)) < 1000:
         raise AssertionError(f"protocol duplicate filter did not mute system span: {filter_stats!r}")
+    if 500 not in filter_stats.get("delay_offsets_ms", []):
+        raise AssertionError(f"protocol duplicate filter delay offsets missing: {filter_stats!r}")
     if max((abs(int(sample)) for sample in early_samples), default=0) != 0:
         raise AssertionError("protocol duplicate filter left early microphone duplicate audio")
     if max((abs(int(sample)) for sample in late_samples), default=0) < 1000:
@@ -9168,7 +9528,34 @@ class DictaApp:
                         )
                         primary_source = result
 
-                prepared_sources = filter_protocol_source_text_overlaps(prepared_sources)
+                prepared_sources = filter_protocol_source_text_overlaps(prepared_sources, keep_hidden=True)
+                for source in prepared_sources:
+                    text_filter = source.get("text_filter") if isinstance(source, dict) else None
+                    if isinstance(text_filter, dict):
+                        self._write_protocol_diagnostic_event(
+                            "source_text_filter",
+                            {
+                                "chunk_index": int(chunk_index),
+                                "start_seconds": round(float(start_seconds), 3)
+                                if start_seconds is not None
+                                else None,
+                                "end_seconds": round(float(end_seconds), 3)
+                                if end_seconds is not None
+                                else None,
+                                "start_timestamp": start_timestamp,
+                                "end_timestamp": end_timestamp,
+                                "source": str(source.get("key", "")),
+                                "label": str(source.get("label", "")),
+                                "hidden": bool(source.get("hidden")),
+                                "hide_reason": str(source.get("hide_reason", "")),
+                                "filter": text_filter,
+                            },
+                        )
+                prepared_sources = [
+                    source
+                    for source in prepared_sources
+                    if not source.get("hidden") and str(source.get("text", "")).strip()
+                ]
                 prepared_sources = mark_unclear_protocol_sources(prepared_sources)
                 for source in prepared_sources:
                     source_key = str(source.get("key", "")).strip() or "source"
