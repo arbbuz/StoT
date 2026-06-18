@@ -28,20 +28,31 @@ jobs:
 
       - name: Prepare local whisper.cpp backend without models
         run: |
-          $maxAttempts = 3
-          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            try {
-              Write-Host "prepare_dicta_assets attempt $attempt of $maxAttempts"
-              .\scripts\prepare_dicta_assets.ps1 -SkipModels
-              break
-            } catch {
-              Write-Host "::warning::prepare_dicta_assets failed on attempt $attempt: $($_.Exception.Message)"
-              if ($attempt -ge $maxAttempts) {
-                throw
-              }
-              Start-Sleep -Seconds (20 * $attempt)
+          $ErrorActionPreference = "Stop"
+          $version = "v1.8.4"
+          $url = "https://github.com/ggml-org/whisper.cpp/releases/download/$version/whisper-bin-x64.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "whisper-bin-x64-$version.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "whisper-bin-x64-$version"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+          $release = Join-Path $extract "Release"
+          $required = @("whisper-cli.exe", "whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll")
+          foreach ($file in $required) {
+            $source = Join-Path $release $file
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "Required whisper.cpp release file was not found: $file"
             }
           }
+          foreach ($backend in @("compat", "avx2")) {
+            $destination = ".tools\whisper.cpp-build-$backend\bin"
+            New-Item -ItemType Directory -Force -Path $destination | Out-Null
+            Remove-Item -Path (Join-Path $destination "*") -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($file in $required) {
+              Copy-Item -LiteralPath (Join-Path $release $file) -Destination $destination -Force
+            }
+          }
+          New-Item -ItemType Directory -Force -Path "models" | Out-Null
+          Write-Host "Prepared whisper.cpp release binaries for CI package."
 
       - name: Build DictaProtocol package without models
         run: .\scripts\build_dicta_exe.ps1 -SkipModels -PackageVersion "1.1-pilot-protocol-code-only" -DistRoot "dist\DictaProtocol"
