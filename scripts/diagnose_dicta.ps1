@@ -192,7 +192,25 @@ Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-avx2\bin\whisper-cli.e
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-vulkan\bin\whisper-cli.exe"
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-cuda\bin\whisper-cli.exe"
 Test-OptionalFile -RelativePath ".tools\whisper.cpp-build-openvino\bin\whisper-cli.exe"
-Test-RequiredFile -RelativePath "models\ggml-small-q5_1.bin" -Hash
+$supportedModels = @(
+    "models\ggml-small-q5_1.bin",
+    "models\ggml-small.bin",
+    "models\ggml-medium-q5_0.bin",
+    "models\ggml-medium.bin",
+    "models\ggml-large-v3-turbo-q5_0.bin",
+    "models\ggml-large-v3-turbo.bin"
+)
+$foundModel = $false
+foreach ($model in $supportedModels) {
+    $modelPath = Join-Path $root $model
+    if (Test-Path -LiteralPath $modelPath -PathType Leaf) {
+        Test-OptionalFile -RelativePath $model
+        $foundModel = $true
+    }
+}
+if (-not $foundModel) {
+    Write-Check -Level "FAIL" -Message "No supported Dicta model found in models. Copy at least one supported ggml-*.bin model." -Blocking
+}
 Test-RequiredFile -RelativePath "assets\app_icon.ico"
 Test-RequiredFile -RelativePath "docs\IB_PACKAGE_DESCRIPTION.md"
 Test-RequiredFile -RelativePath "docs\PROGRAM_LOGIC.md"

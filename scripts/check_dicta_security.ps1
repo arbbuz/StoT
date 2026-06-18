@@ -13,8 +13,13 @@ $whisper = Join-Path $root ".tools\whisper.cpp-build-compat\bin\whisper-cli.exe"
 $manifest = Join-Path $root "manifest.json"
 $shaSums = Join-Path $root "SHA256SUMS.txt"
 $verifyScript = Join-Path $root "scripts\verify_dicta_package.ps1"
-$models = @(
-    Join-Path $root "models\ggml-small-q5_1.bin"
+$supportedModels = @(
+    "ggml-small-q5_1.bin",
+    "ggml-small.bin",
+    "ggml-medium-q5_0.bin",
+    "ggml-medium.bin",
+    "ggml-large-v3-turbo-q5_0.bin",
+    "ggml-large-v3-turbo.bin"
 )
 $tempPatterns = @(
     "dicta_*.wav",
@@ -59,14 +64,19 @@ if (Test-Path -LiteralPath $verifyScript) {
     Write-Host "[WARN] package verification script not found: $verifyScript"
 }
 
-foreach ($model in $models) {
+$foundModels = @()
+foreach ($modelName in $supportedModels) {
+    $model = Join-Path $root "models\$modelName"
     if (Test-Path -LiteralPath $model) {
         $item = Get-Item -LiteralPath $model
+        $foundModels += $item
         Write-Host "[OK] model found: $($item.Name) ($([math]::Round($item.Length / 1MB, 1)) MB)"
-    } else {
-        Write-Host "[FAIL] model not found: $model"
-        $ok = $false
     }
+}
+if ($foundModels.Count -eq 0) {
+    Write-Host "[FAIL] no supported Dicta model found in: $(Join-Path $root 'models')"
+    Write-Host "       Copy at least one supported ggml-*.bin model into the models folder."
+    $ok = $false
 }
 
 Write-Host ""

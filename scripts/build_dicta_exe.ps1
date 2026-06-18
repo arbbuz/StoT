@@ -116,8 +116,9 @@ Dicta models are not included in this package.
 
 Copy these files into this folder before using recognition:
 - ggml-small-q5_1.bin
+- ggml-large-v3-turbo-q5_0.bin
 
-Optional higher-quality models:
+Supported models:
 - ggml-small.bin
 - ggml-medium-q5_0.bin
 - ggml-medium.bin
@@ -131,8 +132,8 @@ Official upstream model source:
 https://huggingface.co/ggerganov/whisper.cpp
 "@ | Set-Content -LiteralPath "$dist\models\README_MODELS.txt" -Encoding UTF8
 } else {
-    $requiredModels = @("ggml-small-q5_1.bin")
-    $optionalModels = @(
+    $packageModels = @(
+        "ggml-small-q5_1.bin",
         "ggml-small.bin",
         "ggml-medium-q5_0.bin",
         "ggml-medium.bin",
@@ -140,15 +141,16 @@ https://huggingface.co/ggerganov/whisper.cpp
         "ggml-large-v3-turbo.bin"
     )
 
-    foreach ($modelName in $requiredModels) {
-        Copy-Item -LiteralPath (Join-Path "models" $modelName) -Destination "$dist\models" -Force
-    }
-
-    foreach ($modelName in $optionalModels) {
+    $copiedModels = 0
+    foreach ($modelName in $packageModels) {
         $modelPath = Join-Path "models" $modelName
         if (Test-Path -LiteralPath $modelPath -PathType Leaf) {
             Copy-Item -LiteralPath $modelPath -Destination "$dist\models" -Force
+            $copiedModels++
         }
+    }
+    if ($copiedModels -eq 0) {
+        throw "No supported Dicta model found in models. Use -SkipModels for a code-only package or copy at least one supported ggml-*.bin model."
     }
 }
 

@@ -1,6 +1,6 @@
 # Dicta Plans
 
-Last updated: 2026-06-08
+Last updated: 2026-06-16
 
 This file is the Dicta-specific project plan. Global Codex operating rules belong in `C:\Users\Olga\.codex\AGENTS.md`.
 
@@ -8,8 +8,8 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
 
 - Branch: `DictaProtocol`.
 - Packaged EXE for manual checks: `C:\Users\Olga\Documents\VoiceHelper\dist\DictaProtocol\Dicta.exe`.
-- Latest pushed protocol commit: `ccfab8f Complete protocol stitching and draft output`.
-- Current local work after that commit contains implemented stage 3.5 long-recording UI and a fresh packaged build; commit/push is still pending.
+- Latest pushed protocol commit: `b4d2e4c Improve protocol source separation`.
+- Current working tree is clean and `DictaProtocol` is synced with `origin/DictaProtocol`.
 - Do not commit or push unless the user explicitly asks.
 
 ## Active Plan
@@ -60,7 +60,7 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
    - Success signal: protocol output looks like a draft protocol, not a recognition log.
 
 7. Stage 3.5: long-recording UI
-   - Status: implemented in code and fresh packaged build.
+   - Status: implemented, packaged, committed, and pushed in `d5ba167`.
    - Problem: during long recognition the user must understand that Dicta is working and has not frozen.
    - Implemented: show a compact counter on the right side of the lower status bar.
    - Implemented: keep the protocol status empty while Dicta is idle, instead of showing `Протокол: -`.
@@ -75,7 +75,7 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
    - Success signal: during a long recording it is clear that Dicta has not frozen.
 
 8. Stage 3.6: reliability and manual verification
-   - Status: automated/package verification executed; real audio manual checks remain before closing the stage.
+   - Status: automated/package verification executed, committed, and pushed in `d5ba167`; real audio manual checks remain before closing the stage.
    - Passed: source quick tests and packaged EXE quick tests for formatting and post-processing.
    - Passed: packaged `dist\DictaProtocol` verification; manifest and SHA256 checks completed.
    - Passed: packaged diagnostic completed with zero blocking failures.
@@ -91,7 +91,7 @@ This file is the Dicta-specific project plan. Global Codex operating rules belon
    - Success signal: stage 3 behavior passes the full manual verification set in the packaged EXE.
 
 9. Stage 4: source separation quality
-   - Status: 4.1-4.3 are implemented and packaged in `dist\DictaProtocol`; 4.4 real-audio manual verification is pending.
+   - Status: 4.1-4.3 are implemented, packaged, committed, and pushed in `b4d2e4c`; 4.4 real-audio manual verification is pending.
    - Goal: improve the practical separation of `Системный звук` and `Микрофон` in protocol mode without requiring a heavier model or cloud services.
    - Principle: if a microphone block is mostly leaked system audio or recognition garbage, do not show it as microphone speech.
    - Constraint: keep ordinary dictation unchanged.

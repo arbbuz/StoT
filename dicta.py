@@ -84,7 +84,6 @@ MODEL_FILES = {
 MODEL_OPTIONS = {MODEL_LABELS[key]: MODEL_FILES[key] for key in MODEL_LABELS}
 MODEL_KEY_BY_LABEL = {label: key for key, label in MODEL_LABELS.items()}
 DEFAULT_MODEL_LABEL = MODEL_LABELS["small-q5_1"]
-REQUIRED_MODEL_KEYS = ("small-q5_1",)
 PACKAGE_MODEL_KEYS = (
     "small-q5_1",
     "small",
@@ -4571,12 +4570,16 @@ def available_model_keys() -> list[str]:
 def available_model_options() -> dict[str, Path]:
     keys = available_model_keys()
     if not keys:
-        keys = list(REQUIRED_MODEL_KEYS)
+        keys = list(MODEL_LABELS)
     return {MODEL_LABELS[key]: MODEL_FILES[key] for key in keys}
 
 
-def required_model_paths() -> list[Path]:
-    return [MODEL_FILES[key] for key in REQUIRED_MODEL_KEYS]
+def supported_model_paths() -> list[Path]:
+    return [MODEL_FILES[key] for key in MODEL_LABELS]
+
+
+def has_any_supported_model() -> bool:
+    return bool(available_model_keys())
 
 
 def sanitize_model_key(model_key: object | None, require_available: bool = False) -> str:
@@ -6087,9 +6090,9 @@ class DictaApp:
         if not available_whisper_backends():
             expected = "\n".join(f"{name}: {path}" for name, path in WHISPER_BACKENDS.items())
             missing.append(f"Не найден ни один локальный whisper.cpp backend:\n{expected}")
-        for model_path in required_model_paths():
-            if not model_path.exists():
-                missing.append(str(model_path))
+        if not has_any_supported_model():
+            expected_models = "\n".join(str(path) for path in supported_model_paths())
+            missing.append(f"Не найдена ни одна поддерживаемая модель Dicta:\n{expected_models}")
 
         if missing:
             self._set_status("Не найдены локальные файлы")
@@ -10408,19 +10411,23 @@ def main() -> None:
             print("Dicta self-test failed. Translation glossary is invalid:")
             print(glossary_error)
             raise SystemExit(1)
-        required = [WHISPER_EXE] if allow_missing_models else [WHISPER_EXE, *required_model_paths()]
+        required = [WHISPER_EXE]
         missing = [path for path in required if not path.exists()]
         if missing:
             print("Dicta self-test failed. Missing files:")
             for path in missing:
                 print(path)
             raise SystemExit(1)
-        if allow_missing_models:
-            missing_models = [path for path in required_model_paths() if not path.exists()]
-            if missing_models:
-                print("Dicta self-test warning: models are not included in this code-only package.")
-                for path in missing_models:
-                    print(path)
+        if not allow_missing_models and not has_any_supported_model():
+            print("Dicta self-test failed. No supported local model was found.")
+            print("Copy at least one of these files into the models folder:")
+            for path in supported_model_paths():
+                print(path)
+            raise SystemExit(1)
+        if allow_missing_models and not has_any_supported_model():
+            print("Dicta self-test warning: models are not included in this code-only package.")
+            for path in supported_model_paths():
+                print(path)
         print("Dicta self-test passed.")
         print(f"APP_DIR={APP_DIR}")
         print(f"APP_ICON={APP_ICON}")

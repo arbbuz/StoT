@@ -1,6 +1,6 @@
 # Dicta Codex Handoff
 
-Last updated: 2026-06-08
+Last updated: 2026-06-16
 
 Workspace: `C:\Users\Olga\Documents\VoiceHelper`
 
@@ -9,10 +9,10 @@ Packaged app for DictaProtocol manual checks: `C:\Users\Olga\Documents\VoiceHelp
 ## Current State
 
 - Current branch: `DictaProtocol`, tracking `origin/DictaProtocol`.
-- HEAD and latest pushed commit: `ccfab8f Complete protocol stitching and draft output`.
-- Current working tree has uncommitted implemented stage 3.5 UI work after `ccfab8f`; do not overwrite it.
-- Uncommitted code work: `dicta.py` adds compact long-recording protocol progress status, processed-fragment counting, clear `Запись` / `Обработка фрагмента` / `Протокол готов` states, adaptive lower-bar layout that moves the protocol status to a second row in narrow windows, simplified spelling context menu with one user-facing action for accepted words, real clock time in visible protocol fragment headers, text-level filtering of long same-fragment system-audio repeats from microphone blocks, and `[неразборчиво]` marking for protocol sentences with dense invalid-word clusters.
-- Uncommitted docs work: `docs\plans.md`, `docs\codex-handoff.md`, and `docs\decision-log.md` describe stage 3.5 status UI work and stage 3.6 verification results.
+- HEAD and latest pushed commit: `b4d2e4c Improve protocol source separation`.
+- Current working tree is clean and `DictaProtocol` is synced with `origin/DictaProtocol`.
+- Stage 3.5 long-recording UI work was committed and pushed in `d5ba167`.
+- Stage 4.1-4.3 source-separation quality work was committed and pushed in `b4d2e4c`.
 - Do not commit or push unless the user explicitly asks.
 
 ## Build And Package
@@ -26,8 +26,8 @@ Packaged app for DictaProtocol manual checks: `C:\Users\Olga\Documents\VoiceHelp
 - `-DistRoot` defaults to `dist\Dicta`, but DictaProtocol manual checks must use `dist\DictaProtocol`.
 - Current packaged EXE: `C:\Users\Olga\Documents\VoiceHelper\dist\DictaProtocol\Dicta.exe`.
 - In user-facing final responses, report the ready EXE as a clickable Markdown file link to the absolute path.
-- Current packaged EXE timestamp observed locally: 2026-06-08 21:35:48.
-- Latest build log observed locally: `artifacts\build_protocol_option_b_20260608_213514.log`.
+- Current packaged EXE timestamp observed locally: 2026-06-09 07:09:41.
+- Latest build log observed locally: `artifacts\build_protocol_stage4_refine_20260609_070901.log`.
 - Latest build log result: package verification passed.
 
 ## Validation Already Run
