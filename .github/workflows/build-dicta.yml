@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   build-windows-code-only:
-    name: Build Windows code-only package
+    name: Build DictaProtocol Windows code-only package
     runs-on: windows-latest
 
     defaults:
@@ -27,21 +27,35 @@ jobs:
           cache: pip
 
       - name: Prepare local whisper.cpp backend without models
-        run: .\scripts\prepare_dicta_assets.ps1 -SkipModels
+        run: |
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+              Write-Host "prepare_dicta_assets attempt $attempt of $maxAttempts"
+              .\scripts\prepare_dicta_assets.ps1 -SkipModels
+              break
+            } catch {
+              Write-Host "::warning::prepare_dicta_assets failed on attempt $attempt: $($_.Exception.Message)"
+              if ($attempt -ge $maxAttempts) {
+                throw
+              }
+              Start-Sleep -Seconds (20 * $attempt)
+            }
+          }
 
-      - name: Build Dicta package without models
-        run: .\scripts\build_dicta_exe.ps1 -SkipModels -PackageVersion "1.1-pilot-code-only"
+      - name: Build DictaProtocol package without models
+        run: .\scripts\build_dicta_exe.ps1 -SkipModels -PackageVersion "1.1-pilot-protocol-code-only" -DistRoot "dist\DictaProtocol"
 
       - name: Create artifact archive
         run: |
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          Compress-Archive -Path "dist\Dicta\*" -DestinationPath artifacts\Dicta-windows-code-only.zip -Force
-          Get-Item -LiteralPath artifacts\Dicta-windows-code-only.zip | Format-List FullName,Length,LastWriteTime
+          Compress-Archive -Path "dist\DictaProtocol\*" -DestinationPath artifacts\DictaProtocol-windows-code-only.zip -Force
+          Get-Item -LiteralPath artifacts\DictaProtocol-windows-code-only.zip | Format-List FullName,Length,LastWriteTime
 
-      - name: Upload Dicta package
+      - name: Upload DictaProtocol package
         uses: actions/upload-artifact@v4
         with:
-          name: Dicta-windows-code-only
-          path: artifacts/Dicta-windows-code-only.zip
+          name: DictaProtocol-windows-code-only
+          path: artifacts/DictaProtocol-windows-code-only.zip
           if-no-files-found: error
           retention-days: 30
